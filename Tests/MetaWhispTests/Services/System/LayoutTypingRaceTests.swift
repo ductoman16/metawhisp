@@ -28,7 +28,7 @@ final class LayoutTypingRaceTests: XCTestCase {
         gateway: TypingRaceGatewaySpy,
         inputSource: TypingRaceInputSourceSpy
     ) -> LayoutSwitchController {
-        LayoutSwitchController(textGateway: gateway, inputSourceService: inputSource)
+        LayoutSwitchController(mapper: .installedForTests, textGateway: gateway, inputSourceService: inputSource)
     }
 
     /// Types `ghbdtn` plus its separator, which schedules a correction.
@@ -44,6 +44,7 @@ final class LayoutTypingRaceTests: XCTestCase {
         let gateway = TypingRaceGatewaySpy()
         let inputSource = TypingRaceInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource,
             isKnownWord: { word, language in

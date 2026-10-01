@@ -11,6 +11,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource
         )
@@ -35,6 +36,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource,
             isKnownWord: { word, language in
@@ -63,6 +65,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
             manualOutcome: .skipped(.noConvertibleText)
         )
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS),
             isKnownWord: { word, language in
@@ -91,6 +94,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource
         )
@@ -116,6 +120,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource
         )
@@ -140,6 +145,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource
         )
@@ -165,6 +171,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
             manualDelayMilliseconds: 100
         )
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS)
         )
@@ -186,6 +193,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
             )
         )
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS)
         )
@@ -227,6 +235,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         var lexiconLookupCount = 0
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS),
             isKnownWord: { _, _ in
@@ -253,6 +262,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
             )
         )
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS),
             permitsInputCapture: { false }
@@ -277,6 +287,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
             focusedElementHash: 100
         )
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS),
             isKnownWord: { word, language in
@@ -310,6 +321,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
             focusedElementHash: 100
         )
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: LayoutInputSourceSpy(current: .englishUS),
             inputContextIdentity: { context }
@@ -335,6 +347,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource
         )
@@ -356,6 +369,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource
         )
@@ -380,6 +394,7 @@ final class LayoutSwitchControllerDispatchTests: XCTestCase {
         )
         let inputSource = LayoutInputSourceSpy(current: .englishUS)
         let controller = LayoutSwitchController(
+            mapper: .installedForTests,
             textGateway: gateway,
             inputSourceService: inputSource,
             isKnownWord: { word, language in

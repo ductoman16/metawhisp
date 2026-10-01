@@ -40,7 +40,7 @@ final class SystemLayoutLexiconTests: XCTestCase {
         }
 
         let lexicon = SystemLayoutLexicon.shared
-        let confidence = LayoutConfidenceEngine()
+        let confidence = LayoutConfidenceEngine(mapper: .installedForTests)
         let isKnown: (String, KeyboardLayout) -> Bool = { word, language in
             lexicon.contains(word, language: language)
         }
@@ -128,7 +128,7 @@ final class SystemLayoutLexiconTests: XCTestCase {
         }
 
         let lexicon = SystemLayoutLexicon.shared
-        let confidence = LayoutConfidenceEngine()
+        let confidence = LayoutConfidenceEngine(mapper: .installedForTests)
         let isKnown: (String, KeyboardLayout) -> Bool = { word, language in
             lexicon.contains(word, language: language)
         }
@@ -169,7 +169,7 @@ final class SystemLayoutLexiconTests: XCTestCase {
         }
 
         let lexicon = SystemLayoutLexicon.shared
-        let confidence = LayoutConfidenceEngine()
+        let confidence = LayoutConfidenceEngine(mapper: .installedForTests)
         let isKnown: (String, KeyboardLayout) -> Bool = { word, language in
             lexicon.contains(word, language: language)
         }
@@ -199,7 +199,7 @@ final class SystemLayoutLexiconTests: XCTestCase {
         }
 
         let lexicon = SystemLayoutLexicon.shared
-        let confidence = LayoutConfidenceEngine()
+        let confidence = LayoutConfidenceEngine(mapper: .installedForTests)
         let isKnown: (String, KeyboardLayout) -> Bool = { word, language in
             lexicon.contains(word, language: language)
         }

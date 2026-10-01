@@ -1,3 +1,4 @@
+#if DEBUG
 import XCTest
 @testable import MetaWhisp
 
@@ -32,3 +33,4 @@ final class GlobalInputEventTapProbeTests: XCTestCase {
         )
     }
 }
+#endif
