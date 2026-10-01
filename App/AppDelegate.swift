@@ -300,6 +300,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Set on auto-start path; nil when user pressed RECORD manually.
     private var currentMeetingCallContext: String?
 
+    nonisolated static func shouldStartUpdater(bundleInfo: [String: Any]?) -> Bool {
+        bundleInfo?["MetaWhispDisableUpdates"] as? Bool != true
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
         FileLogger.setup()
@@ -353,9 +357,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // instances never race on the file. No-op once already migrated.
         KeychainHelper.migrateLegacySecretsIfNeeded()
 
-        // Sparkle auto-updater
-        updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
-        NSLog("[MetaWhisp] Sparkle started — v%@ (build %@), autoCheck=%@, lastCheck=%@", Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?", Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?", updaterController.updater.automaticallyChecksForUpdates ? "on" : "off", updaterController.updater.lastUpdateCheckDate.map { String(format: "%.1fh ago", Date().timeIntervalSince($0) / 3600) } ?? "never")
+        // Fork bundles must never replace themselves with an upstream update.
+        if Self.shouldStartUpdater(bundleInfo: Bundle.main.infoDictionary) {
+            updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+            NSLog("[MetaWhisp] Sparkle started — v%@ (build %@), autoCheck=%@, lastCheck=%@", Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?", Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?", updaterController.updater.automaticallyChecksForUpdates ? "on" : "off", updaterController.updater.lastUpdateCheckDate.map { String(format: "%.1fh ago", Date().timeIntervalSince($0) / 3600) } ?? "never")
+        }
 
         NSLog("[MetaWhisp] Launched")
 
