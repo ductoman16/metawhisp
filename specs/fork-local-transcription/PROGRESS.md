@@ -14,7 +14,7 @@
 - [x] Fix local decoding and add deterministic configuration tests.
 - [x] Run the full repository regression gate and real-engine performance test.
 - [x] Build a release artifact without overwriting or launching the installed application.
-- [ ] Commit and publish the verified fix to the personal fork.
+- [x] Commit and publish the verified fix to the personal fork.
 
 ## October 1 continuation (authorized)
 
@@ -30,7 +30,7 @@
   for both stages and warm up before publishing a loaded model.
 - [x] Disable upstream updates only for the packaged fork; test the policy.
 - [x] Full gate, real-model test, standalone bundle validation.
-- [ ] Publish verified commits to the personal fork.
+- [x] Publish verified commits to the personal fork.
 
 New caller assumption: loadModel completion and isModelLoaded advertise readiness
 to the coordinator and AppDelegate's startup / selection / best-model-swap paths.
@@ -86,6 +86,9 @@ mapper / confidence / word-buffer / controller seams in tests. Production uses
 enabled-only layouts as before. No assertions removed or skips added.
 
 ## Final October 1 verification
+
+Published branch: `ductoman16/metawhisp:fix/local-transcription-latency`.
+Personal-fork PR: https://github.com/ductoman16/metawhisp/pull/1 (no upstream PR).
 
 - First-dictation regression failed before the preparation/encoder change:
   Auto 10.54s first / 2.94s repeated; short English 5.30s first / 1.50s repeated.
