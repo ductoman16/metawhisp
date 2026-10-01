@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Foundation
+import Combine
 import os
 
 /// Single-point lifecycle coordinator for transcription pipeline.
@@ -31,7 +32,40 @@ final class TranscriptionCoordinator: ObservableObject {
     /// Onboarding-transient: onboarding has no provider switcher (so it can't go
     /// stale there) and this flag is not consulted after onboarding completes.
     @Published var cloudKeyValidated: Bool = false
-    var whisperEngine: WhisperKitEngine?
+    var whisperEngine: WhisperKitEngine? {
+        didSet { observeModelState() }
+    }
+    private var modelStateObservation: AnyCancellable?
+    private var blockedReadinessError: String?
+
+    var canStartRecording: Bool { activeEngine?.isModelLoaded == true }
+
+    var idleStatusLabel: String {
+        if canStartRecording { return "Ready" }
+        if settings.transcriptionEngine == "cloud" { return "Cloud not ready" }
+        return (whisperEngine?.modelState.value ?? .unloaded).label
+    }
+
+    private var engineReadinessError: String {
+        if settings.transcriptionEngine == "cloud" { return "API key not set for cloud transcription" }
+        return whisperEngine?.modelState.value.recordingError
+            ?? "No model loaded. Select or download a model in Settings."
+    }
+
+    private func observeModelState() {
+        modelStateObservation = whisperEngine?.modelState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                if self.settings.transcriptionEngine != "cloud",
+                   let blocked = self.blockedReadinessError, self.lastError == blocked {
+                    self.lastError = state.recordingError
+                    self.blockedReadinessError = state.recordingError
+                }
+                self.objectWillChange.send()
+            }
+        objectWillChange.send()
+    }
     private let cloudEngine = CloudWhisperEngine()
     private let textInserter: TextInsertionService
     private let soundService: SoundService
@@ -97,6 +131,7 @@ final class TranscriptionCoordinator: ObservableObject {
         self.textInserter = textInserter
         self.soundService = soundService
         self.settings = settings
+        observeModelState()
     }
 
     /// Toggle with translation — called by Right ⌥ shortcut.
@@ -174,6 +209,15 @@ final class TranscriptionCoordinator: ObservableObject {
     }
 
     private func startRecording() {
+        guard canStartRecording else {
+            translateNext = false
+            lastError = engineReadinessError
+            blockedReadinessError = lastError
+            abortVoiceQuestionIfActive(reason: engineReadinessError)
+            soundService.playError()
+            NSLog("[Coordinator] Recording blocked: %@", engineReadinessError)
+            return
+        }
         // Check microphone permission before starting
         guard recorder.hasPermission else {
             translateNext = false
@@ -277,12 +321,15 @@ final class TranscriptionCoordinator: ObservableObject {
 
     private func transcribe(samples: [Float], shouldTranslate: Bool, rms: Float) async {
         guard let currentEngine = activeEngine, currentEngine.isModelLoaded else {
-            lastError = settings.transcriptionEngine == "cloud" ? "API key not set for cloud transcription" : "No model loaded. Go to Settings to download one."
+            lastError = engineReadinessError
+            if let recoveryURL = Self.saveSamplesAsWav(samples) {
+                lastError = "\(engineReadinessError) Audio saved to \(recoveryURL.path)"
+            }
             abortVoiceQuestionIfActive(reason: "Transcription engine not ready.")
             stage = .idle
             soundService.playError()
             NSLog("[Coordinator] ❌ Engine not ready")
-            NSLog("[Coordinator] engine=%@, %d samples (%.1fs) dropped — %@", settings.transcriptionEngine, samples.count, Double(samples.count) / 16000.0, lastError ?? "?")
+            NSLog("[Coordinator] engine=%@, %d samples (%.1fs) could not be transcribed — %@", settings.transcriptionEngine, samples.count, Double(samples.count) / 16000.0, lastError ?? "?")
             return
         }
 

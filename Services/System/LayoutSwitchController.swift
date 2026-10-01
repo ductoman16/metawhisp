@@ -242,6 +242,7 @@ final class LayoutSwitchController {
     }
 
     private let confidenceEngine: LayoutConfidenceEngine
+    private let mapper: KeyboardLayoutMapper
     private let textGateway: any LayoutTextCorrecting
     private let inputSourceService: any LayoutInputSourceManaging
     private let isKnownWord: (String, KeyboardLayout) -> Bool
@@ -269,6 +270,7 @@ final class LayoutSwitchController {
 
     init(confidenceEngine: LayoutConfidenceEngine = LayoutConfidenceEngine()) {
         SystemLayoutLexicon.shared.warmUp()
+        self.mapper = .russianEnglish
         self.confidenceEngine = confidenceEngine
         self.textGateway = FocusedTextGateway()
         self.inputSourceService = InputSourceService()
@@ -282,7 +284,8 @@ final class LayoutSwitchController {
     }
 
     init(
-        confidenceEngine: LayoutConfidenceEngine = LayoutConfidenceEngine(),
+        confidenceEngine: LayoutConfidenceEngine? = nil,
+        mapper: KeyboardLayoutMapper = .russianEnglish,
         textGateway: any LayoutTextCorrecting,
         inputSourceService: any LayoutInputSourceManaging,
         isKnownWord: ((String, KeyboardLayout) -> Bool)? = nil,
@@ -292,7 +295,8 @@ final class LayoutSwitchController {
         }
     ) {
         SystemLayoutLexicon.shared.warmUp()
-        self.confidenceEngine = confidenceEngine
+        self.mapper = mapper
+        self.confidenceEngine = confidenceEngine ?? LayoutConfidenceEngine(mapper: mapper)
         self.textGateway = textGateway
         self.inputSourceService = inputSourceService
         self.isKnownWord = isKnownWord ?? { word, language in
@@ -407,7 +411,7 @@ final class LayoutSwitchController {
                   keyCode: keyCode,
                   flags: flags,
                   source: source,
-                  mapper: .russianEnglish
+                  mapper: mapper
               ),
               let correction = confidenceEngine.automaticCorrection(
                   for: bufferedToken.token,
@@ -599,7 +603,7 @@ final class LayoutSwitchController {
             NSLog("[LayoutFix] Manual correction dispatch started")
             let outcome = await self.textGateway.correctSelectedTextOrCurrentLine(
                 typedIn: source,
-                mapper: .russianEnglish,
+                mapper: self.mapper,
                 isStillCurrent: { [weak self] in
                     self?.inputGeneration == scheduledGeneration
                 }

@@ -1,3 +1,60 @@
+## Personal fork startup readiness — 2026-10-01 (verification correction)
+
+The previous entry verified engine tests and bundle integrity, not a launched
+app. The user's screenshot revealed that idle was shown as READY during a
+171.53s first preparation, and dictation was accepted then discarded. Added a
+red-first coordinator regression for all four entry points, engine lifecycle
+publication, capture readiness guard, and reactive menu/dashboard status.
+An unavailable engine after capture now writes recovery audio instead of
+silently losing it. Existing prepared models remain usable during replacement.
+
+Full regression gate PASS: 1483 tests, zero failures, 69 critical suites and
+layout corpus. Eight focused release tests PASS including real Turbo: Auto
+2.555/2.437/2.422s for 5.282s audio; English 1.015/0.970/0.970s for 1.554s audio.
+The positive coordinator test enables recording only after real preparation.
+
+Added an explicit fork-only packaged fixture smoke check, with no clipboard or
+history writes. The rebuilt app launched at 16:11 and prepared Turbo in 3.16s;
+two correct Auto fixture transcriptions took 1.283/1.223s for 1.554s audio. Both
+logged `[ForkSmoke] PASS` with coordinator Ready. Final full gate passed again.
+Native UI inspection still times out. This launch reports Accessibility trusted,
+but live automatic paste remains unverified. Details and rollback artifact:
+`specs/fork-local-transcription/PROGRESS.md`. Never infer visual verification or
+auto-paste success from engine benchmarks.
+
+## Personal fork latency fix — 2026-10-01 (verified local build)
+
+Completed the on-device fix: Neural Engine encoder + decoder, no local glossary
+prompt, bounded silence inference before model-ready publication. Auto, pinned
+languages, cloud prompts, output corrections, retries/VAD/confidence preserved.
+Real-engine first / repeated timings: short English 1.02 / 0.97s; 5.28s Auto
+dictation 2.63 / 2.44s. First compilation 147s, subsequent load + warm-up 2.87s.
+
+Full gate PASS: 1477 tests, zero failures, 69 critical suites and layout corpus.
+Previously failing layout tests now take real installed layouts explicitly;
+production remains enabled-only, and host preferences are not changed.
+Fork updater policy tested; packaged app never starts upstream Sparkle updates.
+Build script signs/verifies a separate `dist/MetaWhisp-Fork.app` and never installs
+or launches it. Hub tokenizer resources use a small checked-in dependency patch
+for the standard signed Resources directory; dependency lockfile unchanged.
+Strict bundle verification PASS; original installed app and data remain intact.
+See `FORK.md` and `specs/fork-local-transcription/PROGRESS.md` for commands/details.
+
+## Personal fork latency work — 2026-09-29 (historical diagnosis)
+
+Local large-v3-turbo reproduction: real WhisperKitEngine, exact built-in glossary,
+1.554-second synthetic English fixture, warm latency 14.055/14.112 seconds.
+Removing local prompt tokens and using the Neural Engine decoder gives
+1.520/1.510 seconds; output and three decoder configuration tests pass.
+Cloud prompts and post-transcription corrections remain unchanged. Active
+upstream Auto already gates off the English glossary (earlier tag-based
+Auto-plus-prompt replay did not represent the coordinator).
+
+Full regression gate is BLOCKED: build passes; 1474 tests, 8 skips, 68 failures
+in five unchanged keyboard-layout suites. Host has US only; those tests depend
+on live Russian/US mapping and some punctuation assumptions. No gate weakened,
+no keyboard settings changed, no app installed, no verified release claimed.
+See `specs/fork-local-transcription/PROGRESS.md` for logs and remaining work.
 
 ## Released v1.3.8 — 2026-05-29 (meeting cleanup + LLM cost routing + MetaChat hardening)
 
@@ -2313,4 +2370,3 @@ Sources verified May 12, 2026:
 - mlx-community on HF
 - Gemma 4 announcement / unsloth docs
 - localaimaster small-model 2026 guide
-

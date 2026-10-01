@@ -38,12 +38,12 @@ private struct KeyboardLayoutCharacterMap: Sendable {
 /// the same punctuation layout as Windows Russian, so a handwritten table is
 /// not a safe source of truth.
 private enum SystemKeyboardLayoutMapLoader {
-    static func load(identifier: String) -> KeyboardLayoutCharacterMap? {
+    static func load(identifier: String, includeDisabledLayouts: Bool) -> KeyboardLayoutCharacterMap? {
         let properties = [
             kTISPropertyInputSourceCategory: kTISCategoryKeyboardInputSource,
             kTISPropertyInputSourceType: kTISTypeKeyboardLayout
         ] as CFDictionary
-        let sources = TISCreateInputSourceList(properties, false)
+        let sources = TISCreateInputSourceList(properties, includeDisabledLayouts)
             .takeRetainedValue() as! [TISInputSource]
         guard let source = sources.first(where: {
             stringProperty(kTISPropertyInputSourceID, from: $0) == identifier
@@ -155,12 +155,14 @@ struct KeyboardLayoutMapper: Sendable {
         !english.byKey.isEmpty && !russian.byKey.isEmpty
     }
 
-    init() {
+    init(includeDisabledLayouts: Bool = false) {
         self.english = SystemKeyboardLayoutMapLoader.load(
-            identifier: InputSourceIDResolver.englishUS
+            identifier: InputSourceIDResolver.englishUS,
+            includeDisabledLayouts: includeDisabledLayouts
         ) ?? .empty
         self.russian = SystemKeyboardLayoutMapLoader.load(
-            identifier: InputSourceIDResolver.russian
+            identifier: InputSourceIDResolver.russian,
+            includeDisabledLayouts: includeDisabledLayouts
         ) ?? .empty
     }
 

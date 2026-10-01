@@ -41,7 +41,7 @@ let package = Package(
             // `Sources/MetaWhispMCP/` is a separate `.executableTarget` —
             // exclude it so the main MetaWhisp target doesn't ingest its
             // `main.swift` (which would clash with the SwiftUI @main).
-            exclude: ["Package.swift", "Resources", "mockup-liquid-glass", "Tests", "Sources"],
+            exclude: ["Package.swift", "Resources", "mockup-liquid-glass", "Tests", "Sources", "dist"],
             resources: [
                 .copy("Resources/Sounds"),
                 .process("Resources/mw_menubar.png"),
