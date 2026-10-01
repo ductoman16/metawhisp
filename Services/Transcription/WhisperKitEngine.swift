@@ -16,20 +16,38 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
 
     /// Load a model by its variant name (e.g. "openai_whisper-large-v3_turbo").
     func loadModel(_ variant: String, progressHandler: (@Sendable (Double) -> Void)?) async throws {
+        try Task.checkCancellation()
+        let preparationStart = CFAbsoluteTimeGetCurrent()
         let config = WhisperKitConfig(
             model: variant,
             computeOptions: ModelComputeOptions(
-                audioEncoderCompute: .cpuAndGPU,
-                textDecoderCompute: .cpuAndGPU
+                audioEncoderCompute: .cpuAndNeuralEngine,
+                textDecoderCompute: .cpuAndNeuralEngine
             ),
             verbose: false
         )
 
         let kit = try await WhisperKit(config)
 
+        // Loading Core ML models alone leaves first-inference work unpaid.
+        // Exercise both stages on local silence before advertising readiness.
+        // One decoding step, no retries or VAD; discard all output and never
+        // send this preparation through history, corrections, or usage billing.
+        var warmup = Self.decodingOptions(language: "en")
+        warmup.sampleLength = 1
+        warmup.temperatureFallbackCount = 0
+        warmup.usePrefillCache = false
+        warmup.chunkingStrategy = nil
+        _ = try await kit.transcribe(
+            audioArray: [Float](repeating: 0, count: 16_000),
+            decodeOptions: warmup
+        )
+        try Task.checkCancellation()
+
         lock.withLock {
             self.whisperKit = kit
         }
+        NSLog("[WhisperKit] Model prepared in %.2fs (Neural Engine encoder and decoder)", CFAbsoluteTimeGetCurrent() - preparationStart)
     }
 
     func unloadModel() async {
@@ -38,32 +56,9 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         }
     }
 
-    // `countUsage` ignored — on-device WhisperKit never bills the Pro quota.
-    // No default args (they'd collide with the protocol extension's 3-arg
-    // convenience on concrete calls) — the extension supplies the short forms.
-    func transcribe(audioSamples: [Float], language: String?, promptWords: [String], countUsage: Bool) async throws -> TranscriptionResult {
-        guard let kit = lock.withLock({ whisperKit }) else {
-            throw TranscriptionError.modelNotLoaded
-        }
-
-        let startTime = CFAbsoluteTimeGetCurrent()
-
+    static func decodingOptions(language: String?) -> DecodingOptions {
         let lang = TranscriptionLanguageResolver.resolveLanguage(language)
-
-        // Encode dictionary words as prompt tokens for better recognition
-        var promptTokens: [Int]?
-        if !promptWords.isEmpty, let tokenizer = kit.tokenizer {
-            let promptText = promptWords.joined(separator: ", ")
-            let tokens = tokenizer.encode(text: " " + promptText).filter {
-                $0 < tokenizer.specialTokens.specialTokenBegin
-            }
-            if !tokens.isEmpty {
-                promptTokens = tokens
-                NSLog("[WhisperKit] 📖 Prompt: %d words → %d tokens (%@)", promptWords.count, tokens.count, String(promptText.prefix(80)))
-            }
-        }
-
-        let decodingOptions = DecodingOptions(
+        return DecodingOptions(
             task: .transcribe,
             language: lang,
             temperature: 0,
@@ -78,14 +73,30 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
             detectLanguage: TranscriptionLanguageResolver.whisperDetectLanguage(language: lang),
             skipSpecialTokens: true,
             wordTimestamps: false,
-            promptTokens: promptTokens,
+            // WhisperKit 0.16 decodes prompt tokens sequentially and disables
+            // cached prefill whenever this is non-nil (even an empty array).
+            // Keep brand correction after recognition, not in the local decoder.
+            promptTokens: nil,
             noSpeechThreshold: 0.6,
             chunkingStrategy: .vad
         )
+    }
+
+    // `countUsage` ignored — on-device WhisperKit never bills the Pro quota.
+    // `promptWords` is retained for the shared cloud/local protocol, but local
+    // decoding deliberately ignores hints to avoid a per-dictation prefill cost.
+    // No default args (they'd collide with the protocol extension's 3-arg
+    // convenience on concrete calls) — the extension supplies the short forms.
+    func transcribe(audioSamples: [Float], language: String?, promptWords: [String], countUsage: Bool) async throws -> TranscriptionResult {
+        guard let kit = lock.withLock({ whisperKit }) else {
+            throw TranscriptionError.modelNotLoaded
+        }
+
+        let startTime = CFAbsoluteTimeGetCurrent()
 
         let results = try await kit.transcribe(
             audioArray: audioSamples,
-            decodeOptions: decodingOptions
+            decodeOptions: Self.decodingOptions(language: language)
         )
 
         let processingTime = CFAbsoluteTimeGetCurrent() - startTime
