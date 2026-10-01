@@ -36,6 +36,24 @@ final class WhisperKitLatencyTests: XCTestCase {
         XCTAssertFalse(engine.isModelLoaded)
         try await engine.loadModel(model, progressHandler: nil)
         XCTAssertTrue(engine.isModelLoaded)
+        XCTAssertEqual(engine.modelState.value, .ready)
+        await MainActor.run {
+            let settings = AppSettings.shared
+            let previous = settings.transcriptionEngine
+            settings.transcriptionEngine = "ondevice"
+            defer { settings.transcriptionEngine = previous }
+            let recorder = StubAudioSource()
+            let coordinator = TranscriptionCoordinator(
+                recorder: recorder, whisperEngine: engine,
+                textInserter: TextInsertionService(), soundService: SoundService(enabled: { false }), settings: settings
+            )
+            XCTAssertEqual(coordinator.idleStatusLabel, "Ready")
+            XCTAssertTrue(coordinator.canStartRecording)
+            coordinator.startPTT()
+            XCTAssertTrue(recorder.isRecording)
+            XCTAssertEqual(coordinator.stage, .recording)
+            coordinator.stopPTT()
+        }
         let prompt = TranscriptionLanguageResolver.enginePromptWords(language: "en")
         XCTAssertFalse(prompt.isEmpty, "Exercise the real English glossary input, not a pre-trimmed caller")
 
@@ -49,5 +67,6 @@ final class WhisperKitLatencyTests: XCTestCase {
         }
         await engine.unloadModel()
         XCTAssertFalse(engine.isModelLoaded)
+        XCTAssertEqual(engine.modelState.value, .unloaded)
     }
 }

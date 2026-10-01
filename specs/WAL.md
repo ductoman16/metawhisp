@@ -1,3 +1,27 @@
+## Personal fork startup readiness — 2026-10-01 (verification correction)
+
+The previous entry verified engine tests and bundle integrity, not a launched
+app. The user's screenshot revealed that idle was shown as READY during a
+171.53s first preparation, and dictation was accepted then discarded. Added a
+red-first coordinator regression for all four entry points, engine lifecycle
+publication, capture readiness guard, and reactive menu/dashboard status.
+An unavailable engine after capture now writes recovery audio instead of
+silently losing it. Existing prepared models remain usable during replacement.
+
+Full regression gate PASS: 1483 tests, zero failures, 69 critical suites and
+layout corpus. Eight focused release tests PASS including real Turbo: Auto
+2.555/2.437/2.422s for 5.282s audio; English 1.015/0.970/0.970s for 1.554s audio.
+The positive coordinator test enables recording only after real preparation.
+
+Added an explicit fork-only packaged fixture smoke check, with no clipboard or
+history writes. The rebuilt app launched at 16:11 and prepared Turbo in 3.16s;
+two correct Auto fixture transcriptions took 1.283/1.223s for 1.554s audio. Both
+logged `[ForkSmoke] PASS` with coordinator Ready. Final full gate passed again.
+Native UI inspection still times out. This launch reports Accessibility trusted,
+but live automatic paste remains unverified. Details and rollback artifact:
+`specs/fork-local-transcription/PROGRESS.md`. Never infer visual verification or
+auto-paste success from engine benchmarks.
+
 ## Personal fork latency fix — 2026-10-01 (verified local build)
 
 Completed the on-device fix: Neural Engine encoder + decoder, no local glossary

@@ -1,5 +1,63 @@
 # Local transcription latency fix
 
+## October 1 packaged-app readiness correction
+
+User story: as a dictator launching the fork, I need a truthful preparation
+status and recording disabled until inference is ready, so my audio is not lost.
+Failure must be distinguished from preparation; a successful load enables capture.
+
+The earlier verification covered engine tests and bundle integrity, NOT launched
+app behavior. The user's screenshot exposed the gap: the old UI mapped idle to
+READY, accepted 3.2 seconds of audio during preparation, then discarded it with
+an incorrect download message. The launched package eventually prepared Turbo
+in 171.53s. A later real microphone dictation took 1.28s engine time and ~1.33s
+from stop to clipboard for 1.79s of audio. Auto-paste was blocked by Accessibility.
+
+- [x] Reproduce all four recording entry points with a failing coordinator test
+  (14 assertions failed before the fix; no real microphone used).
+- [x] Publish preparation lifecycle from the engine to the coordinator; guard
+  capture before microphone access; show truthful menu/dashboard state and disable
+  start controls. Clear only readiness errors when preparation changes. Preserve
+  an existing prepared model during replacement loads.
+- [x] Preserve recovery audio if the engine disappears after capture starts.
+- [x] Unit coverage for preparation, cancellation/failure, unload, and all recording
+  entry points; positive ready-to-record coverage in opt-in real-model tests.
+- [x] Full gate PASS: 1483 tests, zero failures, 69 critical suites, layout corpus.
+- [x] Real-model release tests and rebuilt bundle verification.
+- [x] Launch packaged app and run its opt-in fixture transcription smoke check.
+- [ ] Native UI rendering and live auto-paste verification (automation blocked).
+
+Final gate PASS again after the last source edit: 1483 tests, zero failures,
+69 critical suites, layout corpus. Eight focused release tests passed; Auto
+2.555/2.437/2.422s for 5.282s audio, English 1.015/0.970/0.970s for 1.554s audio.
+Logs: `/tmp/metawhisp-readiness-final-regression.log`,
+`/tmp/metawhisp-readiness-real-model.log`, `/tmp/metawhisp-readiness-package.log`.
+
+Launched the rebuilt packaged executable at 16:11:33 (PID 24685), with the
+fork-only smoke arguments, selected large-v3-turbo and Auto unchanged. Normal
+startup prepared the model in 3.16s. Two correct fixture transcriptions passed
+at 16:11:41 and 16:11:42: 1.283s / 1.223s for 1.554s audio, coordinator Ready.
+Evidence: `[ForkSmoke] PASS` entries for that PID in `~/Library/Logs/MetaWhisp.log`.
+The app remains running. This launch reports Accessibility trusted, but that
+does not prove a successful live paste. The smoke check does not touch history
+or clipboard. Previous idle fork was stopped before moving its bundle to
+`dist/MetaWhisp-Fork-before-readiness.app`; `/Applications/MetaWhisp.app` is intact.
+
+Native UI inspection timed out for the exact fork path, including after the
+rebuild and successful smoke check; the bundle ID is
+ambiguous because the original and fork intentionally share it. Do not substitute
+unit tests or log-derived readiness for visual verification. The package smoke
+check uses the actual startup-loaded engine and coordinator, but deliberately
+does not exercise microphone capture, paste, history, or global hotkeys.
+
+Consumer assumptions checked: all recording entry points share startRecording;
+idle does not imply a prepared engine. MenuBarView and DashboardView must observe
+engine transitions as well as recording-stage changes. Existing model-loading
+call sites all use WhisperKitEngine.loadModel, so lifecycle reporting belongs
+there rather than only in AppDelegate startup. Floating recording variants are
+stage-driven overlays; they do not authorize capture. Cloud readiness continues
+to use its existing isModelLoaded contract.
+
 ## User stories and acceptance criteria
 
 - As an on-device English dictator, I want short turbo dictations to finish promptly without processing a fixed brand glossary before my words. A real-engine, warmed short-audio test must finish within five seconds on the diagnosed M2 Pro.

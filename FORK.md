@@ -9,6 +9,8 @@ Personal fork of MetaWhisp's `architecture-phase-1-3` branch, based on 1.3.37.
   post-transcription corrections are unchanged.
 - Model loading includes one bounded inference on silence before reporting ready.
   Its output never enters dictation, history, or billing.
+- Menu and dashboard status track model preparation, not just idle recording.
+  Recording hotkeys and buttons cannot capture audio before the engine is ready.
 - The fork bundle disables the upstream updater. Ordinary upstream-style builds
   retain their existing update behavior.
 
@@ -53,6 +55,24 @@ This avoids both an absolute build-directory dependency and unsigned files in
 the app root. An incompatible dependency update fails the patch check loudly.
 
 ## Trying the fork
+
+Bundle signing and engine benchmarks alone do not verify a launched application.
+For a packaged startup/engine smoke check, quit the running app, create a local
+fixture, then launch the packaged executable with explicit diagnostic arguments:
+
+```sh
+say -v Samantha -r 190 -o /tmp/metawhisp-smoke.aiff 'Hello, this is a test.'
+dist/MetaWhisp-Fork.app/Contents/MacOS/MetaWhisp \
+  --transcription-smoke-test /tmp/metawhisp-smoke.aiff 'this is a test'
+```
+
+The fork-only flag verifies the normally initialized coordinator is ready and
+transcribes the fixture twice. Look for two `[ForkSmoke] PASS` entries in
+`~/Library/Logs/MetaWhisp.log` for the current launch's PID and timestamp; any
+`[ForkSmoke] FAIL` or missing PASS is a failure. Older PASS entries do not count.
+It does not write transcripts to clipboard/history, and does not verify native
+UI rendering, microphone capture, hotkeys, or automatic paste. Those require a
+live dictation and the relevant macOS permissions.
 
 Quit the original MetaWhisp, then open `dist/MetaWhisp-Fork.app`. Do not run both:
 the bundle identifier remains `com.metawhisp.app`, so they share preferences,

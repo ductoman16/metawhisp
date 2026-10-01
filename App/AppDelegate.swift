@@ -1027,6 +1027,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
 
+        await ForkTranscriptionSmoke.runIfRequested(coordinator: coordinator)
+
         // 6a. ITER-058.3 — resume an interrupted quick-start upgrade. Runs
         // strictly AFTER the Pro auto-switch (step 5: a fresh Pro cancels the
         // plan instead of downloading ~1 GB) and AFTER engine creation (step 6:

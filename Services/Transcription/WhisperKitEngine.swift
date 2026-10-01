@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import WhisperKit
 
 /// WhisperKit-based transcription engine. Runs entirely on-device using Metal.
@@ -10,12 +11,49 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     private var whisperKit: WhisperKit?
     private let lock = NSLock()
 
+    enum ModelState: Equatable {
+        case unloaded, preparing, ready
+        case failed(String)
+
+        var label: String {
+            switch self {
+            case .unloaded: "Model not loaded"
+            case .preparing: "Preparing model"
+            case .ready: "Ready"
+            case .failed: "Model load failed"
+            }
+        }
+
+        var recordingError: String? {
+            switch self {
+            case .unloaded: "No model loaded. Select or download a model in Settings."
+            case .preparing: "Preparing the transcription model. Recording will be available when preparation finishes."
+            case .ready: nil
+            case .failed(let message): "Model failed to load: \(message). Retry in Settings."
+            }
+        }
+    }
+
+    let modelState = CurrentValueSubject<ModelState, Never>(.unloaded)
+
     var isModelLoaded: Bool {
         lock.withLock { whisperKit != nil }
     }
 
     /// Load a model by its variant name (e.g. "openai_whisper-large-v3_turbo").
     func loadModel(_ variant: String, progressHandler: (@Sendable (Double) -> Void)?) async throws {
+        if !isModelLoaded { modelState.send(.preparing) }
+        do {
+            try await prepareModel(variant)
+            modelState.send(.ready)
+        } catch {
+            // A replacement load must not disable an already prepared model.
+            if !isModelLoaded { modelState.send(.failed(error.localizedDescription)) }
+            throw error
+        }
+    }
+
+    private func prepareModel(_ variant: String) async throws {
         try Task.checkCancellation()
         let preparationStart = CFAbsoluteTimeGetCurrent()
         let config = WhisperKitConfig(
@@ -54,6 +92,7 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         lock.withLock {
             self.whisperKit = nil
         }
+        modelState.send(.unloaded)
     }
 
     static func decodingOptions(language: String?) -> DecodingOptions {
