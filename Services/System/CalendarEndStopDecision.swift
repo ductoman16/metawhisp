@@ -9,8 +9,15 @@ enum CalendarEndStopDecision: Equatable {
     case keepRunning
     /// Past endDate + grace, audio below quiet threshold → stop now.
     case stopNow
-    /// Past endDate + grace BUT audio is still active → push notification
-    /// to user and re-check at `newDeadline`.
+    /// Both strong signals say meeting is ongoing (audio active AND meeting
+    /// app visible). Extend the deadline silently — no user-facing card.
+    /// ITER-035-followup (2026-05-12): the previous behavior pushed a
+    /// «RECORDING STOPPED · Meeting overrunning» card here, which was both
+    /// misleading (recording was NOT stopped) and noisy (fires within
+    /// minutes of recording start if the calendar event was short).
+    case silentExtend(newDeadline: Date)
+    /// Past endDate + grace, ONE positive signal but not both → push a
+    /// user-facing «still recording» card and re-check at `newDeadline`.
     case notifyAndExtend(newDeadline: Date)
     /// User has ignored too many notify attempts → force stop to prevent
     /// indefinite recording (e.g. someone left mic on overnight after a
@@ -42,11 +49,25 @@ extension CalendarEndStopDecision {
     ///   - eventEnd: `EKEvent.endDate` snapshot from the moment the
     ///     recording started. Stale if user edits the calendar mid-record;
     ///     acceptable trade-off for simplicity.
-    ///   - audioRMSLastNSec: max(mic, system) RMS observed during the
-    ///     last sampling window. Caller usually polls 30s of audio.
+    ///   - audioRMSLastNSec: instantaneous RMS sample at fire time. Used as
+    ///     a fast quiet-check, BUT it can be false-positive during the
+    ///     200-500ms pauses between sentences. The sliding-window guard
+    ///     `recentAudioActive` (below) is the authoritative signal for
+    ///     "someone is still talking."
     ///   - notifyAttemptsSoFar: how many times we've already pushed the
     ///     "meeting overrunning — tap to stop" card. Caller increments
     ///     after each `notifyAndExtend`.
+    ///   - recentAudioActive: ITER-034.1 (2026-05-11) — true iff audio
+    ///     crossed the silence threshold within the last sliding window
+    ///     (caller usually 30s). When true, we never `.stopNow` — at worst
+    ///     we `.notifyAndExtend`. Closes the bug where a single quiet
+    ///     instant between sentences killed an ongoing meeting.
+    ///   - meetingAppVisible: ITER-034.1 — true iff a recognized meeting
+    ///     app (Zoom / Meet / Teams / Discord / FaceTime / Webex / etc) was
+    ///     foreground in the recent ScreenContext window. User-requested
+    ///     signal: "if the meeting is still open on my screen, don't stop
+    ///     it just because there was silence." When true, blocks `.stopNow`
+    ///     same as `recentAudioActive`.
     ///   - graceSeconds: grace period after `eventEnd` before any stop
     ///     decision. Default 60s — covers the common "couple of minutes
     ///     to wrap up" overrun.
@@ -61,6 +82,8 @@ extension CalendarEndStopDecision {
         eventEnd: Date,
         audioRMSLastNSec: Float,
         notifyAttemptsSoFar: Int,
+        recentAudioActive: Bool = false,
+        meetingAppVisible: Bool = false,
         graceSeconds: TimeInterval = CalendarEndStopDecisionRules.defaultGraceSeconds,
         extensionSeconds: TimeInterval = CalendarEndStopDecisionRules.defaultExtensionSeconds,
         quietRMSThreshold: Float = CalendarEndStopDecisionRules.defaultQuietRMSThreshold,
@@ -70,13 +93,43 @@ extension CalendarEndStopDecision {
         let secondsPastEnd = now.timeIntervalSince(eventEnd)
         if secondsPastEnd < graceSeconds { return .keepRunning }
 
-        // Past grace + already exhausted notify budget → force stop.
-        if notifyAttemptsSoFar >= maxNotifyAttempts { return .hardStop }
+        // Past grace + exhausted notify budget → force stop, UNLESS audio is
+        // currently active. 2026-05-15 bug: user's Google-Meet-in-Chrome call
+        // ran for 46 min and got hard-stopped at the 3rd notify because the
+        // meeting-app probe doesn't recognize browser-tab meetings. Audio
+        // was loud the entire time (RMS 0.099-1.0). Real-life recording
+        // shouldn't get killed when there's clearly still conversation.
+        // The safety valve fires ONLY when room is genuinely quiet.
+        if notifyAttemptsSoFar >= maxNotifyAttempts && !recentAudioActive {
+            return .hardStop
+        }
+        // Audio still active after 3 notifies — extend silently rather than
+        // killing the recording. User will get a final card every 5 min if
+        // they want to stop, but the recorder keeps capturing.
+        if notifyAttemptsSoFar >= maxNotifyAttempts {
+            return .silentExtend(newDeadline: now.addingTimeInterval(extensionSeconds))
+        }
 
-        // Past grace, audio quiet → graceful stop.
-        if audioRMSLastNSec < quietRMSThreshold { return .stopNow }
+        // ITER-034.1 — sliding-window guards. A single quiet sample is NOT
+        // enough evidence the meeting is over. We need EITHER:
+        //   • audio continuously quiet for the caller's sliding window, OR
+        //   • the meeting app gone from screen recently.
+        // Either positive signal → don't stop. Both → silent extend.
 
-        // Audio still active → notify user, re-check after extension.
+        // Past grace, audio quiet, and no positive "still going" signal → stop.
+        if audioRMSLastNSec < quietRMSThreshold && !recentAudioActive && !meetingAppVisible {
+            return .stopNow
+        }
+
+        // ITER-035-followup (2026-05-12) — both strong signals say meeting is
+        // ongoing → silent extension, no user card. Avoids the «RECORDING
+        // STOPPED · Meeting overrunning» false-alarm card the user reported
+        // hitting after only ~5 minutes of recording.
+        if recentAudioActive && meetingAppVisible {
+            return .silentExtend(newDeadline: now.addingTimeInterval(extensionSeconds))
+        }
+
+        // One positive signal — uncertain, notify the user and re-check later.
         return .notifyAndExtend(newDeadline: now.addingTimeInterval(extensionSeconds))
     }
 }

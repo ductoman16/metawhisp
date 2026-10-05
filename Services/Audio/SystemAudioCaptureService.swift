@@ -10,6 +10,9 @@ import ScreenCaptureKit
 final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
     @Published var isRecording = false
     @Published var audioLevel: Float = 0
+    /// Physical (un-boosted) RMS of the last buffer — see the mic-side twin in
+    /// AudioRecordingService; silence guards must compare against THIS.
+    @Published var rawRMSLevel: Float = 0
     @Published var audioBars: [Float] = Array(repeating: 0, count: 24)
     /// Last error — surfaced to UI so user knows why recording failed to start.
     @Published var lastError: String?
@@ -23,6 +26,10 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
     private var stream: SCStream?
     private let audioQueue = DispatchQueue(label: "com.metawhisp.system-audio", qos: .userInteractive)
     private var streamOutput: AudioStreamOutput?
+    /// AUD-008 — bumped on every start()/stop(). The async setup task captures its
+    /// value and bails after each suspension point if it no longer matches, so a
+    /// STOP during setup cannot resurrect a recording the user already cancelled.
+    private var startGeneration = 0
 
     /// Based on Screen Recording permission — system audio via SCStream needs it.
     var hasPermission: Bool { CGPreflightScreenCaptureAccess() }
@@ -32,14 +39,39 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
         await PermissionsService.shared.requestScreenRecording()
     }
 
+    /// Samples of leading silence that place a channel starting `seconds`
+    /// into a recording at its true offset.
+    ///
+    /// The buffer is flat and mixing pairs index 0 with index 0, so a channel
+    /// that joins late without this would put the other side's voice at the
+    /// beginning of the meeting — audio that lies about when it was said. This
+    /// is the mic timeline's own answer to an outage (silence placed into the
+    /// timeline is the outage's exact length), applied to the other channel.
+    nonisolated static func leadingSilenceSamples(seconds: Double, rate: Double) -> Int {
+        guard seconds > 0, rate > 0 else { return 0 }
+        return Int((seconds * rate).rounded())
+    }
+
     /// Start capturing all system audio.
     /// Synchronously throws only for immediate state errors — actual SCStream setup is async.
-    func start() throws {
+    /// - Parameter leadingSilenceSeconds: how far into a recording this channel
+    ///   is joining, so its samples land where they belong.
+    func start() throws { try start(leadingSilenceSeconds: 0) }
+
+    func start(leadingSilenceSeconds: Double) throws {
         guard !isRecording, !isStarting else { return }
-        samples = []
-        samples.reserveCapacity(Int(targetSampleRate) * 300) // ~5 min pre-alloc
+        let lead = Self.leadingSilenceSamples(seconds: leadingSilenceSeconds, rate: targetSampleRate)
+        samples = lead > 0 ? [Float](repeating: 0, count: lead) : []
+        placedLeadingSilence = lead
+        samples.reserveCapacity(lead + Int(targetSampleRate) * 300) // ~5 min pre-alloc
+        if lead > 0 {
+            NSLog("[SystemAudio] joining %.1fs into the recording — %d samples of leading silence placed",
+                  leadingSilenceSeconds, lead)
+        }
         lastError = nil
         isStarting = true
+        startGeneration += 1
+        let gen = startGeneration  // AUD-008
 
         // ScreenCaptureKit setup happens async. If permission is missing,
         // SCShareableContent will either trigger the dialog or throw.
@@ -51,6 +83,7 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
             if !CGPreflightScreenCaptureAccess() {
                 NSLog("[SystemAudio] No Screen Recording permission — requesting...")
                 _ = await PermissionsService.shared.requestScreenRecording()
+                guard self.startGeneration == gen else { return }  // AUD-008: stopped during permission prompt
 
                 if !CGPreflightScreenCaptureAccess() {
                     // Keep the popover open — surface error in UI with a clickable hint.
@@ -58,6 +91,7 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
                     // the popover, making the user think "nothing happened".
                     // User can click the error banner to open Settings (see popover strip).
                     self.lastError = "🎥 Screen Recording denied. Click here to open Settings"
+                    NSLog("[SystemAudio] Screen Recording still denied after the request — system audio not captured; user shown the click-to-open-Settings banner")
                     self.isStarting = false
                     return
                 }
@@ -65,9 +99,25 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
 
             do {
                 try await self.setupStream()
+                guard self.startGeneration == gen else {
+                    // AUD-008 — user stopped during setup; tear down the stream we just made.
+                    try? await self.stream?.stopCapture()
+                    self.stream = nil
+                    self.streamOutput = nil
+                    return
+                }
                 self.isRecording = true
                 self.isStarting = false
                 NSLog("[SystemAudio] ✅ Capture started via ScreenCaptureKit")
+            } catch is CancellationError {
+                // Our own `stop()` bumped the generation while the stream was
+                // still being built, and the setup noticed. That is an abort,
+                // not a system failure — reporting it as one put
+                // "System audio failed: … CancellationError" in front of the
+                // owner for a meeting the app itself had just abandoned
+                // (2026-09-16 12:00).
+                self.isStarting = false
+                NSLog("[SystemAudio] setup cancelled — stopped while starting")
             } catch {
                 self.lastError = "System audio failed: \(error.localizedDescription)"
                 self.isStarting = false
@@ -75,6 +125,11 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
             }
         }
     }
+
+    /// Silence placed at the front of the buffer so a late-joining channel
+    /// sits at its true offset. A reader that consumes the buffer live starts
+    /// past it — the padding is history, not something just heard.
+    private(set) var placedLeadingSilence = 0
 
     /// ITER-019 — total samples accumulated so far.
     var currentSampleCount: Int { samples.count }
@@ -89,13 +144,16 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
 
     /// Stop capturing and return collected PCM samples.
     func stop() -> [Float] {
+        startGeneration += 1  // AUD-008: invalidate any in-flight start
+        isStarting = false
         Task {
             try? await stream?.stopCapture()
         }
         stream = nil
-        streamOutput = nil
+        streamOutput = nil   // TR-9/TR-10: drops the per-capture resampler with it
         isRecording = false
         audioLevel = 0
+        rawRMSLevel = 0
         audioBars = Array(repeating: 0, count: 24)
 
         let result = samples
@@ -107,7 +165,35 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
     // MARK: - ScreenCaptureKit Setup
 
     private func setupStream() async throws {
-        let content = try await SCShareableContent.current
+        // ITER-050 B3.6 — `SCShareableContent` transiently reports ZERO
+        // displays (display waking / SCK daemon hiccup); the log shows the
+        // very next attempt minutes later succeeding. Retry briefly before
+        // declaring failure so a one-off hiccup doesn't kill the recording.
+        // A genuinely headless session still fails honestly after ~1.6s.
+        // AUD-008: re-check the generation after every suspension point so a
+        // stop() during the retry window cancels instead of resurrecting a
+        // stream nobody owns.
+        let gen = startGeneration
+        // Five seconds of total silence in the log is what the owner's three
+        // failed auto-starts looked like from outside (2026-09-15 08:30,
+        // 2026-09-16 08:30 and 12:00): the recorder's budget expired and
+        // nothing said which step had not returned. Every step says how long
+        // it took now — counts and durations only, never content.
+        let t0 = Date()
+        var content = try await SCShareableContent.current
+        var attempt = 1
+        while content.displays.isEmpty && attempt < 5 {
+            guard startGeneration == gen else { throw CancellationError() }
+            NSLog("[SystemAudio] shareable content has no displays (attempt %d, %.0f ms) — retrying",
+                  attempt, Date().timeIntervalSince(t0) * 1000)
+            try await Task.sleep(for: .milliseconds(400))
+            content = try await SCShareableContent.current
+            attempt += 1
+        }
+        NSLog("[SystemAudio] shareable content: %d displays, %d windows (%.0f ms, attempt %d)",
+              content.displays.count, content.windows.count,
+              Date().timeIntervalSince(t0) * 1000, attempt)
+        guard startGeneration == gen else { throw CancellationError() }
         guard let display = content.displays.first else {
             throw CaptureError.noDisplay
         }
@@ -128,20 +214,27 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
 
         let newStream = SCStream(filter: filter, configuration: config, delegate: nil)
 
-        // Create output handler
-        let output = AudioStreamOutput { [weak self] sampleBuffer in
-            self?.processSampleBuffer(sampleBuffer)
+        // Create output handler. TR-9/TR-10: the resampler is OWNED by the output
+        // and only ever touched inside its `stream(...)` callback (the SCStream
+        // sample-handler queue), so it never races with MainActor start()/stop().
+        // Created here, before startCapture establishes the happens-before for the
+        // first callback; a fresh one per capture = clean filter state per meeting.
+        let output = AudioStreamOutput(resampler: StreamingResampler(outputRate: targetSampleRate)) { [weak self] sampleBuffer, resampler in
+            self?.processSampleBuffer(sampleBuffer, resampler: resampler)
         }
         self.streamOutput = output
 
         try newStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: audioQueue)
+        let beforeCapture = Date()
         try await newStream.startCapture()
+        NSLog("[SystemAudio] stream capture started (%.0f ms for startCapture, %.0f ms total)",
+              Date().timeIntervalSince(beforeCapture) * 1000, Date().timeIntervalSince(t0) * 1000)
         self.stream = newStream
     }
 
     // MARK: - Audio Processing
 
-    private func processSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    private func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, resampler: StreamingResampler) {
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
         let length = CMBlockBufferGetDataLength(blockBuffer)
         guard length > 0 else { return }
@@ -204,23 +297,20 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
         let rms = sqrtf(sumSq / Float(mono.count))
         let level = sqrtf(min(rms * 12.0, 1.0))
 
-        // Resample to 16kHz (linear interpolation)
-        let ratio = targetSampleRate / sampleRate
-        let outCount = Int(Double(frameCount) * ratio)
-        guard outCount > 0 else { return }
-        var resampled = [Float](repeating: 0, count: outCount)
-        for i in 0..<outCount {
-            let srcIdx = Double(i) / ratio
-            let idx0 = Int(srcIdx)
-            let frac = Float(srcIdx - Double(idx0))
-            let s0 = idx0 < mono.count ? mono[idx0] : 0
-            let s1 = (idx0 + 1) < mono.count ? mono[idx0 + 1] : s0
-            resampled[i] = s0 + frac * (s1 - s0)
-        }
+        // TR-9: resample 48→16 kHz via AVAudioConverter (same mechanism as the
+        // mic path) — proper anti-aliasing low-pass instead of bare linear
+        // interpolation, which folded everything above 8 kHz into the speech
+        // band and degraded the "Them" stream. TR-10: the per-capture converter
+        // carries the fractional source position across buffers, so no samples
+        // are lost at buffer boundaries (the old `Int(frameCount * ratio)`
+        // truncated every buffer and drifted mic/system sync on long calls).
+        let resampled = resampler.resample(mono, from: sampleRate)
+        guard !resampled.isEmpty else { return }
 
         Task { @MainActor in
             self.samples.append(contentsOf: resampled)
             self.audioLevel = level
+            self.rawRMSLevel = rms
             self.updateBars(level: level)
         }
     }
@@ -271,17 +361,6 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
         "com.tinyspeck.slackmacgap":   ["Huddle"],
         // Discord: voice call shows "Voice Connected" / "Voice Call".
         "com.discord.Discord":         ["Voice Connected", "Voice Call"],
-    ]
-
-    /// Browser bundle IDs — we look at the active window title for call keywords.
-    private static let browserBundleIDs: Set<String> = [
-        "com.google.Chrome",
-        "com.apple.Safari",
-        "company.thebrowser.Browser",     // Arc
-        "org.mozilla.firefox",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.operasoftware.Opera",
     ]
 
     /// Window-title keywords that indicate an active video call (matched case-insensitive).
@@ -354,7 +433,7 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
         }
 
         // Browser: scan window title for call keywords.
-        if browserBundleIDs.contains(bundleID) {
+        if BrowserIdentity.isBrowser(bundleID) {
             for (kw, name) in callTitleKeywords where windowTitle.localizedCaseInsensitiveContains(kw) {
                 return name
             }
@@ -386,14 +465,18 @@ final class SystemAudioCaptureService: NSObject, ObservableObject, AudioSource {
 
 /// Wraps the SCStreamOutput protocol to forward audio buffers via closure.
 private final class AudioStreamOutput: NSObject, SCStreamOutput {
-    let handler: (CMSampleBuffer) -> Void
+    let handler: (CMSampleBuffer, StreamingResampler) -> Void
+    /// TR-9/TR-10 — owned here, passed to `handler` and used ONLY inside
+    /// `stream(...)` (the sample-handler queue), so it never crosses threads.
+    private let resampler: StreamingResampler
 
-    init(handler: @escaping (CMSampleBuffer) -> Void) {
+    init(resampler: StreamingResampler, handler: @escaping (CMSampleBuffer, StreamingResampler) -> Void) {
+        self.resampler = resampler
         self.handler = handler
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
-        handler(sampleBuffer)
+        handler(sampleBuffer, resampler)
     }
 }

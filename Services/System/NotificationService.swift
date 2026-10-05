@@ -43,36 +43,37 @@ final class NotificationService: NSObject, ObservableObject {
             NSLog("[Notifications] DND — meeting active, deferring task notify (will land in recap)")
             return
         }
-        let title = source.isEmpty ? "New task" : "New task from \(source)"
+        let title = source.isEmpty ? "Task added" : "Task added from \(source)"
         let note = MWNotification(
             kind: .task,
             title: title,
             body: String(task.taskDescription.prefix(200)),
             onTap: {
-                NSApp.activate(ignoringOtherApps: true)
-                NotificationCenter.default.post(
-                    name: .switchMainTab,
-                    object: MainWindowView.SidebarTab.tasks
-                )
+                // Space-throw fix (2026-06-10): NSApp.activate() snapped the
+                // user to the Space of the app's key window («кидает на первый
+                // экран»). openMainWindow re-places the window on the CURRENT
+                // Space and switches the tab itself.
+                AppDelegate.shared?.openMainWindow(tab: .workspace)
             }
         )
         MWNotificationStack.shared.push(note)
-        NSLog("[Notifications] ✅ Posted task: %@", String(task.taskDescription.prefix(60)))
+        NSLog("[Notifications] ✅ posted task %@ (%d chars)", task.id.uuidString.prefix(8) as CVarArg, task.taskDescription.count)
     }
 
     /// Call detection — fires once per session per app (CallSessionMachine
     /// dedups upstream, so we don't repeat ourselves here).
     func postCallDetected(appName: String, autoStart: Bool) {
         let body = autoStart
-            ? "Recording starts in 5 seconds…"
-            : "Tap the menu bar to start recording."
+            ? "Recording starts in 5 seconds"
+            : "Tap the menu bar to start recording"
         let note = MWNotification(
             kind: .call,
-            title: "\(appName) detected",
+            title: "\(appName) call started",
             body: body,
-            onTap: {
-                NSApp.activate(ignoringOtherApps: true)
-            }
+            // Space-throw fix (2026-06-10): the tap did nothing useful —
+            // NSApp.activate() only snapped the user to another Space. The
+            // card itself already says what to do ("Tap the menu bar…").
+            onTap: nil
         )
         MWNotificationStack.shared.push(note)
         NSLog("[Notifications] ✅ Posted call: %@ (autoStart=%@)", appName, autoStart ? "YES" : "NO")
@@ -84,13 +85,13 @@ final class NotificationService: NSObject, ObservableObject {
         let (title, body): (String, String) = {
             switch reason {
             case .callEnded:
-                return ("Recording stopped", "The call window closed — saving transcript.")
+                return ("Recording saved", "The call window closed — transcript on the way")
             case .silenceTimeout:
                 let mins = Int(AppSettings.shared.meetingSilenceStopMinutes)
-                return ("Recording stopped", "Silence for \(mins) min — saving transcript.")
+                return ("Recording saved", "Silence for \(mins) min — transcript on the way")
             case .maxDurationReached:
                 let hrs = Int(AppSettings.shared.meetingMaxDurationMinutes / 60)
-                return ("Recording stopped", "Hit \(hrs)h max duration — saving transcript.")
+                return ("Recording saved", "Hit \(hrs)h max duration — transcript on the way")
             }
         }()
         let note = MWNotification(
@@ -114,22 +115,46 @@ final class NotificationService: NSObject, ObservableObject {
             return
         }
         let adviceID = advice.id
+        // `headline` exists for exactly this — a short punchy line for the
+        // card — and the card was showing the filing category instead
+        // («Productivity»), which tells the reader nothing about what
+        // happened. Legacy rows have no headline; they fall back to the
+        // advice itself rather than to a category word.
         let note = MWNotification(
             kind: .advice,
-            title: advice.category.capitalized,
+            title: advice.headline ?? String(advice.content.prefix(60)),
             body: String(advice.content.prefix(200)),
             onTap: {
-                NSApp.activate(ignoringOtherApps: true)
-                NotificationCenter.default.post(
-                    name: .switchMainTab,
-                    object: MainWindowView.SidebarTab.tasks
-                )
+                // Space-throw fix (2026-06-10) — see postNewTask.
+                AppDelegate.shared?.openMainWindow(tab: .workspace)
                 NotificationCenter.default.post(name: .markAdviceAsRead, object: adviceID)
-            }
+            },
+            sourceApp: advice.sourceApp
         )
         MWNotificationStack.shared.push(note)
         lastAdviceAt = Date()
         NSLog("[Notifications] ✅ Posted advice: %@", advice.category)
+    }
+
+    /// Result banner for the web sign-in deep link (`metawhisp://auth`). Replaces
+    /// the old force-activate + open-window flow that threw the user onto the
+    /// main window's Space/display after signing in from the browser. The
+    /// banner's `canJoinAllSpaces` panel surfaces wherever the user currently
+    /// is; tapping it opens the app on their terms.
+    func postSignInResult(title: String, body: String) {
+        let note = MWNotification(
+            kind: .signIn,
+            title: title,
+            body: body,
+            onTap: {
+                // Space-throw fix (2026-06-10): openMainWindow alone is enough —
+                // it orders the window onto the CURRENT Space; NSApp.activate()
+                // on top of it re-introduced the Space jump.
+                AppDelegate.shared?.openMainWindow()
+            }
+        )
+        MWNotificationStack.shared.push(note)
+        NSLog("[Notifications] ✅ posted sign-in result (%d-char title)", title.count)
     }
 
     // NOTE: `postMeetingRecap` was deliberately removed. The recap is shown

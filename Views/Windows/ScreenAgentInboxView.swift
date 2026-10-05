@@ -1,0 +1,309 @@
+import SwiftData
+import SwiftUI
+
+/// Where a Screen Agent comment lives after its popup is gone.
+///
+/// A comment used to exist for six seconds and then not exist. Anything noticed
+/// out of the corner of an eye was lost, and anything suppressed because the
+/// user was in a meeting was thrown away rather than deferred. This is the
+/// difference between quiet hours and losing work.
+struct ScreenAgentInboxView: View {
+
+    enum Filter: String, CaseIterable, Identifiable {
+        case new = "New"
+        case later = "Later"
+        case all = "All"
+        var id: String { rawValue }
+    }
+
+    @State private var filter: Filter = .new
+    @State private var items: [ScreenAgentItem] = []
+    @State private var selectedID: UUID?
+    @FocusState private var focusedID: UUID?
+    @State private var health: ScreenAgentHealth?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // The house filter bar, not the system segmented control: that one
+            // paints itself with the OS accent, which is blue on a Mac and has
+            // nothing to do with this app's monochrome palette.
+            HStack(spacing: 8) {
+                ForEach(Filter.allCases) { option in
+                    let isActive = filter == option
+                    Text(option.rawValue.uppercased())
+                        .font(MW.label)
+                        .tracking(0.8)
+                        .foregroundStyle(isActive ? MW.textPrimary : MW.textMuted)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(isActive ? MW.elevated : .clear)
+                        .overlay(Rectangle().stroke(isActive ? MW.borderLight : MW.border,
+                                                    lineWidth: MW.hairline))
+                        .contentShape(Rectangle())
+                        .onTapGesture { filter = option }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+
+            // ITER-072 — the status belongs here, where the user is when they
+            // start wondering why nothing has arrived.
+            if let health, health.isSilentlyIdle {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(health.summary)
+                            .font(.system(size: 11, weight: .medium))
+                        if let action = health.action {
+                            Text(action)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color.orange.opacity(0.08))
+                .accessibilityElement(children: .combine)
+            }
+
+            Divider()
+
+            if visible.isEmpty {
+                emptyState
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(visible, id: \.id) { item in
+                            row(item)
+                                .focusable()
+                                .focused($focusedID, equals: item.id)
+                                // Return opens the comment in conversation, the
+                                // same thing the mouse does. Without it the
+                                // whole surface was mouse-only.
+                                .onKeyPress(.return) { ask(item); return .handled }
+                                .onKeyPress(.space) { ask(item); return .handled }
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear(perform: reload)
+        .onReceive(NotificationCenter.default.publisher(for: .screenAgentOpenItem)) { _ in
+            // The view may already be mounted, in which case onAppear never
+            // fires again and a clicked card would land on whatever was last
+            // being looked at.
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in reload() }
+    }
+
+    // MARK: - Rows
+
+    private func row(_ item: ScreenAgentItem) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(item.sourceApp.uppercased())
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(relativeAge(item.capturedAt))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                stateBadge(item)
+            }
+
+            Text(item.headline)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+
+            if !item.body.isEmpty {
+                Text(item.body)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+
+            if !item.sourceWindowTitle.isEmpty {
+                Text(item.sourceWindowTitle)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 10) {
+                // `.link` is system blue by definition. The primary action
+                // carries the app accent, the rest are quiet text.
+                Button("Ask MetaWhisp") { ask(item) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(MW.accent)
+                Button("Later") { mark(item, .later) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(MW.textSecondary)
+                Button("Dismiss") { mark(item, .dismissed) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(MW.textMuted)
+                Spacer(minLength: 0)
+                // Explicit and separate from closing. Each reason moves a
+                // different thing, which is the only reason to ask at all.
+                Menu("Not helpful") {
+                    ForEach(ScreenAgentDelivery.Feedback.allCases, id: \.rawValue) { reason in
+                        Button(reason.label) { giveFeedback(item, reason) }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .font(.system(size: 11))
+                .accessibilityLabel("Say what was wrong with this comment")
+            }
+            .padding(.top, 2)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(highlight(item))
+        .overlay(alignment: .leading) {
+            // A visible focus ring, not just a tint: keyboard users need to see
+            // where they are.
+            if focusedID == item.id {
+                Rectangle().fill(MW.accent).frame(width: 3)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { ask(item) }
+        // `.contain` rather than `.combine`: the buttons inside stay reachable
+        // as their own elements instead of being flattened into the label.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityLabel(item))
+        .accessibilityHint("Press Return to continue this comment in the conversation")
+    }
+
+    /// Says plainly why a comment never interrupted, instead of leaving the
+    /// user to wonder whether it was shown and missed.
+    private func stateBadge(_ item: ScreenAgentItem) -> some View {
+        let text: String
+        if item.deliveryOutcome == ScreenAgentDelivery.Outcome.suppressed.rawValue {
+            switch ScreenAgentDelivery.SuppressionReason(rawValue: item.suppressionReason ?? "") {
+            case .meetingInProgress: text = "held — you were in a meeting"
+            case .paused: text = "held — paused"
+            case .pacing: text = "held — too soon after the last one"
+            case .stackFull: text = "held — no room on screen"
+            case .staleVisit: text = "held — you had moved on"
+            case .featureOff: text = "held — feature was off"
+            case .dailyBudget: text = "held — enough for today"
+            default: text = "held"
+            }
+        } else if let given = item.feedbackReason,
+                  let reason = ScreenAgentDelivery.Feedback(rawValue: given) {
+            text = "you said: \(reason.label.lowercased())"
+        } else if item.interaction == ScreenAgentDelivery.Interaction.later.rawValue {
+            text = "later"
+        } else {
+            text = ""
+        }
+        return Text(text)
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.tertiary)
+    }
+
+    private func highlight(_ item: ScreenAgentItem) -> Color {
+        if focusedID == item.id { return MW.selectFill }
+        if item.id == selectedID { return MW.subtle }
+        return .clear
+    }
+
+    /// Reads the whole row in one breath, including why it was held back —
+    /// a sighted user gets that from the badge.
+    private func accessibilityLabel(_ item: ScreenAgentItem) -> String {
+        var parts = ["\(item.sourceApp), \(relativeAge(item.capturedAt))", item.headline]
+        if !item.body.isEmpty { parts.append(item.body) }
+        if item.deliveryOutcome == ScreenAgentDelivery.Outcome.suppressed.rawValue {
+            parts.append("Held back, not shown at the time")
+        }
+        return parts.joined(separator: ". ")
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 6) {
+            Text(filter == .new ? "Nothing new" : "Nothing here")
+                .font(.system(size: 13, weight: .medium))
+            Text(health?.isSilentlyIdle == true
+                 ? (health?.action ?? "")
+                 : "Comments from the Screen Agent collect here, including the ones it held back.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+
+    // MARK: - Data
+
+    private var visible: [ScreenAgentItem] {
+        switch filter {
+        case .new:
+            return items.filter {
+                $0.interaction == ScreenAgentDelivery.Interaction.none.rawValue
+                    || $0.interaction == ScreenAgentDelivery.Interaction.timedOut.rawValue
+                    || $0.interaction == ScreenAgentDelivery.Interaction.replaced.rawValue
+            }
+        case .later:
+            return items.filter { $0.interaction == ScreenAgentDelivery.Interaction.later.rawValue }
+        case .all:
+            return items
+        }
+    }
+
+    private func reload() {
+        items = AppDelegate.shared?.screenAgentDelivery?.recentItems() ?? []
+        health = AppDelegate.shared?.screenAgentHealth()
+        NSLog("[ScreenAgentInbox] list loaded — %d item(s), %d unanswered, filter=%@, health=%@", items.count, items.filter({ $0.interaction == ScreenAgentDelivery.Interaction.none.rawValue }).count, filter.rawValue, (health?.isSilentlyIdle ?? false) ? "silently-idle" : "ok")
+        if let pending = AppDelegate.shared?.consumePendingScreenAgentItem() {
+            selectedID = pending
+            filter = .all
+        }
+    }
+
+    /// Continue this comment in the conversation, with its screen pinned.
+    private func ask(_ item: ScreenAgentItem) {
+        AppDelegate.shared?.screenAgentDelivery?.recordInteraction(.opened, itemID: item.id)
+        NotificationCenter.default.post(
+            name: .screenAgentAnchorChat,
+            object: ScreenAgentThreadAnchor(item: item)
+        )
+        NotificationCenter.default.post(name: .screenAgentShowChatPane, object: nil)
+        NSLog("[ScreenAgentInbox] comment opened in chat — from %@, %.0f min old", item.sourceApp, Date().timeIntervalSince(item.capturedAt) / 60)
+        reload()
+    }
+
+    private func giveFeedback(_ item: ScreenAgentItem,
+                              _ reason: ScreenAgentDelivery.Feedback) {
+        AppDelegate.shared?.screenAgentDelivery?.recordFeedback(reason, itemID: item.id)
+        reload()
+    }
+
+    private func mark(_ item: ScreenAgentItem, _ interaction: ScreenAgentDelivery.Interaction) {
+        AppDelegate.shared?.screenAgentDelivery?.recordInteraction(interaction, itemID: item.id)
+        NSLog("[ScreenAgentInbox] user chose %@ on an inbox item", interaction.rawValue)
+        reload()
+    }
+
+    private func relativeAge(_ date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 { return "\(max(0, seconds))s ago" }
+        if seconds < 3600 { return "\(seconds / 60)m ago" }
+        if seconds < 86_400 { return "\(seconds / 3600)h ago" }
+        return "\(seconds / 86_400)d ago"
+    }
+}

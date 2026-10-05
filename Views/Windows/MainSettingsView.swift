@@ -1,3 +1,4 @@
+import SwiftData
 import SwiftUI
 
 struct MainSettingsView: View {
@@ -5,19 +6,36 @@ struct MainSettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var license = LicenseService.shared
     @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
+    /// ITER-039 — local-LLM download progress + downloaded set. Drives the
+    /// Download/Make-active state machine inside `aiModelCard`.
+    @ObservedObject private var mlxManager = MLXModelManager.shared
+    /// ITER-051 F1.4 — live isReady/isLoading for the model cards (they used
+    /// to read `LocalLLMService.shared` without observation, so load state
+    /// changes never refreshed the UI).
+    @ObservedObject private var localLLM = LocalLLMService.shared
 
     // Screen Context app picker sheet
     @State private var showAppPicker = false
     @State private var appCache: [String: AppInfo] = [:]  // bundleID → AppInfo for rendering
+    // ITER-053.1 — delete-screen-history confirm + inline result
+    @State private var confirmDeleteScreenHistory = false
+    @State private var screenHistoryDeleteResult: String?
+    // ITER-054 — Deepgram key draft (commit on ⏎/Save, not per keystroke)
+    @State private var deepgramKeyDraft = ""
+    @State private var geminiKeyDraft = ""
 
     // Tab selection — single column scroll per tab beats the previous two-column wall
     // (1500-line settings was hard to scan).
     @State private var selectedTab: SettingsTab = .general
 
+    /// ITER-056 — 5 tabs, one product vertical each (founder-approved mockup
+    /// 2026-07-15): a key lives next to the feature it powers; Integrations
+    /// holds external services only.
     enum SettingsTab: String, CaseIterable, Identifiable {
         case general = "General"
         case dictation = "Dictation"
-        case ai = "AI"
+        case meetings = "Meetings"
+        case brain = "Second Brain"
         case integrations = "Integrations"
         var id: String { rawValue }
     }
@@ -94,33 +112,38 @@ struct MainSettingsView: View {
         switch tab {
         case .general:
             VStack(spacing: MW.sp12) {
-                accountSection
-                cloudSection
+                accountSection            // + minutes meter + star promo (ITER-056)
+                aiModelsSection           // AI ENGINE — app-wide text intelligence
+                cloudSection              // CLOUD LLM (Pro included / BYOK)
                 twoColumn(hotkeySection, overlaySection)
                 optionsSection
             }
         case .dictation:
             VStack(spacing: MW.sp12) {
-                modelSection
+                modelSection              // engine + Whisper models + cloud provider key
                 microphoneSection
                 twoColumn(languageSection, processingSection)
                 twoColumn(translationSection, textStyleSection)
             }
-        case .ai:
+        case .meetings:
             VStack(spacing: MW.sp12) {
+                meetingSection            // recording + Deepgram + limits + recap + live advice
+            }
+        case .brain:
+            VStack(spacing: MW.sp12) {
+                screenContextSection      // Screen Intelligence
                 twoColumn(memoriesSection, adviceSection)
+                proactiveSection
                 dailySummarySection
                 weeklyPatternsSection
                 voiceQuestionSection
             }
         case .integrations:
             VStack(spacing: MW.sp12) {
-                meetingSection
-                screenContextSection
-                proactiveSection
                 twoColumn(fileIndexingSection, appleNotesSection)
                 calendarSection
                 obsidianSyncSection
+                mcpSection
             }
         }
     }
@@ -244,6 +267,7 @@ struct MainSettingsView: View {
                     }
                 }
             }
+
         }
     }
 
@@ -304,6 +328,128 @@ struct MainSettingsView: View {
             .font(MW.monoSm).foregroundStyle(MW.textMuted)
     }
 
+    /// ITER-054 — optional BYOK Deepgram for MEETING diarization. Works on any
+    /// tier: with a key set, meetings transcribe in one diarized pass on the
+    /// user's own Deepgram account (real speaker labels); dictations unaffected.
+    @ViewBuilder
+    private var deepgramKeyField: some View {
+        let key = settings.deepgramKey
+        GlassDivider()
+        Text("Meeting diarization (optional)")
+            .font(MW.mono).foregroundStyle(MW.textSecondary)
+        HStack(spacing: MW.sp8) {
+            if key.isEmpty {
+                // Codex review — a live binding saved the FIRST keystroke,
+                // key.isEmpty flipped, and the field collapsed to the masked
+                // view with a 1-char «key». Type/paste into a DRAFT, commit on
+                // ⏎ or Save.
+                TextField("", text: $deepgramKeyDraft,
+                          prompt: Text("Deepgram API Key").foregroundStyle(MW.textMuted))
+                    .font(MW.mono)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(MW.textPrimary)
+                    .padding(.horizontal, MW.sp8)
+                    .padding(.vertical, MW.sp4)
+                    .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous).stroke(MW.border, lineWidth: 0.5))
+                    .onSubmit { commitDeepgramKeyDraft() }
+                if !deepgramKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("Save") { commitDeepgramKeyDraft() }
+                        .buttonStyle(.plain)
+                        .font(MW.label).tracking(0.6)
+                        .foregroundStyle(MW.idle)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                                    .stroke(MW.idle.opacity(0.4), lineWidth: 0.5))
+                }
+            } else {
+                HStack(spacing: MW.sp8) {
+                    let masked = String(repeating: "\u{2022}", count: min(20, max(0, key.count - 4))) + String(key.suffix(4))
+                    Text(masked)
+                        .font(MW.mono)
+                        .foregroundStyle(MW.textSecondary)
+                    Spacer()
+                    Circle().fill(MW.idle).frame(width: 6, height: 6)
+                    Button { settings.deepgramKey = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(MW.textMuted)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, MW.sp8)
+                .padding(.vertical, MW.sp4)
+                .overlay(Rectangle().stroke(MW.borderLight, lineWidth: MW.hairline))
+            }
+        }
+        Text("With a key set, meetings are transcribed on YOUR Deepgram account with real speaker labels (who said what) in one pass. Voice dictations are unaffected. console.deepgram.com")
+            .font(MW.monoSm).foregroundStyle(MW.textMuted)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The same optional BYOK deal on a second provider. Tried after Deepgram:
+    /// that one is generally available, this model is in public preview, and a
+    /// preview model is what took the vision path down this month.
+    @ViewBuilder
+    private var geminiKeyField: some View {
+        let key = settings.geminiKey
+        HStack(spacing: MW.sp8) {
+            if key.isEmpty {
+                TextField("", text: $geminiKeyDraft,
+                          prompt: Text("Gemini API Key").foregroundStyle(MW.textMuted))
+                    .font(MW.mono)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(MW.textPrimary)
+                    .padding(.horizontal, MW.sp8)
+                    .padding(.vertical, MW.sp4)
+                    .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous).stroke(MW.border, lineWidth: 0.5))
+                    .onSubmit { commitGeminiKeyDraft() }
+                if !geminiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("Save") { commitGeminiKeyDraft() }
+                        .buttonStyle(.plain)
+                        .font(MW.label).tracking(0.6)
+                        .foregroundStyle(MW.idle)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                                    .stroke(MW.idle.opacity(0.4), lineWidth: 0.5))
+                }
+            } else {
+                HStack(spacing: MW.sp8) {
+                    let masked = String(repeating: "\u{2022}", count: min(20, max(0, key.count - 4))) + String(key.suffix(4))
+                    Text(masked)
+                        .font(MW.mono)
+                        .foregroundStyle(MW.textSecondary)
+                    Spacer()
+                    Circle().fill(MW.idle).frame(width: 6, height: 6)
+                    Button { settings.geminiKey = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(MW.textMuted)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, MW.sp8)
+                .padding(.vertical, MW.sp4)
+                .overlay(Rectangle().stroke(MW.borderLight, lineWidth: MW.hairline))
+            }
+        }
+        Text("Alternative to the above, on YOUR Google account. Speaker labels for up to 8 voices; long meetings are sent in 25-minute pieces because diarization is capped at 30 minutes per request. Used only if the Deepgram field is empty or fails. aistudio.google.com")
+            .font(MW.monoSm).foregroundStyle(MW.textMuted)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func commitGeminiKeyDraft() {
+        let trimmed = geminiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        settings.geminiKey = trimmed
+        geminiKeyDraft = ""
+    }
+
+    /// ITER-054 — commit the Deepgram key draft into the keychain-backed setting.
+    private func commitDeepgramKeyDraft() {
+        let trimmed = deepgramKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        settings.deepgramKey = trimmed
+        deepgramKeyDraft = ""
+    }
+
     private func modelRow(_ info: ModelInfo) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: MW.spaceXs) {
@@ -325,22 +471,48 @@ struct MainSettingsView: View {
         ))
     }
 
+    /// True when THIS model is on disk but its load into the engine failed
+    /// (ITER-058.3). Keyed on the dedicated marker, not the download `phase`:
+    /// an unrelated download running (or finishing) must neither hide nor erase
+    /// a load failure (Codex).
+    private func isLoadFailure(_ modelId: String) -> Bool {
+        modelManager.failedToLoadModelId == modelId && modelManager.isDownloaded(modelId)
+    }
+
     @ViewBuilder
     private func modelAction(_ info: ModelInfo) -> some View {
         if modelManager.isDownloaded(info.id) {
             if settings.selectedModel == info.id {
-                Text("ACTIVE")
-                    .font(MW.monoSm)
-                    .foregroundStyle(MW.idle)
+                // ITER-058.3 (Codex) — a downloaded-but-broken ACTIVE model had
+                // no retry in Settings (only onboarding did). Re-running the
+                // download fast-paths cached files and re-triggers the load.
+                if isLoadFailure(info.id) {
+                    BlocksButton(label: "RETRY") {
+                        modelManager.startDownload(info.id)
+                    }
+                } else {
+                    Text("ACTIVE")
+                        .font(MW.monoSm)
+                        .foregroundStyle(MW.idle)
+                }
             } else {
                 BlocksButton(label: "USE") {
+                    // ITER-058.3 — an explicit pick anywhere cancels the
+                    // quick-start background upgrade: the user chose, we obey.
+                    settings.pendingBestModelUpgrade = false
                     settings.selectedModel = info.id
                 }
             }
-        } else if modelManager.currentDownloadModel == info.id {
+        } else if modelManager.isDownloading, modelManager.currentDownloadModel == info.id {
+            // `isDownloading` too, not just the id: a FAILED download keeps
+            // currentDownloadModel set so the error text stays visible, and the
+            // row used to freeze on stale progress with no way to retry (Codex).
             downloadProgress
         } else {
             BlocksButton(label: "DOWNLOAD") {
+                // ITER-058.3 — same explicit-pick rule as USE (a Settings
+                // download must not later trigger a surprise 950 MB upgrade).
+                settings.pendingBestModelUpgrade = false
                 modelManager.startDownload(info.id)
             }
             .opacity(modelManager.isDownloading ? 0.4 : 1.0)
@@ -660,10 +832,82 @@ struct MainSettingsView: View {
                     .font(MW.monoSm).foregroundStyle(MW.textMuted)
             }
             .buttonStyle(.plain)
+
+            // ITER-056 — meeting-minutes meter. Meetings-only quota; dictations
+            // never blocked. Fetched from the worker on section appear.
+            if license.isPro, let u = license.usage {
+                GlassDivider()
+                HStack {
+                    Text("MEETING MINUTES").blocksLabel()
+                    Spacer()
+                    Text("\(Int(u.balance)) of \(Int(u.limit)) left\(resetDaySuffix(u.periodStart))")
+                        .font(MW.monoSm).foregroundStyle(MW.textSecondary)
+                }
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 4).fill(MW.border)
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(u.balance / max(u.limit, 1) < 0.1 ? MW.processing : MW.idle)
+                            .frame(width: geo.size.width * min(1, max(0, u.balance / max(u.limit, 1))))
+                    }
+                }
+                .frame(height: 7)
+                Text("Only meetings consume minutes. Voice dictations are never blocked.")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+            }
+
+            // ITER-056 — GitHub star promo (3-stage lifecycle, see GitHubStarPromo).
+            if GitHubStarPromo.isVisible(stage: settings.githubStarStage) {
+                HStack(spacing: MW.sp8) {
+                    Text("⭐").font(.system(size: 13))
+                    Text("Enjoying MetaWhisp? Star it on GitHub — it helps the project.")
+                        .font(MW.monoSm).foregroundStyle(MW.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: MW.sp8)
+                    Button("Star") {
+                        NSWorkspace.shared.open(URL(string: "https://github.com/metawhisp/metawhisp")!)
+                        settings.githubStarStage = GitHubStarPromo.afterStarClick(stage: settings.githubStarStage)
+                    }
+                    .buttonStyle(.plain)
+                    .font(MW.monoSm)
+                    .foregroundStyle(MW.textPrimary)
+                    .padding(.horizontal, MW.sp8).padding(.vertical, 3)
+                    .overlay(RoundedRectangle(cornerRadius: MW.rTiny, style: .continuous).stroke(MW.border, lineWidth: 0.5))
+                    if GitHubStarPromo.showsClose(stage: settings.githubStarStage) {
+                        Button {
+                            settings.githubStarStage = GitHubStarPromo.afterCloseClick(stage: settings.githubStarStage)
+                        } label: {
+                            Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(MW.textMuted)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Hide")
+                    }
+                }
+                .padding(MW.sp8)
+                .overlay(RoundedRectangle(cornerRadius: MW.rTiny, style: .continuous).stroke(MW.border, lineWidth: 0.5))
+            }
         }
         .padding(MW.sp16)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .mwCard(radius: MW.rMedium, elevation: .raised)
+        // Codex review — id-bound so signing in WHILE Settings is open
+        // re-fetches (a bare .task runs once per view identity).
+        .task(id: license.licenseKey) { await license.fetchUsage() }
+    }
+
+    /// «· resets on the 25th» from the worker's period_start (day-of-month).
+    private func resetDaySuffix(_ periodStart: String?) -> String {
+        guard let p = periodStart, p.count >= 10,
+              let day = Int(p.suffix(2)) else { return "" }
+        let suffix: String
+        switch day % 10 {
+        case 1 where day != 11: suffix = "st"
+        case 2 where day != 12: suffix = "nd"
+        case 3 where day != 13: suffix = "rd"
+        default: suffix = "th"
+        }
+        return " · resets on the \(day)\(suffix)"
     }
 
     // MARK: - Hotkeys
@@ -923,8 +1167,10 @@ struct MainSettingsView: View {
         panel.allowedContentTypes = [.audio]
         panel.allowsMultipleSelection = false
         panel.message = "Choose a sound file for \(role)"
-        // Activate so the panel renders in front, not hidden behind windows.
-        NSApp.activate(ignoringOtherApps: true)
+        // NO NSApp.activate(ignoringOtherApps:) — its aggressive form throws the
+        // user to the main window's bound Space (see MainWindowController). The
+        // panel keys itself from the already-foreground window — same as the
+        // Obsidian-vault picker below, which has no activate and works fine.
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             // Copy to App Support so file persists
@@ -999,6 +1245,14 @@ struct MainSettingsView: View {
         .mwCard(radius: MW.rMedium, elevation: .raised)
     }
 
+    /// Community CTA tucked into the otherwise-empty right-column space under the
+    /// overlay card. Header + button only — no card border, no section label, no
+    /// star count (per design). Uses the shared `GlassChipButton(accent:)` so the
+    /// button follows the user's selected accent preset (mono / orange / electric
+    /// / mint / violet) instead of any hardcoded colour.
+    // (githubStarSection removed — ITER-056: the star promo lives in
+    // accountSection with the 3-stage lifecycle, see GitHubStarPromo.)
+
     private func pillStyleRow(_ style: (label: String, value: String, desc: String)) -> some View {
         let isSelected = settings.pillStyle == style.value
         return HStack {
@@ -1032,7 +1286,7 @@ struct MainSettingsView: View {
 
     private var cloudSection: some View {
         VStack(alignment: .leading, spacing: MW.sp8) {
-            Text("LLM PROVIDER").blocksLabel()
+            Text("CLOUD LLM").blocksLabel()
 
             if license.isPro {
                 HStack(spacing: MW.sp4) {
@@ -1158,6 +1412,12 @@ struct MainSettingsView: View {
                 Text("Records system audio from Zoom, Meet, Teams. Transcribed locally via WhisperKit.")
                     .font(MW.monoSm).foregroundStyle(MW.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
+                // ITER-054 — BYOK Deepgram diarization. Lives HERE (not in the
+                // cloud-dictation section, hidden for on-device users — Codex
+                // review): the key affects MEETINGS regardless of the dictation
+                // engine, on any tier.
+                deepgramKeyField
+                geminiKeyField
                 GlassDivider()
                 toggleRow("Auto-detect calls", isOn: $settings.autoDetectCalls)
                 if settings.autoDetectCalls {
@@ -1235,9 +1495,45 @@ struct MainSettingsView: View {
     /// Screen Context on (feeds on its ScreenContext pipeline) + Pro (needs embeddings).
     private var proactiveSection: some View {
         VStack(alignment: .leading, spacing: MW.sp10) {
-            toggleRow("Proactive Chip", isOn: $settings.proactiveEnabled)
+            toggleRow("Screen Agent", isOn: $settings.proactiveEnabled)
             if settings.proactiveEnabled {
-                Text("While you're typing in Slack, Mail, Notion, or similar apps, MetaWhisp silently surfaces 2-3 relevant memories, past decisions, and waiting-on tasks as a peripheral chip. Never a notification — no sound, no interrupt.")
+                // ITER-070 — the old copy promised a peripheral chip showing
+                // 2-3 memories and "never a notification". The app has not
+                // behaved that way for a long time, and copy describing a
+                // feature that no longer exists is worse than none.
+                Text("MetaWhisp watches the apps you allow and occasionally says one specific thing — a deadline someone is waiting on, a mistake on screen, a conflict with something you decided earlier. Most of the time it says nothing, which is the point. Comments collect in MetaChat → Inbox, including the ones it held back.")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                GlassDivider()
+
+                // One choice, in plain language, instead of intervals in three
+                // different places.
+                Text("How often").font(MW.mono).foregroundStyle(MW.textSecondary)
+                Picker("", selection: $settings.screenAgentPacing) {
+                    ForEach(ScreenAgentPacing.allCases) { mode in
+                        Text(mode.label).tag(mode.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text((ScreenAgentPacing(rawValue: settings.screenAgentPacing) ?? .balanced).explanation)
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                GlassDivider()
+
+                // ITER-069 — its own consent, never bundled. Agreeing to cloud
+                // text is not agreeing to screenshots.
+                toggleRow("Visual mode", isOn: $settings.screenAgentVisualConsent)
+                Text(settings.screenAgentVisualConsent
+                     ? "Visual enabled — one downscaled image of the allowed, focused window may be sent to the cloud vision model when text alone cannot answer. Never stored, never logged."
+                     : "Text only — MetaWhisp reads recognized text and will not claim things only eyes can verify (a disabled button, a highlighted field).")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                toggleRow("Pause for now", isOn: $settings.screenAgentPaused)
+                Text("Stops the interruptions without turning the feature off — held comments still collect in the Inbox.")
                     .font(MW.monoSm).foregroundStyle(MW.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
                 if !settings.screenContextEnabled {
@@ -1254,7 +1550,7 @@ struct MainSettingsView: View {
                 }
                 Slider(value: $settings.proactiveCooldownMinutes, in: 1...30, step: 1)
                     .controlSize(.small)
-                Text("Minimum gap between chip surfaces. Default 5 min.")
+                Text("Minimum gap between chip surfaces. Default 10 min.")
                     .font(MW.monoSm).foregroundStyle(MW.textMuted)
 
                 GlassDivider()
@@ -1300,15 +1596,107 @@ struct MainSettingsView: View {
                 GlassDivider()
                 toggleRow("Realtime task detection", isOn: $settings.realtimeScreenReactionEnabled)
                 if settings.realtimeScreenReactionEnabled {
-                    Text("LLM checks each new window for actionable tasks. Max 30 checks/hour. Per-app 60s cooldown. Pro only.")
+                    Text("Catches commitments in your chats (\"I'll send it tomorrow\") and auto-completes tasks it sees you finish. Messengers, mail and work browser tabs only. Max 30 checks/hour. Needs Pro, a local model, or your API key.")
                         .font(MW.monoSm).foregroundStyle(MW.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // ITER-057.1 — promotion loop opt-in (default off, like the
+                // rest of proactive notifications).
+                toggleRow("Notify when a task is promoted", isOn: $settings.taskPromotionNotificationsEnabled)
+                Text("Screen-found task candidates auto-promote to My Tasks as slots free up (≈5 active). On = one notification per promoted task.")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // ITER-053.1 — retention + one-click delete. Codex review: OUTSIDE
+            // the `if screenContextEnabled` — the privacy escape hatch must
+            // stay reachable after the user turns capture off (their existing
+            // history doesn't vanish with the toggle).
+            GlassDivider()
+            HStack {
+                Text("Keep history").font(MW.mono).foregroundStyle(MW.textSecondary)
+                Spacer()
+                Picker("", selection: $settings.screenRetentionDays) {
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                    Text("Forever").tag(0)
+                }
+                .labelsHidden()
+                .frame(width: 120)
+                .onChange(of: settings.screenRetentionDays) { _, _ in
+                    AppDelegate.shared?.pruneScreenHistory()
+                }
+            }
+            Text("Raw screen text older than this is deleted automatically. Activity timeline entries are kept longer (\(settings.observationRetentionDays) days).")
+                .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Delete screen history…") {
+                confirmDeleteScreenHistory = true
+            }
+            .buttonStyle(.plain)
+            .font(MW.label).tracking(0.6)
+            .foregroundStyle(MW.recording)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                        .stroke(MW.recording.opacity(0.4), lineWidth: 0.5))
+            .confirmationDialog(
+                "Delete ALL screen history?",
+                isPresented: $confirmDeleteScreenHistory
+            ) {
+                Button("Delete everything", role: .destructive) {
+                    deleteAllScreenHistory()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Removes every captured screen text, timeline entry, and everything derived from your screen: unconfirmed task candidates and screen memories (including their Obsidian copies). Tasks you promoted stay. This cannot be undone.")
+            }
+            if let result = screenHistoryDeleteResult {
+                Text(result)
+                    .font(MW.monoSm).foregroundStyle(MW.idle)
             }
         }
         .padding(MW.sp16)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .mwCard(radius: MW.rMedium, elevation: .raised)
+    }
+
+    /// ITER-053.1 — the one-click promise. Runs on the main actor against the
+    /// shared container; result surfaced inline (no silent destructive ops).
+    private func deleteAllScreenHistory() {
+        guard let container = AppDelegate.shared?.historyService.modelContainer else { return }
+        do {
+            // Fence FIRST: extractor batches / realtime reactions awaiting
+            // their LLM response were built from rows we're about to delete —
+            // make them discard themselves instead of re-inserting.
+            AppDelegate.shared?.screenExtractor.invalidatePendingWork()
+            AppDelegate.shared?.realtimeScreenReactor.invalidatePendingWork()
+            AppDelegate.shared?.proactiveContextService.invalidatePendingWork()
+            let ctx = ModelContext(container)
+            let deleted = try ScreenRetention.deleteAll(in: ctx)
+            // The destructive privacy action covers the in-session buffers
+            // too — otherwise Advice keeps quoting "deleted" OCR for a while.
+            AppDelegate.shared?.screenContext.clearInMemory()
+            // External copies (Codex review): a batch delete bypasses the
+            // MutationService hooks, so remove the Obsidian vault files for
+            // the deleted artifacts and refresh the MCP snapshot explicitly.
+            // Best-effort, like all post-commit hooks.
+            let taskIds = deleted.taskIds
+            let memoryIds = deleted.memoryIds
+            Task { @MainActor in
+                if let exporter = AppDelegate.shared?.obsidianExporter {
+                    for id in taskIds { await exporter.deleteTaskFile(id) }
+                    for id in memoryIds { await exporter.deleteMemoryFile(id) }
+                }
+                MCPSnapshotService.shared.snapshotNow()
+            }
+            screenHistoryDeleteResult = "Deleted \(deleted.contexts) captures, \(deleted.observations) timeline entries, \(deleted.tasks) unconfirmed tasks, \(deleted.memories) screen memories."
+            NSLog("[ScreenRetention] ✅ delete-all: %d contexts, %d observations, %d tasks, %d memories",
+                  deleted.contexts, deleted.observations, deleted.tasks, deleted.memories)
+        } catch {
+            screenHistoryDeleteResult = "Delete failed: \(error.localizedDescription)"
+            NSLog("[ScreenRetention] ⚠️ delete-all failed: %@", error.localizedDescription)
+        }
     }
 
     private var fileIndexingSection: some View {
@@ -1345,7 +1733,7 @@ struct MainSettingsView: View {
         VStack(alignment: .leading, spacing: MW.sp10) {
             toggleRow("Obsidian Sync", isOn: $settings.obsidianSyncEnabled)
             if settings.obsidianSyncEnabled {
-                Text("Appends new memories to <vault>/MetaWhisp/Journal.md so they propagate into your Obsidian-connected knowledge graph (mobile, plugins, search).")
+                Text("Writes voices, meetings, tasks, memories and insights as Markdown files in your Obsidian vault. Date-first folders for time-bound entities, project-first for memories. Tasks support two-way delete.")
                     .font(MW.monoSm).foregroundStyle(MW.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 6) {
@@ -1372,14 +1760,630 @@ struct MainSettingsView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                scanNowButton {
-                    if let svc = AppDelegate.shared?.obsidianSync { _ = await svc.syncNow() }
+                // ITER-035 v2 — manual bulk export. Rerenders every entity
+                // in SwiftData → markdown. Idempotent (overwrites by id-path),
+                // safe to run repeatedly.
+                Button {
+                    Task { @MainActor in
+                        if let exp = AppDelegate.shared?.obsidianExporter {
+                            _ = await exp.bulkExportAll()
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.and.arrow.up.on.square")
+                            .font(.system(size: 10))
+                        Text("Export everything to vault").font(MW.label).tracking(0.6)
+                    }
+                    .foregroundStyle(MW.textPrimary)
+                    .glassChip(selected: false, radius: MW.rTiny)
+                }
+                .buttonStyle(.plain)
+
+                // ITER-037 Option A (2026-05-12) — external LLM access docs.
+                // After bulk export, the user can wire Claude Desktop / Cursor /
+                // ChatGPT to read the vault as «second memory». No custom code —
+                // just MCP filesystem server pointed at the vault path.
+                Divider().padding(.vertical, 4)
+                Text("EXTERNAL LLM ACCESS")
+                    .font(MW.label).tracking(1.0)
+                    .foregroundStyle(MW.textMuted)
+                Text("Once vault is filled, point Claude Desktop / Cursor / ChatGPT at it. They'll read your voices, meetings, tasks and memories as «second memory».")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 6) {
+                    integrationDocButton(label: "Setup Claude Desktop", file: "CLAUDE-DESKTOP-SETUP.md")
+                    integrationDocButton(label: "Setup Cursor", file: "CURSOR-SETUP.md")
+                    integrationDocButton(label: "Setup ChatGPT", file: "CHATGPT-SETUP.md")
                 }
             }
         }
         .padding(MW.sp16)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .mwCard(radius: MW.rMedium, elevation: .raised)
+    }
+
+    /// AUD-029 — MCP snapshot opt-in. Default OFF: no snapshot of memories/tasks/
+    /// conversations is written unless the user enables it here; turning it off
+    /// purges the on-disk file via applyEnabledState().
+    private var mcpSection: some View {
+        VStack(alignment: .leading, spacing: MW.sp10) {
+            toggleRow("MCP Server", isOn: $settings.mcpEnabled)
+            if settings.mcpEnabled {
+                Text("Writes a local snapshot of your memories, tasks and conversation summaries to ~/Library/Application Support/MetaWhisp/mcp-snapshot.json so the standalone metawhisp-mcp tool can answer Claude Desktop / Cursor calls. The file stays on this Mac, owner-only, and is deleted when you turn this off.")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(MW.sp16)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .mwCard(radius: MW.rMedium, elevation: .raised)
+        .onChange(of: settings.mcpEnabled) { _, _ in
+            MCPSnapshotService.shared.applyEnabledState()
+        }
+    }
+
+    /// ITER-037 Option A — opens the relevant setup doc from `specs/integrations/`
+    /// in the user's preferred Markdown viewer (Finder fallback). Bundled into
+    /// the .app at `Contents/Resources/integrations/<file>` by build.sh; here
+    /// we resolve via Bundle.main + NSWorkspace.open.
+    private func integrationDocButton(label: String, file: String) -> some View {
+        Button {
+            // Prefer bundled doc; if not present (debug builds skip resource
+            // copy), open the source spec via filesystem path.
+            let bundledURL = Bundle.main.url(forResource: file.replacingOccurrences(of: ".md", with: ""), withExtension: "md", subdirectory: "integrations")
+            let fallbackURL = URL(fileURLWithPath: "/Users/\(NSUserName())/Code/MetaWhisp/specs/integrations/\(file)")
+            let url = bundledURL ?? (FileManager.default.fileExists(atPath: fallbackURL.path) ? fallbackURL : nil)
+            if let url {
+                NSWorkspace.shared.open(url)
+            } else {
+                NSLog("[Settings] Integration doc not found: %@", file)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "book")
+                    .font(.system(size: 10))
+                Text(label).font(MW.label).tracking(0.6)
+            }
+            .foregroundStyle(MW.textSecondary)
+            .glassChip(selected: false, radius: MW.rTiny)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - AI Models (ITER-039 local LLM catalog)
+
+    /// Section shown in the AI tab. Collapsed by default — `localLLMEnabled`
+    /// toggle controls whether the model catalog is expanded. Keeps the
+    /// section minimal for users who haven't opted in.
+    private var aiModelsSection: some View {
+        VStack(alignment: .leading, spacing: MW.sp10) {
+            Text("AI ENGINE").blocksLabel()
+                // ITER-056 — cross-hint: this is TEXT intelligence (cleanup,
+                // recaps, memories, chat); speech-to-text lives in Dictation.
+                // ITER-044 — Foundation Models is a real backend now, so we only
+                // clear a persisted FM selection when THIS Mac can't run it
+                // (< macOS 26 → verdict .incompatible). On Tahoe+ the selection
+                // is honoured and the auto-loader brings the on-device model up.
+                .onAppear {
+                    if let spec = ModelRegistry.model(byID: settings.localLLMActiveModelID),
+                       spec.isFoundationModels,
+                       !ModelCompatibility.verdict(for: spec).isDownloadable {
+                        settings.localLLMActiveModelID = ""
+                    }
+                }
+
+            // ALWAYS-VISIBLE routing indicator — TEMPORARILY DISABLED
+            // 2026-05-19 on macOS 26 Tahoe. The view triggered NSISEngine
+            // constraint-solver recursion (stack overflow) when the AI tab
+            // is rendered. Suspect: HStack with mixed `.frame(maxWidth: .infinity)`
+            // + `.lineLimit(1)` + nested `.background/.overlay` shapes confuses
+            // macOS 26's stricter SwiftUI→AppKit autoresizing bridge.
+            // Reintroduce after standalone repro + Layout Instruments trace.
+            // currentAIRoutingIndicator
+
+            // Master toggle — collapsed/expanded state driver.
+            // ITER-051 F1.4 — the toggle now has the side effect it always
+            // implied: OFF unloads the model (frees ~3 GB RAM and, since every
+            // service gates on `isReady`, actually stops local routing); ON
+            // with a persisted selection reloads it.
+            toggleRow("Use local model for AI features",
+                      isOn: $settings.localLLMEnabled)
+                .onChange(of: settings.localLLMEnabled) { _, enabled in
+                NSLog("[ITER-039] Settings toggle: local model %@", enabled ? "ON" : "OFF")
+                    if enabled {
+                        let id = settings.localLLMActiveModelID
+                        guard !id.isEmpty else { return }
+                        Task { @MainActor in
+                            try? await LocalLLMService.shared.loadModel(id: id)
+                        }
+                    } else {
+                        LocalLLMService.shared.unloadModel()
+                    }
+                }
+
+            if !settings.localLLMEnabled {
+                // Collapsed — one-line summary so user knows the section exists
+                // and what it does. Tapping the toggle expands it.
+                Text("Run AI features (structured text, memory, tasks, chat) on-device for free instead of through Pro proxy / API key. Toggle on to pick a model.")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                // Expanded — system summary + cards.
+                HStack(spacing: 6) {
+                    Image(systemName: "cpu").font(.system(size: 10))
+                    Text("Your Mac: \(SystemSpecs.summary)")
+                        .font(MW.monoSm).foregroundStyle(MW.textSecondary)
+                }
+                .padding(.bottom, 2)
+
+                ForEach(ModelRegistry.allModels) { spec in
+                    aiModelCard(spec)
+                }
+
+                if !ModelRegistry.allModels.contains(where: { $0.id == settings.localLLMActiveModelID }) {
+                    Text("No active model yet. App keeps using Pro proxy / your API key for AI features in the meantime.")
+                        .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                        .padding(.top, 4)
+                }
+            }
+        }
+        .padding(MW.sp16)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .mwCard(radius: MW.rMedium, elevation: .raised)
+    }
+
+    /// Compact 2-column model card. LEFT = identity + tagline + compat badge.
+    /// RIGHT = stats + action button (right-aligned). Significantly shorter
+    /// than the previous all-left-stacked layout — fits 5 cards in roughly
+    /// the same vertical space as 2 cards before.
+    private func aiModelCard(_ spec: ModelSpec) -> some View {
+        let verdict = ModelCompatibility.verdict(for: spec)
+        let isActive = settings.localLLMActiveModelID == spec.id
+
+        return HStack(alignment: .top, spacing: 16) {
+            // ── LEFT column ───────────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 3) {
+                // Title row
+                HStack(spacing: 6) {
+                    Text(spec.displayName)
+                        .font(MW.mono).fontWeight(.semibold)
+                        .foregroundStyle(MW.textPrimary)
+                    if isActive {
+                        Text("ACTIVE")
+                            .font(.system(size: 8, weight: .bold))
+                            .tracking(1)
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 5).padding(.vertical, 1.5)
+                            .background(MW.idle)
+                            .cornerRadius(2)
+                    }
+                }
+                // Vendor + params
+                Text("\(spec.vendor) · \(spec.paramsDisplay) · \(spec.quantization)")
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                // Tagline
+                Text(spec.bestForTagline)
+                    .font(MW.monoSm).foregroundStyle(MW.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Compatibility badge
+                compatBadge(verdict)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // ── RIGHT column ──────────────────────────────────────────────
+            VStack(alignment: .trailing, spacing: 3) {
+                // Stars
+                Text(String(repeating: "★", count: spec.quality) +
+                     String(repeating: "☆", count: 5 - spec.quality))
+                    .font(MW.monoSm).foregroundStyle(MW.textSecondary)
+                // Speed + RAM packed
+                if spec.isFoundationModels {
+                    Text("native · ~\(spec.ramPeakGB) GB RAM")
+                        .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                } else {
+                    Text("\(spec.speedM1TokPerSec) tok/s · \(spec.ramPeakGB) GB RAM")
+                        .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                }
+                // Languages
+                Text(spec.languages.joined(separator: " · "))
+                    .font(MW.monoSm).foregroundStyle(MW.textMuted)
+                // Action button (always rendered, may be disabled)
+                actionButton(for: spec, verdict: verdict, isActive: isActive)
+                    .padding(.top, 2)
+            }
+            .frame(width: 180, alignment: .trailing)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        // macOS 26 fix: dropped outer `.frame(maxWidth: .infinity)` on
+        // the HStack — collision with inner `.frame(maxWidth: .infinity)`
+        // (LEFT) + `.frame(width: 180)` (RIGHT) caused NSISEngine to
+        // recurse forever during constraint solve (crash 2026-05-19
+        // 20:48 / 20:52 / 20:54). The HStack now sizes to the parent
+        // section's padding container naturally.
+        .frame(maxWidth: .infinity)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
+            RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                .fill(isActive ? MW.idle.opacity(0.08) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                .stroke(isActive ? MW.idle.opacity(0.4) : MW.border, lineWidth: 0.5)
+        )
+    }
+
+    /// Tiny always-visible status row that tells the user where their AI
+    /// is running RIGHT NOW. Computed from `localLLMActiveModelID` +
+    /// `LocalLLMService.isReady` + license + API-key state. Three flavors:
+    ///   - **LOCAL** (green): a downloaded MLX model is loaded and ready,
+    ///     OR Foundation Models is selected on Tahoe.
+    ///   - **CLOUD** (blue): no local model active; Pro proxy or user's
+    ///     own API key is the active LLM path.
+    ///   - **INACTIVE** (dim): no API key, no Pro, no local — AI features
+    ///     are silently no-op for this user.
+    /// The row also names the specific provider/model so the user doesn't
+    /// have to play detective: «Cerebras Qwen 3 235B (Pro)» vs
+    /// «Phi-4 Mini Instruct (on M4 Max)».
+    @ViewBuilder
+    private var currentAIRoutingIndicator: some View {
+        let (label, detail, color) = aiRoutingState()
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 5, height: 5)
+            Text(label)
+                .font(.system(size: 9, weight: .bold))
+                .tracking(0.8)
+                .foregroundStyle(color)
+            Text(detail)
+                .font(MW.monoSm)
+                .foregroundStyle(MW.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        // macOS 26 layout-engine workaround: pinning vertical sizing breaks
+        // the NSISEngine constraint cycle this view contributed to (crash
+        // 2026-05-19 NSISEngine excessive recursion).
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
+            RoundedRectangle(cornerRadius: MW.rTiny, style: .continuous)
+                .fill(color.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: MW.rTiny, style: .continuous)
+                .stroke(color.opacity(0.25), lineWidth: 0.5)
+        )
+    }
+
+    /// Pure resolver — derive the (label, detail, color) tuple from current
+    /// settings/license/local-model state. Kept separate from the View so
+    /// the same routing logic can be re-used later (Dashboard widget,
+    /// telemetry, status menu, etc.) without UI baggage.
+    private func aiRoutingState() -> (label: String, detail: String, color: Color) {
+        // Local path takes priority — if user activated a local model,
+        // that's what's running (or about to run after warm-up).
+        if !settings.localLLMActiveModelID.isEmpty,
+           let spec = ModelRegistry.model(byID: settings.localLLMActiveModelID) {
+            let chipBit = SystemSpecs.chipName  // e.g. "M4 Max"
+            if spec.isFoundationModels {
+                return (
+                    "LOCAL",
+                    "\(spec.displayName) (\(chipBit) Neural Engine)",
+                    MW.idle
+                )
+            }
+            // MLX model. `isReady` reflects whether weights are loaded
+            // into RAM; until that's true we're technically still on
+            // cloud for this tick (Phase 4 will flip isReady to true).
+            if LocalLLMService.shared.isReady {
+                return (
+                    "LOCAL",
+                    "\(spec.displayName) on \(chipBit)",
+                    MW.idle
+                )
+            } else {
+                return (
+                    "LOADING",
+                    "\(spec.displayName) — warming up…",
+                    MW.processing
+                )
+            }
+        }
+
+        // No local model — figure out which cloud path is active.
+        if license.isPro {
+            let providerLabel = settings.llmProvider == "cerebras"
+                ? "Cerebras Qwen 3 235B"
+                : "OpenAI GPT-4o-mini"
+            return (
+                "CLOUD",
+                "\(providerLabel) via Pro proxy",
+                MW.postProcess
+            )
+        }
+
+        // Non-Pro: check user-supplied API key (BYOK path).
+        if !settings.activeAPIKey.isEmpty {
+            let providerLabel = settings.llmProvider == "cerebras"
+                ? "Cerebras (your key)"
+                : "OpenAI (your key)"
+            return ("CLOUD", providerLabel, MW.postProcess)
+        }
+
+        // Nothing wired — AI features no-op for this user.
+        return (
+            "INACTIVE",
+            "No API key, no Pro, no local model — AI features silently disabled",
+            MW.textDim
+        )
+    }
+
+    @ViewBuilder
+    private func compatBadge(_ verdict: CompatibilityVerdict) -> some View {
+        HStack(spacing: 4) {
+            switch verdict {
+            case .recommended:
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 9))
+                    .foregroundStyle(MW.idle)
+                Text("Recommended for your Mac")
+                    .font(MW.monoSm).foregroundStyle(MW.idle)
+            case .slow(let reason):
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 9))
+                    .foregroundStyle(MW.processing)
+                Text(reason)
+                    .font(MW.monoSm).foregroundStyle(MW.processing)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            case .incompatible(let reason):
+                Image(systemName: "xmark.circle.fill").font(.system(size: 9))
+                    .foregroundStyle(MW.recording)
+                Text(reason)
+                    .font(MW.monoSm).foregroundStyle(MW.recording)
+                    .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionButton(for spec: ModelSpec, verdict: CompatibilityVerdict, isActive: Bool) -> some View {
+        if spec.isFoundationModels {
+            // ITER-044 — Foundation Models is a real on-device backend now. On
+            // macOS 26+ (verdict .recommended) it's activatable; below 26 the
+            // verdict is .incompatible and the compat badge already explains
+            // why, so we render no button.
+            if verdict.isDownloadable {
+                foundationModelsActiveButton(spec: spec, isActive: isActive)
+            }
+        } else if verdict.isDownloadable {
+            // MLX model. v1.3.5 ships the download path for Phi-4 Mini only
+            // — other model architectures land in v1.4.0 with the full MLX
+            // inference loop. So we render two flavors of "Download":
+            //   - phi-4-mini → live button calling MLXModelManager
+            //   - everything else → disabled with a "shipping later" tooltip
+            mlxDownloadButton(spec: spec)
+        } else {
+            // Incompatible — show size as plain label, no button.
+            Text(spec.downloadSizeDisplay)
+                .font(MW.label).tracking(0.6)
+                .foregroundStyle(MW.textDim)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+        }
+    }
+
+    /// ITER-044 — Make-active control for the Apple Foundation Models card.
+    /// No download / no weights / no trash: the model is built into macOS 26+.
+    /// Three states mirror the MLX toggle:
+    ///   • not selected          → «Make active» (sets ID + loads on-device)
+    ///   • selected + loaded      → «Active» (click deactivates + unloads)
+    ///   • selected + not loaded  → «Load now» (retry, e.g. after enabling
+    ///     Apple Intelligence). A failed load (AI off / device ineligible /
+    ///     model downloading) surfaces its reason inline via `localLLM.lastError`.
+    @ViewBuilder
+    private func foundationModelsActiveButton(spec: ModelSpec, isActive: Bool) -> some View {
+        let isReady = LocalLLMService.shared.isReady && LocalLLMService.shared.currentModelID == spec.id
+        let isLoadingThis = localLLM.isLoading && settings.localLLMActiveModelID == spec.id
+        let label: String = {
+            if isLoadingThis { return "Loading…" }
+            if isActive && isReady { return "Active" }
+            if isActive && !isReady { return "Load now" }
+            return "Make active"
+        }()
+        VStack(alignment: .trailing, spacing: 2) {
+            Button(label) {
+                if isActive && isReady {
+                    settings.localLLMActiveModelID = ""
+                    Task { @MainActor in LocalLLMService.shared.unloadModel() }
+                } else {
+                    settings.localLLMActiveModelID = spec.id
+                    Task { @MainActor in
+                        try? await LocalLLMService.shared.loadModel(id: spec.id)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .font(MW.label).tracking(0.6)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .foregroundStyle((isActive && isReady) ? .black : MW.textPrimary)
+            .background((isActive && isReady) ? MW.idle :
+                        (isActive ? MW.processing.opacity(0.18) : Color.clear))
+            .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                        .stroke(MW.border, lineWidth: 0.5))
+            .disabled(localLLM.isLoading)
+            // Inline reason when the on-device model refused to load (most
+            // commonly: Apple Intelligence is switched off).
+            if isActive, !isReady, !isLoadingThis, let err = localLLM.lastError {
+                Text(err.errorDescription ?? "Couldn't start Apple Foundation Models")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(MW.recording)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.trailing)
+            }
+        }
+    }
+
+    /// Download/Make-active control for an MLX model card. Three states:
+    ///   - downloading (this spec) → progress label "53% · 1.2/2.3 GB"
+    ///   - downloaded → "Make active" (or "Active") — once Step 4 wires
+    ///     LocalLLMService into hasLLMAccess this actually starts using
+    ///     the model
+    ///   - not downloaded → "Download · 2.3 GB"
+    /// Phi-4 Mini is the only model whose Download is wired in v1.3.5 — the
+    /// other 3 MLX cards stay disabled until v1.4.0 ships their architecture
+    /// adapters (see specs/iterations/ITER-039-local-llm.md → Step 4).
+    @ViewBuilder
+    private func mlxDownloadButton(spec: ModelSpec) -> some View {
+        let isDownloading = mlxManager.activeDownloadID == spec.id
+        let isDownloaded = mlxManager.downloadedIDs.contains(spec.id)
+        let anotherDownloading = mlxManager.activeDownloadID != nil && !isDownloading
+        // v1.3.5 ships Phi-4 Mini's download flow only. Other MLX models
+        // need per-architecture inference code (Step 4) before their
+        // weights are useful — until then we leave their Download dimmed.
+        let isWiredInV135 = (spec.id == "phi-4-mini")
+
+        if isDownloading {
+            // Progress + Cancel pair. Progress label is informational; the
+            // small ✕ button beside it cancels and surfaces a confirm-y
+            // state via `MLXModelManager.cancelActiveDownload()`. Partial
+            // shards stay on disk so the next Download resumes via Hub's
+            // ETag check (no re-download of finished shards).
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 4) {
+                    let pct = Int((mlxManager.progress * 100).rounded())
+                    let mb = Double(mlxManager.bytesCompleted) / 1_048_576
+                    Text("\(pct)% · \(String(format: "%.0f", mb)) MB")
+                        .font(MW.label).tracking(0.6)
+                        .foregroundStyle(MW.processing)
+                    Button {
+                        mlxManager.cancelActiveDownload()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(MW.textMuted)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Cancel download (partial files stay on disk for resume)")
+                }
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                            .stroke(MW.processing.opacity(0.4), lineWidth: 0.5))
+                if mlxManager.retryAttempt > 1 {
+                    Text("Retry \(mlxManager.retryAttempt)/3")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(MW.recording)
+                }
+            }
+        } else if isDownloaded {
+            let isActive = settings.localLLMActiveModelID == spec.id
+            let isReady = LocalLLMService.shared.isReady && LocalLLMService.shared.currentModelID == spec.id
+            // Three-state button label:
+            //   • selected + loaded   → «Active» (click deactivates + unloads)
+            //   • selected + not loaded → «Load now» (click triggers loadModel,
+            //     keeps ID. Happens after app restart since auto-load on
+            //     launch was disabled to prevent watchdog SIGKILL.)
+            //   • not selected         → «Make active» (sets ID + loads)
+            let isLoadingThis = localLLM.isLoading && settings.localLLMActiveModelID == spec.id
+            let label: String = {
+                if isLoadingThis { return "Loading…" }
+                if isActive && isReady { return "Active" }
+                if isActive && !isReady { return "Load now" }
+                return "Make active"
+            }()
+            HStack(spacing: 4) {
+                Button(label) {
+                    if isActive && isReady {
+                        // Deactivating — also unload from memory.
+                        NSLog("[ITER-039] Settings: deactivate %@ (Active clicked)", spec.id)
+                        settings.localLLMActiveModelID = ""
+                        Task { @MainActor in LocalLLMService.shared.unloadModel() }
+                    } else {
+                        // Either «Load now» (ID already set, just reload) or
+                        // «Make active» (set ID + load). Either way: load.
+                        NSLog("[ITER-039] Settings: %@ %@", isActive ? "Load now" : "Make active", spec.id)
+                        settings.localLLMActiveModelID = spec.id
+                        Task { @MainActor in
+                            try? await LocalLLMService.shared.loadModel(id: spec.id)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(MW.label).tracking(0.6)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .foregroundStyle((isActive && isReady) ? .black : MW.textPrimary)
+                .background((isActive && isReady) ? MW.idle :
+                            (isActive ? MW.processing.opacity(0.18) : Color.clear))
+                .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                            .stroke(MW.border, lineWidth: 0.5))
+                .disabled(localLLM.isLoading)   // F1.4 — no double-load
+                Button {
+                    removeDownloadedModel(spec)
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 10))
+                        .foregroundStyle(MW.textMuted)
+                }
+                .buttonStyle(.plain)
+                .help("Delete downloaded weights (\(spec.downloadSizeDisplay)) to free disk space")
+            }
+        } else if isWiredInV135 {
+            VStack(alignment: .trailing, spacing: 2) {
+                Button("Download · \(spec.downloadSizeDisplay)") {
+                    Task {
+                        do {
+                            _ = try await mlxManager.download(spec)
+                        } catch {
+                            NSLog("[ITER-039] download failed for \(spec.id): \(error.localizedDescription)")
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(MW.label).tracking(0.6)
+                .foregroundStyle(anotherDownloading ? MW.textDim : MW.textPrimary)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                            .stroke(MW.border, lineWidth: 0.5))
+                .disabled(anotherDownloading)
+                .help(anotherDownloading ? "Another model is downloading — wait for it to finish." :
+                      "Downloads ~\(spec.downloadSizeDisplay) from HuggingFace. Resumes if interrupted.")
+                // Show last error inline, if any.
+                if let err = mlxManager.lastError[spec.id] {
+                    Text(err)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(MW.recording)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+        } else {
+            Button("Download · \(spec.downloadSizeDisplay)") { }
+                .buttonStyle(.plain)
+                .font(MW.label).tracking(0.6)
+                .foregroundStyle(MW.textDim)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous)
+                            .stroke(MW.border.opacity(0.5), lineWidth: 0.5))
+                .disabled(true)
+                .help("Inference for \(spec.displayName) ships in v1.4.0. v1.3.5 enables Phi-4 Mini only.")
+        }
+    }
+
+    /// Tear-down helper for the trash-icon button on a downloaded model
+    /// card. Two-stage: (1) if this model is currently active, deactivate
+    /// + unload it; (2) remove the on-disk weight shards via
+    /// `MLXModelManager.remove(_:)`. Errors get logged but don't bubble to
+    /// the UI — worst case the directory partially survives and the next
+    /// download fully overwrites it.
+    private func removeDownloadedModel(_ spec: ModelSpec) {
+    NSLog("[ITER-039] Settings: removing weights for %@ (was active: %@)", spec.id, settings.localLLMActiveModelID == spec.id ? "yes" : "no")
+        if settings.localLLMActiveModelID == spec.id {
+            settings.localLLMActiveModelID = ""
+            Task { @MainActor in LocalLLMService.shared.unloadModel() }
+        }
+        do {
+            try mlxManager.remove(spec)
+            NSLog("[ITER-039] ✅ removed weights for %@", spec.id)
+        } catch {
+            NSLog("[ITER-039] failed to remove \(spec.id): \(error.localizedDescription)")
+        }
     }
 
     private var calendarSection: some View {
@@ -1503,7 +2507,7 @@ struct MainSettingsView: View {
                     .labelsHidden()
                     .datePickerStyle(.compact)
                 }
-                Text("Manual trigger: Insights tab → GENERATE WEEKLY DIGEST.")
+                Text("View past recaps in the Weekly Insights tab.")
                     .font(MW.monoSm).foregroundStyle(MW.textMuted)
             }
         }
@@ -1713,10 +2717,10 @@ struct MainSettingsView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
-        // Activate app first — on macOS Sonoma/Sequoia menu bar apps, NSOpenPanel sometimes
-        // renders BEHIND the main window if app isn't frontmost → UI appears frozen.
-        // Also use async .begin() instead of .runModal() so we don't block the main thread.
-        NSApp.activate(ignoringOtherApps: true)
+        // NO NSApp.activate(ignoringOtherApps:) — its aggressive form throws the user
+        // to the main window's bound Space (see MainWindowController). Use async .begin()
+        // (not .runModal()) so we don't block the main thread; the panel keys itself
+        // from the already-foreground window.
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in settings.addIndexedFolder(url.path) }

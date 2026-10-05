@@ -5,6 +5,13 @@ import SwiftData
 /// Uses the existing OpenAIService (Pro) or can work with local LLM when available.
 @MainActor
 final class AdviceService: ObservableObject {
+    /// ITER-041 — user-facing advice generation on the medium tier
+    /// (gpt-oss-20b on Groq). Quality preserved for notification copy;
+    /// ~50% cheaper than heavy. Phase C will gate this with a mini
+    /// relevance check before generate.
+    static let llmTier: LLMTier = .medium
+    static let llmServiceId: String = "AdviceService"
+
     @Published var latestAdvice: AdviceItem?
     @Published var isGenerating = false
     /// Last error surfaced from a generation attempt (network, HTTP, parse).
@@ -41,7 +48,9 @@ final class AdviceService: ObservableObject {
 
     /// True if we can call an LLM: either user has their own API key, or they're Pro (server proxy).
     private var hasLLMAccess: Bool {
-        !settings.activeAPIKey.isEmpty || LicenseService.shared.isPro
+        !settings.activeAPIKey.isEmpty
+            || LicenseService.shared.isPro
+            || LocalLLMService.shared.isReady
     }
 
     /// Start periodic advice generation.
@@ -65,6 +74,7 @@ final class AdviceService: ObservableObject {
     /// Generate advice based on current context.
     @discardableResult
     func generateAdvice(extraContext: String? = nil) async -> AdviceItem? {
+    if isGenerating { NSLog("[Advice] trigger dropped — previous generation still running") }
         guard !isGenerating else { return nil }
         guard hasLLMAccess else {
             NSLog("[Advice] No LLM access — skipping (need API key or Pro)")
@@ -92,8 +102,29 @@ final class AdviceService: ObservableObject {
             // time so toggle changes take effect immediately, not on next launch.
             let prompt = Self.activePrompt
             let mode = settings.adviceCoachMode ? "coach" : "standard"
+            NSLog("[Advice] ▶️ generate — screenContexts=%d, prompt=%d chars, extra=%d chars, mode=%@", contexts.count, contextBlock.count, extraContext?.count ?? 0, mode)
             let response: String
-            if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
+            // ITER-039 — local LLM takes priority when loaded.
+            if LocalLLMService.shared.isReady {
+                NSLog("[Advice] Generating via local Phi (mode=%@)", mode)
+                response = try await LocalLLMService.shared.completeBlocking(
+                    system: prompt, user: contextBlock, maxTokens: 256
+                )
+            } else if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
+                // ITER-041 Phase C — cheap relevance gate before the
+                // medium-tier advice generate. Skip when score < 0.65.
+                let gate = await GateClient.call(
+                    context: contextBlock,
+                    purpose: .advice,
+                    recentTopics: [],
+                    serviceId: Self.llmServiceId,
+                    licenseKey: licenseKey
+                )
+                guard gate.shouldFire else {
+                    NSLog("[Advice] gate-skipped score=%.2f — %@",
+                          gate.score, String(gate.reasoning.prefix(80)))
+                    return nil
+                }
                 NSLog("[Advice] Generating via Pro proxy (mode=%@)", mode)
                 response = try await callProProxy(system: prompt, user: contextBlock, licenseKey: licenseKey)
             } else {
@@ -119,7 +150,7 @@ final class AdviceService: ObservableObject {
             }
 
             guard let advice = parseAdviceResponse(response, contexts: contexts) else {
-                NSLog("[Advice] ⚠️ Failed to parse LLM response as advice OR no_advice: %@", String(response.prefix(300)))
+                NSLog("[Advice] ⚠️ failed to parse the model reply as advice or no_advice — %d chars", response.count)
                 return nil
             }
 
@@ -132,8 +163,9 @@ final class AdviceService: ObservableObject {
 
             latestAdvice = advice
             NotificationService.shared.postAdvice(advice)
+            NSLog("[Advice] ✅ generated — category=%@, confidence=%.2f, content=%d chars, headline=%@", advice.category, advice.confidence, advice.content.count, advice.headline == nil ? "NO" : "YES")
 
-            NSLog("[Advice] ✅ Generated (%d chars): %@", advice.content.count, advice.content)
+            NSLog("[Advice] ✅ generated (%d chars)", advice.content.count)
             return advice
 
         } catch {
@@ -419,7 +451,7 @@ final class AdviceService: ObservableObject {
         guard let container = modelContainer else { return [] }
         let ctx = ModelContext(container)
         var desc = FetchDescriptor<UserMemory>(
-            predicate: #Predicate { !$0.isDismissed },
+            predicate: #Predicate { !$0.isDismissed && !$0.needsReview },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         desc.fetchLimit = limit
@@ -466,7 +498,7 @@ final class AdviceService: ObservableObject {
         guard let container = modelContainer else { return [] }
         let ctx = ModelContext(container)
         let desc = FetchDescriptor<UserMemory>(
-            predicate: #Predicate<UserMemory> { !$0.isDismissed && $0.embedding != nil },
+            predicate: #Predicate<UserMemory> { !$0.isDismissed && !$0.needsReview && $0.embedding != nil },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         let candidates = (try? ctx.fetch(desc)) ?? []
@@ -524,14 +556,17 @@ final class AdviceService: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
 
-        let body: [String: Any] = ["system": system, "user": user]
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user,
+            tier: Self.llmTier, serviceId: Self.llmServiceId
+        )
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             let bodyStr = String(data: data, encoding: .utf8) ?? ""
-            NSLog("[Advice] PRO ❌ HTTP %d: %@", http.statusCode, String(bodyStr.prefix(200)))
+            NSLog("[Advice] PRO ❌ HTTP %d — %@", http.statusCode, LLMRequestBody.proxyReason(data))
             throw ProcessingError.apiError("Advice proxy: HTTP \(http.statusCode)")
         }
 

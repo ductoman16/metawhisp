@@ -87,6 +87,11 @@ final class ChatToolExecutor: ObservableObject {
     /// the query string. Without it they fall back to substring match (still useful).
     weak var embeddingService: EmbeddingService?
 
+    /// SB-2 — route Task/UserMemory commits through MutationService so a failed
+    /// save propagates (no more `try? + ok = true`) and Obsidian/MCP refresh on
+    /// success. Injectable so tests can substitute no-op hooks.
+    var mutationService: MutationService = .shared
+
     func configure(modelContainer: ModelContainer, embeddingService: EmbeddingService? = nil) {
         self.modelContainer = modelContainer
         self.embeddingService = embeddingService
@@ -227,12 +232,17 @@ final class ChatToolExecutor: ObservableObject {
                 "wasIsDismissed": task.isDismissed,
                 "wasStatus": task.status ?? "committed",
             ])
-            task.isDismissed = true
-            task.status = "dismissed"
-            task.updatedAt = Date()
-            try? ctx.save()
-            ok = true
-            summary = "Dismissed task: \(task.taskDescription)"
+            do {
+                try mutationService.commit(.taskSaved(task.id), in: ctx) {
+                    task.isDismissed = true
+                    task.status = "dismissed"
+                    task.updatedAt = Date()
+                }
+                ok = true
+                summary = "Dismissed task: \(task.taskDescription)"
+            } catch {
+                summary = "Couldn't save — the task wasn't dismissed (\(error.localizedDescription))"
+            }
 
         case "completeTask":
             guard let idStr = call.args["id"], let uuid = UUID(uuidString: idStr),
@@ -247,12 +257,17 @@ final class ChatToolExecutor: ObservableObject {
                 "wasCompleted": task.completed,
                 "wasCompletedAt": task.completedAt.map { ISO8601DateFormatter().string(from: $0) } as Any,
             ])
-            task.completed = true
-            task.completedAt = Date()
-            task.updatedAt = Date()
-            try? ctx.save()
-            ok = true
-            summary = "Marked done: \(task.taskDescription)"
+            do {
+                try mutationService.commit(.taskSaved(task.id), in: ctx) {
+                    task.completed = true
+                    task.completedAt = Date()
+                    task.updatedAt = Date()
+                }
+                ok = true
+                summary = "Marked done: \(task.taskDescription)"
+            } catch {
+                summary = "Couldn't save — the task wasn't marked done (\(error.localizedDescription))"
+            }
 
         case "dismissMemory":
             guard let idStr = call.args["id"], let uuid = UUID(uuidString: idStr),
@@ -266,11 +281,20 @@ final class ChatToolExecutor: ObservableObject {
                 "memoryId": mem.id.uuidString,
                 "wasIsDismissed": mem.isDismissed,
             ])
-            mem.isDismissed = true
-            mem.updatedAt = Date()
-            try? ctx.save()
-            ok = true
-            summary = "Forgot: \(mem.content.prefix(80))"
+            do {
+                // .memoryDismissed (not .memorySaved): the saved-hook calls
+                // exportMemory, which no-ops on a dismissed memory — leaving the
+                // stale .md in the vault (AUD-030). The dismissed-hook deletes it.
+                // (Tasks don't need this: exportTask itself deletes when dismissed.)
+                try mutationService.commit(.memoryDismissed(mem.id), in: ctx) {
+                    mem.isDismissed = true
+                    mem.updatedAt = Date()
+                }
+                ok = true
+                summary = "Forgot: \(mem.content.prefix(80))"
+            } catch {
+                summary = "Couldn't save — the memory wasn't forgotten (\(error.localizedDescription))"
+            }
 
         case "updateGoalProgress":
             guard let idStr = call.args["id"], let uuid = UUID(uuidString: idStr),
@@ -308,9 +332,16 @@ final class ChatToolExecutor: ObservableObject {
             }
             goal.lastProgressAt = Date()
             goal.updatedAt = Date()
-            try? ctx.save()
-            ok = true
-            summary = "Updated goal \"\(goal.title)\" → \(goal.progressLabel)"
+            // Goal is outside MutationService's Task/UserMemory scope (it has no
+            // Obsidian export); still propagate the save so a failure isn't
+            // reported as success.
+            do {
+                try ctx.save()
+                ok = true
+                summary = "Updated goal \"\(goal.title)\" → \(goal.progressLabel)"
+            } catch {
+                summary = "Couldn't save — the goal wasn't updated (\(error.localizedDescription))"
+            }
 
         case "addTask":
             guard let desc = call.args["description"]?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -337,13 +368,16 @@ final class ChatToolExecutor: ObservableObject {
                 sourceApp: "MetaChat",
                 assignee: assignee
             )
-            ctx.insert(task)
-            try? ctx.save()
-            // Snapshot AFTER insert — undo = soft-delete the row we just created.
-            snapshotJSON = encodeSnapshot(["createdTaskId": task.id.uuidString])
-            ok = true
-            let tag = assignee.map { " (waiting on \($0))" } ?? ""
-            summary = "Added task: \(desc)\(tag)"
+            do {
+                try mutationService.insert(task, in: ctx)
+                // Snapshot AFTER insert — undo = soft-delete the row we just created.
+                snapshotJSON = encodeSnapshot(["createdTaskId": task.id.uuidString])
+                ok = true
+                let tag = assignee.map { " (waiting on \($0))" } ?? ""
+                summary = "Added task: \(desc)\(tag)"
+            } catch {
+                summary = "Couldn't save the new task (\(error.localizedDescription))"
+            }
 
         case "addMemory":
             guard let content = call.args["content"]?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -360,11 +394,14 @@ final class ChatToolExecutor: ObservableObject {
                 sourceApp: "MetaChat",
                 confidence: 1.0
             )
-            ctx.insert(mem)
-            try? ctx.save()
-            snapshotJSON = encodeSnapshot(["createdMemoryId": mem.id.uuidString])
-            ok = true
-            summary = "Stored memory: \(content.prefix(80))"
+            do {
+                try mutationService.insert(mem, in: ctx)
+                snapshotJSON = encodeSnapshot(["createdMemoryId": mem.id.uuidString])
+                ok = true
+                summary = "Stored memory: \(content.prefix(80))"
+            } catch {
+                summary = "Couldn't save the new memory (\(error.localizedDescription))"
+            }
 
         default:
             let r = ExecResult(ok: false, summary: "Unknown tool: \(call.tool)", auditId: nil)
@@ -402,6 +439,7 @@ final class ChatToolExecutor: ObservableObject {
         case "searchTasks":       return await searchTasks(call.args)
         case "searchMemories":    return await searchMemories(call.args)
         case "searchConversations": return await searchConversations(call.args)
+        case "searchScreenHistory": return await searchScreenHistory(call.args)
         default:
             return ExecResult(ok: false, summary: "Unknown read-only tool", auditId: nil)
         }
@@ -442,7 +480,7 @@ final class ChatToolExecutor: ObservableObject {
 
         let ctx = ModelContext(container)
         let desc = FetchDescriptor<UserMemory>(
-            predicate: #Predicate { !$0.isDismissed },
+            predicate: #Predicate { !$0.isDismissed && !$0.needsReview },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         let all = (try? ctx.fetch(desc)) ?? []
@@ -488,6 +526,135 @@ final class ChatToolExecutor: ObservableObject {
         return ExecResult(ok: true, summary: jsonString(["items": payload, "count": payload.count]), auditId: nil)
     }
 
+    /// ITER-053.4 (первый срез) — «спроси свой экран»: searches BOTH layers of
+    /// the screen store within a day window. Distilled ScreenObservation rows
+    /// answer «что я делал по X»; raw ScreenContext OCR answers «что мне писал
+    /// Alex» / «где я видел ту ссылку» (messengers, pages, code the user saw).
+    /// Keyword ranking v1 — plugs into semantic automatically once observations
+    /// get embeddings (053.4 full).
+    private func searchScreenHistory(_ args: [String: String]) async -> ExecResult {
+        // ITER-069 §5 — the master toggle governs the stored OCR too. With
+        // Screen Context off, months of already-captured screen text were
+        // still searchable and still fed into model prompts: off meant "stop
+        // capturing", not "stop using what was captured", and nothing told the
+        // user about the difference.
+        guard AppSettings.shared.screenContextEnabled else {
+            return ExecResult(ok: false,
+                              summary: "Screen history is unavailable — Screen Context is turned off.",
+                              auditId: nil)
+        }
+        guard let container = modelContainer else { return ExecResult(ok: false, summary: "no db", auditId: nil) }
+        let query = args["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !query.isEmpty else { return ExecResult(ok: false, summary: "Empty query", auditId: nil) }
+        let limit = min(20, max(1, Int(args["limit"] ?? "8") ?? 8))
+        let days = min(90, max(1, Int(args["days"] ?? "7") ?? 7))
+        let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
+        // Review fix — LOCAL timezone, not UTC: «что я делал вчера» is a
+        // day-boundary question; UTC stamps shift the user's evening into the
+        // wrong day and the LLM answers about the wrong date.
+        let iso = ISO8601DateFormatter()
+        iso.timeZone = .current
+
+        let ownApp = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "MetaWhisp"
+        let ctx = ModelContext(container)
+        // Distilled timeline — «what was I doing». Own-app rows dropped for the
+        // same feedback-loop reason as raw OCR below (review fix — the filter
+        // used to cover only one of the two layers).
+        let obsDesc = FetchDescriptor<ScreenObservation>(
+            predicate: #Predicate { $0.endedAt >= cutoff },
+            sortBy: [SortDescriptor(\.endedAt, order: .reverse)]
+        )
+        let observations = ((try? ctx.fetch(obsDesc)) ?? []).filter {
+            !ScreenContextNoiseFilter.isOwnWindow(appName: $0.appName, ownAppName: ownApp)
+        }
+        // ITER-053.4 slice 2 — semantic when observations carry embeddings
+        // (rankByQuery falls back to keyword for nil rows / non-Pro).
+        let rankedObs = await rankByQuery(
+            items: observations, query: query, embedding: { $0.embedding },
+            textForSubstring: { "\($0.appName) \($0.windowTitle ?? "") \($0.contextSummary) \($0.currentActivity)" },
+            limit: limit)
+
+        // Raw OCR — «what did I see / what did people write me». Newest-first,
+        // bounded fetch so months of rows can't blow memory; own-app windows
+        // are a feedback loop (our answers re-captured as "facts") — dropped.
+        var rawDesc = FetchDescriptor<ScreenContext>(
+            predicate: #Predicate { $0.timestamp >= cutoff },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        rawDesc.fetchLimit = 2000
+        let raws = ((try? ctx.fetch(rawDesc)) ?? []).filter {
+            !ScreenContextNoiseFilter.isOwnWindow(appName: $0.appName, ownAppName: ownApp)
+        }
+        let rankedRaw = await rankByQuery(
+            items: raws, query: query, embedding: { _ in nil },
+            textForSubstring: { "\($0.appName) \($0.windowTitle) \($0.ocrText)" },
+            limit: limit)
+
+        let activities: [[String: Any]] = rankedObs.map { o in
+            [
+                "when": iso.string(from: o.endedAt),
+                "app": o.appName,
+                "summary": o.contextSummary,
+                "activity": o.currentActivity,
+            ]
+        }
+        let screenTexts: [[String: Any]] = rankedRaw.map { r in
+            [
+                "when": iso.string(from: r.timestamp),
+                "app": r.appName,
+                "window": r.windowTitle,
+                "snippet": Self.matchSnippet(in: r.ocrText, query: query),
+            ]
+        }
+        // ITER-071 §6 — what the record does NOT cover, in the answer's own
+        // terms. Without it a handful of observed minutes reads as the whole
+        // afternoon, and the user builds on a day the app never saw.
+        var coverageDesc = FetchDescriptor<ScreenContext>(
+            predicate: #Predicate { $0.timestamp >= cutoff },
+            sortBy: [SortDescriptor(\.timestamp, order: .forward)]
+        )
+        coverageDesc.fetchLimit = 20_000
+        coverageDesc.propertiesToFetch = [\.timestamp]
+        let stamps = ((try? ctx.fetch(coverageDesc)) ?? []).map(\.timestamp)
+        let coverage = ScreenCoverage.report(from: cutoff, to: Date(), samples: stamps)
+
+        return ExecResult(ok: true, summary: jsonString([
+            "activities": activities,
+            "screen_texts": screenTexts,
+            "count": activities.count + screenTexts.count,
+            "window_days": days,
+            "coverage": ScreenCoverage.honestyLine(
+                coverage, captureEnabled: AppSettings.shared.screenContextEnabled),
+            "observed_fraction": Int((coverage.observedFraction * 100).rounded()),
+        ]), auditId: nil)
+    }
+
+    /// Slice ~2×radius chars of OCR around the first query-token hit so the
+    /// LLM gets the evidence, not a 4KB wall. Head of text when nothing hits.
+    static func matchSnippet(in text: String, query: String, radius: Int = 120) -> String {
+        let tokens = query.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
+        // Earliest case-insensitive hit across tokens — ranges from `text`
+        // itself (indices from a lowercased COPY are not transferable).
+        var hit: Range<String.Index>?
+        for t in tokens {
+            if let r = text.range(of: t, options: [.caseInsensitive, .diacriticInsensitive]),
+               hit == nil || r.lowerBound < hit!.lowerBound {
+                hit = r
+            }
+        }
+        guard let found = hit else {
+            return String(text.prefix(2 * radius)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let start = text.index(found.lowerBound, offsetBy: -radius, limitedBy: text.startIndex) ?? text.startIndex
+        let end = text.index(found.lowerBound, offsetBy: radius, limitedBy: text.endIndex) ?? text.endIndex
+        var s = String(text[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if start > text.startIndex { s = "…" + s }
+        if end < text.endIndex { s += "…" }
+        return s
+    }
+
     /// Generic ranker: try semantic (cosine on embedding) when query embedding is
     /// available, fall back to substring/keyword match otherwise. Substring fallback
     /// is permissive — splits query into tokens and counts matches in the text field.
@@ -497,35 +664,55 @@ final class ChatToolExecutor: ObservableObject {
                                             textForSubstring: (T) -> String,
                                             limit: Int) async -> [T] {
         guard !items.isEmpty else { return [] }
-        // Try semantic ranking via embeddings (Pro only).
-        if let svc = embeddingService, LicenseService.shared.isPro {
+
+        // Substring ranker: token overlap count. Used as the primary path when
+        // no embeddings exist, and as the FILLER for un-embedded rows when the
+        // semantic path runs (Codex review — during gradual backfill, rows
+        // without vectors must degrade to keyword matching, not vanish).
+        func keywordRanked(_ candidates: [T], cap: Int) -> [T] {
+            let qTokens = query.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { $0.count >= 2 }
+            guard !qTokens.isEmpty else { return Array(candidates.prefix(cap)) }
+            return candidates.map { item -> (T, Int) in
+                let text = textForSubstring(item).lowercased()
+                let hits = qTokens.reduce(0) { $0 + (text.contains($1) ? 1 : 0) }
+                return (item, hits)
+            }
+            .filter { $0.1 > 0 }
+            .sorted { $0.1 > $1.1 }
+            .prefix(cap)
+            .map { $0.0 }
+        }
+
+        // Try semantic ranking via embeddings (Pro only). Review fix: embed the
+        // QUERY only when at least one item actually carries an embedding —
+        // otherwise the network call is a guaranteed-wasted ~300ms + Pro cost.
+        if let svc = embeddingService, LicenseService.shared.isPro,
+           items.contains(where: { embedding($0) != nil }) {
             if let qVec = try? await svc.embedOne(query) {
                 var scored: [(T, Float)] = []
+                var unembedded: [T] = []
                 for item in items {
-                    guard let data = embedding(item) else { continue }
+                    guard let data = embedding(item) else { unembedded.append(item); continue }
                     let vec = EmbeddingService.decode(data)
-                    if vec.isEmpty { continue }
+                    if vec.isEmpty { unembedded.append(item); continue }
                     scored.append((item, EmbeddingService.cosineSimilarity(qVec, vec)))
                 }
                 if !scored.isEmpty {
-                    return scored.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
+                    let semanticAll = scored.sorted { $0.1 > $1.1 }.map { $0.0 }
+                    // Codex review — unembedded rows with REAL keyword hits must
+                    // compete even when embedded rows alone could fill the limit
+                    // (mid-backfill, an exact match must not vanish). They get
+                    // up to half the slots; semantic keeps at least half.
+                    let kwFiller = keywordRanked(unembedded, cap: limit)
+                    guard !kwFiller.isEmpty else { return Array(semanticAll.prefix(limit)) }
+                    let semCount = max(limit - kwFiller.count, limit / 2)
+                    return Array((semanticAll.prefix(semCount) + kwFiller).prefix(limit))
                 }
             }
         }
-        // Substring fallback: token overlap count.
-        let qTokens = query.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { $0.count >= 2 }
-        guard !qTokens.isEmpty else { return Array(items.prefix(limit)) }
-        let scored = items.map { item -> (T, Int) in
-            let text = textForSubstring(item).lowercased()
-            let hits = qTokens.reduce(0) { $0 + (text.contains($1) ? 1 : 0) }
-            return (item, hits)
-        }
-        return scored.filter { $0.1 > 0 }
-            .sorted { $0.1 > $1.1 }
-            .prefix(limit)
-            .map { $0.0 }
+        return keywordRanked(items, cap: limit)
     }
 
     private func jsonString(_ obj: Any) -> String {
@@ -619,7 +806,13 @@ final class ChatToolExecutor: ObservableObject {
         }
 
         entry.undone = true
-        try? ctx.save()
+        // SB-2: propagate a save failure instead of falsely reporting "Reverted".
+        // (External-surface re-sync after undo — Obsidian/MCP — is SB-3.)
+        do {
+            try ctx.save()
+        } catch {
+            return "Couldn't save the undo — nothing was reverted (\(error.localizedDescription))"
+        }
         return "Reverted: \(entry.resultSummary)"
     }
 
@@ -824,6 +1017,23 @@ final class ChatToolExecutor: ObservableObject {
                 ],
             ],
         ],
+        // ── ITER-053.4 — screen-history search ────────────────────────────────
+        [
+            "type": "function",
+            "function": [
+                "name": "searchScreenHistory",
+                "description": "Search what was ON THE USER'S SCREEN: the activity timeline plus raw captured screen text (messages they read, pages, code). Use for \"что я делал по X\", \"что мне писал <человек>\", \"где я видел ту ссылку/цифру\". Returns activities (what the user was doing, with time+app) and screen_texts (verbatim snippets with time+app+window).",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string", "description": "Free-text query — topic, person, project, phrase."],
+                        "days": ["type": "integer", "description": "How many days back to search. Default 7, max 90."],
+                        "limit": ["type": "integer", "description": "Max results per group. Default 8, max 20."],
+                    ],
+                    "required": ["query"],
+                ],
+            ],
+        ],
     ]
 
     /// Set of tool names that don't mutate state. Read-only tools auto-execute
@@ -831,7 +1041,7 @@ final class ChatToolExecutor: ObservableObject {
     /// to undo — they only read). Keep this list narrow — when in doubt, treat
     /// as mutation.
     static let readOnlyTools: Set<String> = [
-        "searchTasks", "searchMemories", "searchConversations",
+        "searchTasks", "searchMemories", "searchConversations", "searchScreenHistory",
     ]
 
     static func isReadOnly(_ tool: String) -> Bool {
@@ -869,7 +1079,7 @@ final class ChatToolExecutor: ObservableObject {
     private static let allKnownTools: Set<String> = [
         "dismissTask", "completeTask", "dismissMemory", "updateGoalProgress",
         "addTask", "addMemory",
-        "searchTasks", "searchMemories", "searchConversations",
+        "searchTasks", "searchMemories", "searchConversations", "searchScreenHistory",
     ]
 
     /// Extract the FIRST `<tool_call>{...}</tool_call>` block from text.
@@ -938,9 +1148,15 @@ final class ChatToolExecutor: ObservableObject {
     private func fetchOne<T: PersistentModel>(_ type: T.Type, id: UUID, in ctx: ModelContext) -> T? where T: Identifiable {
         // SwiftData predicate requires T.id compare; use runtime filter since
         // AnyPersistentModel's id type varies.
-        var desc = FetchDescriptor<T>()
-        desc.fetchLimit = 300
-        let all = (try? ctx.fetch(desc)) ?? []
+        //
+        // 2026-05-29 FIX: removed `fetchLimit = 300`. With >300 rows (a real
+        // account had 625 tasks) the target — even one the user can SEE in the
+        // <my_tasks> context block — could fall outside the arbitrary, unsorted
+        // 300-row window, so dismissTask / completeTask / updateGoalProgress
+        // returned "not found" for valid items. That was the user-reported
+        // "MetaChat can't delete tasks". Fetch-all + filter is O(n) but n is
+        // tiny for a per-tool-call lookup and is now correct at any task count.
+        let all = (try? ctx.fetch(FetchDescriptor<T>())) ?? []
         return all.first { ($0.id as? UUID) == id }
     }
 }

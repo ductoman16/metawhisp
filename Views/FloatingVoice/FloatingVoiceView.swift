@@ -10,9 +10,51 @@ struct FloatingVoiceView: View {
     @ObservedObject var state: VoiceQuestionState
 
     var body: some View {
+        // ITER-050 B2.2 — the card window is sized exactly to the pill
+        // (two-window pattern, see FloatingVoiceWindowController), so no
+        // centering wrapper and no in-window shadow envelope anymore. The
+        // drop shadow is drawn by CardShadowView in the shadow child window.
+        pillContent
+    }
+
+    private var pillContent: some View {
         VStack(spacing: 0) {
             header
 
+            // Review fix (ITER-050 B2.2): Q/A content scrolls past 380pt
+            // instead of growing the card window past the screen — a long
+            // dictated question + multi-line answer used to be unbounded
+            // (the old fixed window clipped it; the measured card must cap).
+            ScrollView {
+                cards
+            }
+            .frame(maxHeight: 380)
+        }
+        .frame(width: 380)
+        .background(.ultraThinMaterial)
+        .background(Color.black.opacity(0.45))
+        .overlay(alignment: .top) {
+            // Specular rim — top-down bright→dim white.
+            LinearGradient(
+                colors: [Color.white.opacity(0.18), Color.white.opacity(0.04), .clear],
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: 100)
+            .allowsHitTesting(false)
+            .blendMode(.plusLighter)
+            .opacity(0.6)
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // Drop shadow lives in the shadow child window (CardShadowView) —
+        // ITER-050 B2.2 two-window pattern, same as MeetingCoach.
+    }
+
+    private var cards: some View {
+        VStack(spacing: 0) {
             // Q card — show user's transcript whenever we have one (transcribing/
             // thinking/answered) plus a "Listening…" placeholder while recording.
             if !state.transcript.isEmpty {
@@ -63,27 +105,6 @@ struct FloatingVoiceView: View {
                 )
             }
         }
-        .frame(width: 380)
-        .background(.ultraThinMaterial)
-        .background(Color.black.opacity(0.45))
-        .overlay(alignment: .top) {
-            // Specular rim — top-down bright→dim white.
-            LinearGradient(
-                colors: [Color.white.opacity(0.18), Color.white.opacity(0.04), .clear],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 100)
-            .allowsHitTesting(false)
-            .blendMode(.plusLighter)
-            .opacity(0.6)
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .shadow(color: .black.opacity(0.45), radius: 24, x: 0, y: 12)
-        .shadow(color: .black.opacity(0.30), radius: 6, x: 0, y: 2)
     }
 
     // MARK: - Header
@@ -122,7 +143,17 @@ struct FloatingVoiceView: View {
                 .help("Stop speaking (Space)")
             }
 
-            Keycap(text: "Esc")
+            // Real close control — clicking dismisses (the card window is
+            // interactive since the two-window migration). The Esc KEY also
+            // closes it while MetaWhisp is frontmost.
+            Button {
+                VoiceQuestionState.shared.dismiss()
+            } label: {
+                Keycap(text: "Esc")
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Close (Esc)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)

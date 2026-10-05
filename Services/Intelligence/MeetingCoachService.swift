@@ -15,6 +15,13 @@ import SwiftData
 ///   advisor already runs, so there's no NEW per-meeting LLM spend.
 @MainActor
 final class MeetingCoachService {
+    /// ITER-041 — live meeting coach overlay is the user-visible flagship
+    /// surface. Stays on heavy tier (llama-3.3-70b) where quality is
+    /// non-negotiable. Phase D will add a mini gate to skip ticks where
+    /// no coachable moment exists.
+    static let llmTier: LLMTier = .heavy
+    static let llmServiceId: String = "MeetingCoachService"
+
     static let shared = MeetingCoachService()
 
     private let llm = OpenAIService()
@@ -52,7 +59,24 @@ final class MeetingCoachService {
     /// partial transcribe. Updates the overlay's transcript tail immediately
     /// and kicks off (at most one) LLM call to extract the next suggestion.
     func process(partialText: String) async {
-        let trimmed = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        // Strip Whisper hallucination tokens (DimaTorzok / Subtitles by /
+        // amara.org / ♪ music markers) BEFORE anything else looks at the
+        // text. Otherwise the rolling transcript tail shows garbage AND
+        // the LLM coach invents «ASK» questions about non-existent topics
+        // («Как связана проблема с видео MetaWhisp 1000 и ошибкой в vision
+        // seed?» — observed 2026-05-23 from a transcript that was 80%
+        // «Субтитры сделал DimaTorzok»). Reuses the same patterns the
+        // dictation coordinator already strips so we don't duplicate the
+        // toxic-token list.
+        var trimmed = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            let lower = trimmed.lowercased()
+            if TranscriptionCoordinator.toxicHallucinationTokens.contains(where: { lower.contains($0) }) {
+                trimmed = TranscriptionCoordinator.stripHallucinationTokens(trimmed)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
         guard !trimmed.isEmpty else { return }
 
         allPartials.append(trimmed)
@@ -61,6 +85,7 @@ final class MeetingCoachService {
         // even when the LLM call is still pending.
         let recent = allPartials.suffix(recentChunkCount).joined(separator: " ")
         MeetingCoachState.shared.updateTranscriptTail(recent)
+        if inFlight { NSLog("[MeetingCoach] tick skipped — previous LLM call still in flight (partial #%d)", allPartials.count) }
 
         guard !inFlight else { return }
         guard hasLLMAccess else { return }
@@ -70,6 +95,7 @@ final class MeetingCoachService {
         defer {
             inFlight = false
             MeetingCoachState.shared.isProcessing = false
+            NSLog("[MeetingCoach] tick #%d finished in %.1fs", allPartials.count, CFAbsoluteTimeGetCurrent() - t0)
         }
 
         // Refresh the rolling summary of older content if we've accumulated
@@ -85,12 +111,38 @@ final class MeetingCoachService {
 
         do {
             let userPrompt = buildUserPrompt(recent: recent, memoryContext: memoryContext)
-            let response = try await callLLM(systemPrompt: Self.systemPrompt, userPrompt: userPrompt)
-            if let suggestion = parseSuggestion(response) {
+            NSLog("[MeetingCoach] ▶️ tick #%d — recent=%d, summary=%d, memory=%d, prompt=%d chars, local=%@", allPartials.count, recent.count, meetingSummary.count, memoryContext.count, userPrompt.count, LocalLLMService.shared.isReady ? "YES" : "NO")
+            var usedLocal = LocalLLMService.shared.isReady
+            var response = try await callLLM(systemPrompt: Self.systemPrompt, userPrompt: userPrompt)
+            var suggestion = parseSuggestion(response)
+            // 2026-06-10 — user report: «копайлот не дает рекомендации».
+            // Local Phi takes priority in callLLM, but small local models
+            // routinely fail the strict-JSON suggestion format → parse
+            // returned nil EVERY cycle and the coach stayed silent for the
+            // whole meeting. If the local output didn't parse (and isn't an
+            // explicit "null" verdict), retry ONCE via Pro/BYOK.
+            if suggestion == nil, usedLocal,
+               response.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "null",
+               LicenseService.shared.isPro || !settings.activeAPIKey.isEmpty {
+                NSLog("[MeetingCoach] local output unparseable (%d chars) — retrying via cloud",
+                      response.count)
+                usedLocal = false
+                response = try await callLLM(
+                    systemPrompt: Self.systemPrompt, userPrompt: userPrompt, allowLocal: false
+                )
+                suggestion = parseSuggestion(response)
+            }
+            if let suggestion {
+            if suggestion.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { NSLog("[MeetingCoach] ⚠️ suggestion dropped by the overlay — empty text after trim (kind=%@); nothing shown to the user", suggestion.kind.rawValue) }
                 MeetingCoachState.shared.addSuggestion(suggestion.kind, text: suggestion.text)
-                NSLog("[MeetingCoach] ✅ %@ → %@", suggestion.kind.rawValue, String(suggestion.text.prefix(80)))
+                NSLog("[MeetingCoach] ✅ suggestion kind=%@, len=%d chars, backend=%@, tick #%d", suggestion.kind.rawValue, suggestion.text.count, usedLocal ? "local" : (LicenseService.shared.isPro ? "pro" : "byok"), allPartials.count)
+                NSLog("[MeetingCoach] ✅ %@ → %d chars", suggestion.kind.rawValue, suggestion.text.count)
             } else {
-                NSLog("[MeetingCoach] LLM returned no actionable suggestion this cycle")
+                // Log the RAW response — "no actionable suggestion" hid the
+                // difference between an honest `null` and a parse failure.
+                NSLog("[MeetingCoach] no suggestion this cycle — verdict=%@, raw=%d chars, local=%@, tick #%d", response.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "null" ? "null" : "unparseable", response.count, usedLocal ? "YES" : "NO", allPartials.count)
+                NSLog("[MeetingCoach] no suggestion this cycle (local=%@, raw: '%@')",
+                      usedLocal ? "YES" : "NO", String(response.prefix(160)))
             }
         } catch {
             NSLog("[MeetingCoach] ❌ LLM call failed: %@", error.localizedDescription)
@@ -102,6 +154,7 @@ final class MeetingCoachService {
         allPartials = []
         meetingSummary = ""
         partialIndexOfLastSummary = 0
+        NSLog("[MeetingCoach] reset for new meeting — llmAccess=%@ (local=%@ pro=%@ byok=%@)", hasLLMAccess ? "YES" : "NO", LocalLLMService.shared.isReady ? "YES" : "NO", LicenseService.shared.isPro ? "YES" : "NO", settings.activeAPIKey.isEmpty ? "NO" : "YES")
         inFlight = false
     }
 
@@ -114,6 +167,7 @@ final class MeetingCoachService {
         let endIdx = allPartials.count - recentChunkCount
         guard endIdx > partialIndexOfLastSummary else { return }
         let older = allPartials[partialIndexOfLastSummary..<endIdx].joined(separator: " ")
+        NSLog("[MeetingCoach] 📝 summary refresh — folding %d partials (%d chars) into prior summary (%d chars)", endIdx - partialIndexOfLastSummary, older.count, meetingSummary.count)
         let body: String
         if meetingSummary.isEmpty {
             body = "Summarize the meeting so far in 4-6 bullet points. Track: who's speaking, decisions made, open questions, important data points. Keep it factual.\n\nMeeting transcript:\n\(older)"
@@ -138,7 +192,7 @@ final class MeetingCoachService {
     private func fetchRelevantMemoryContext(query: String) -> String {
         guard let container = modelContainer else { return "" }
         let ctx = ModelContext(container)
-        var desc = FetchDescriptor<UserMemory>(predicate: #Predicate { !$0.isDismissed })
+        var desc = FetchDescriptor<UserMemory>(predicate: #Predicate { !$0.isDismissed && !$0.needsReview })
         desc.fetchLimit = 500
         let all = (try? ctx.fetch(desc)) ?? []
         let lower = query.lowercased()
@@ -173,10 +227,22 @@ final class MeetingCoachService {
     // MARK: - LLM access
 
     private var hasLLMAccess: Bool {
-        !settings.activeAPIKey.isEmpty || LicenseService.shared.isPro
+        !settings.activeAPIKey.isEmpty
+            || LicenseService.shared.isPro
+            || LocalLLMService.shared.isReady
     }
 
-    private func callLLM(systemPrompt: String, userPrompt: String) async throws -> String {
+    private func callLLM(systemPrompt: String, userPrompt: String, allowLocal: Bool = true) async throws -> String {
+        // ITER-039 — local Phi takes priority for the meeting-coach loop:
+        // small prompts, frequent (every 30s during a call), low-stakes
+        // (one short hint per cycle). Local cuts ~$0.05/hour meeting cost
+        // to zero. `allowLocal: false` = cloud retry after the local model
+        // produced unparseable output (see `process`).
+        if allowLocal, LocalLLMService.shared.isReady {
+            return try await LocalLLMService.shared.completeBlocking(
+                system: systemPrompt, user: userPrompt, maxTokens: 256
+            )
+        }
         if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
             return try await callProProxy(system: systemPrompt, user: userPrompt, licenseKey: licenseKey)
         }
@@ -197,7 +263,11 @@ final class MeetingCoachService {
         request.setValue("Bearer \(licenseKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 25
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["system": system, "user": user])
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user,
+            tier: Self.llmTier, serviceId: Self.llmServiceId
+        )
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
@@ -262,11 +332,28 @@ Hard rules:
 - Match the conversation language. Don't translate.
 - ONE suggestion only. No arrays.
 - Plain JSON. No markdown, no code fence, no preamble.
+
+Anti-patterns — output `null` instead of any of these:
+- "What does <generic word> mean?" or "Что значит <фраза-связка>?" —
+  filler conversational tokens («продолжение следует», «короче», «ну вот»,
+  «короче говоря») are NOT topics to question.
+- "How does <app/brand name> relate to <thing>?" — references to apps the
+  user is RUNNING (MetaWhisp itself, Zoom, Slack, the browser, Telegram,
+  ChatGPT, etc.) leaked from screen-context OCR are NOT meeting topics
+  unless the participants actively discussed them. If the transcript
+  doesn't show the speaker NAMING the app, treat any app/brand mention
+  as background noise and ignore.
+- "Can you elaborate on <X>?" without a concrete X grounded in the
+  transcript — that's L1 generic. Skip.
+- Speculative «why» questions about emotion/motivation — meetings deal
+  in facts and decisions, not feelings.
 """
 
     private struct SuggestionJSON: Decodable { let type: String; let text: String }
 
-    private func parseSuggestion(_ raw: String) -> (kind: MeetingCoachState.Suggestion.Kind, text: String)? {
+    /// Internal (not private) so `MeetingCoachServiceTests` can pin the
+    /// regression for the 2026-05-21 Range-crash fix.
+    func parseSuggestion(_ raw: String) -> (kind: MeetingCoachState.Suggestion.Kind, text: String)? {
         let cleaned = raw
             .replacingOccurrences(of: "```json", with: "")
             .replacingOccurrences(of: "```", with: "")
@@ -276,7 +363,17 @@ Hard rules:
             return mapKind(parsed)
         }
         // Permissive fallback — find { ... } window if model added preamble.
-        if let start = cleaned.firstIndex(of: "{"), let end = cleaned.lastIndex(of: "}") {
+        // CRASH FIX 2026-05-21: when the LLM emits `}` BEFORE the first `{`
+        // (e.g. preamble like `cannot answer that } { "type": "question" ...`
+        // with no closing brace after), `firstIndex(of: "{") > lastIndex(of: "}")`
+        // and `cleaned[start...end]` constructs a reversed Range, killing the
+        // app with `Fatal error: Range requires lowerBound <= upperBound`.
+        // The other 10 LLM-JSON parsers in this codebase use brace-counting
+        // (Services/Intelligence/MemoryExtractor.swift:463 and similar) which
+        // is robust; here the naive firstIndex/lastIndex pair was the bug.
+        if let start = cleaned.firstIndex(of: "{"),
+           let end = cleaned.lastIndex(of: "}"),
+           start <= end {
             let slice = String(cleaned[start...end])
             if let parsed = decodeSuggestionJSON(slice) {
                 return mapKind(parsed)

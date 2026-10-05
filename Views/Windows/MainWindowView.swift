@@ -5,7 +5,19 @@ struct MainWindowView: View {
     @ObservedObject var coordinator: TranscriptionCoordinator
     @ObservedObject var modelManager: ModelManagerService
     @ObservedObject var recorder: AudioRecordingService
-    var historyService: HistoryService
+    @ObservedObject var historyService: HistoryService
+
+    /// Drives the sidebar footer pips. AppSettings publishes change events
+    /// when @AppStorage-backed properties flip, so the footer recomposes
+    /// the moment the user toggles e.g. "Proactive insights" in Settings.
+    @ObservedObject private var settings = AppSettings.shared
+    /// ITER-039 — pip flips to "local" the moment Phi-4 finishes loading
+    /// into RAM. Observed so the footer animates the green dot instantly
+    /// instead of staying blue until next re-render.
+    @ObservedObject private var localLLM = LocalLLMService.shared
+    /// Drives the tier pip ("free" / "pro"). LicenseService publishes
+    /// `isPro` after license activation/deactivation.
+    @ObservedObject private var license = LicenseService.shared
 
     @State var selectedTab: SidebarTab
 
@@ -26,9 +38,8 @@ struct MainWindowView: View {
     enum SidebarTab: String, CaseIterable, Identifiable {
         case dashboard = "Dashboard"
         case library = "Library"
-        case projects = "Projects"
-        case goals = "Goals"
-        case tasks = "Tasks"
+        case workspace = "Workspace"
+        case weeklyInsights = "Weekly Insights"
         case chat = "MetaChat"
         case dictionary = "Dictionary"
         case settings = "Settings"
@@ -39,9 +50,8 @@ struct MainWindowView: View {
             switch self {
             case .dashboard: "gauge.with.dots.needle.33percent"
             case .library: "books.vertical"
-            case .projects: "folder.badge.person.crop"
-            case .goals: "target"
-            case .tasks: "checklist"
+            case .workspace: "checklist"
+            case .weeklyInsights: "lightbulb"
             case .chat: "message"
             case .dictionary: "character.book.closed"
             case .settings: "gearshape"
@@ -68,6 +78,13 @@ struct MainWindowView: View {
             }
         }
         .modelContainer(historyService.modelContainer)
+        .overlay {
+            // AUD-007 / ITER-049 A1 — blocking recovery surface when the
+            // persistent store couldn't be opened (temporary in-memory session).
+            if case let .degraded(reason, backupPath) = historyService.health {
+                StoreRecoveryOverlay(reason: reason, backupPath: backupPath)
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .switchMainTab)) { notification in
             if let tab = notification.object as? SidebarTab {
                 selectedTab = tab
@@ -111,25 +128,122 @@ struct MainWindowView: View {
 
             Spacer()
 
-            // Version + on-device status pip — matches mockup footer.
+            // Version + processing-mode + tier pips. Replaces a previous
+            // hard-coded "● on-device" label that was decorative-only and
+            // misleading for users on Cloud Whisper / Pro proxy paths.
+            // Both pips derive from settings + license live, so flipping
+            // a Cloud-feature toggle in Settings instantly updates the footer.
             HStack(spacing: 8) {
                 Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
                     .font(MW.monoSm)
                     .foregroundStyle(MW.textDim)
                 Spacer()
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(MW.idle)
-                        .frame(width: 5, height: 5)
-                    Text("on-device")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(MW.textMuted)
-                }
+                statusPip(label: processingModeLabel, color: processingModeColor)
+                statusPip(label: tierLabel, color: tierColor)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
         }
         .mwCard(radius: MW.rLarge, elevation: .hero)
+    }
+
+    // MARK: - Footer status pips
+
+    /// Reusable colored-dot + label pip for the sidebar footer.
+    /// `color` is the dot fill; the label always uses `MW.textMuted` so the
+    /// pip is unobtrusive — the dot carries the accent.
+    private func statusPip(label: String, color: Color) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 5, height: 5)
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(MW.textMuted)
+        }
+    }
+
+    /// Decides the processing-mode label based on which paths the user
+    /// has actually wired up. Source-of-truth flags:
+    ///   - `transcriptionEngine`: primary dictation engine ("ondevice" or "cloud")
+    ///   - `processingMode == "structured"`: post-transcription LLM cleanup
+    ///   - `proactiveEnabled`: ITER-027 insight extraction (cloud LLM)
+    ///   - `ttsCloudEnabled`: cloud TTS for voice replies
+    ///   - `liveMeetingAdviceEnabled`: live coach during meetings
+    ///   - `localLLMEnabled` + `localLLMActiveModelID`: ITER-039 local LLM is loaded
+    ///
+    /// `cloud` features all require Pro proxy so they're real cloud roundtrips.
+    /// `local` features run through MLX-hosted model OR Apple Foundation Models.
+    ///
+    /// Label combinations (ITER-039):
+    ///   - "on-device" — fully local Whisper + no post-processing LLM
+    ///   - "local" — Whisper on-device + LOCAL LLM for cleanup/intelligence
+    ///   - "cloud" — cloud Whisper + cloud LLM (Pro)
+    ///   - "on-device+cloud" — local Whisper + cloud LLM
+    ///   - "local+cloud" — local LLM for processing + cloud Whisper for transcription
+    ///   - "on-device+local" — fully local stack (Whisper + local LLM)
+    private var processingModeLabel: String {
+        let primaryCloud = settings.transcriptionEngine == "cloud"
+        // ITER-039 Phase 5b — pip says "local" ONLY when the model weights
+        // are actually loaded into RAM. `localLLMActiveModelID` non-empty
+        // means the user picked one; `isReady` means it's truly serving
+        // tokens. Without the `isReady` gate, the pip would lie during the
+        // ~5-10s warm-up between Make active and first inference.
+        let hasLocalLLM = settings.localLLMEnabled
+            && !settings.localLLMActiveModelID.isEmpty
+            && LocalLLMService.shared.isReady
+        let cloudFeatures = settings.processingMode == "structured"
+            || settings.proactiveEnabled
+            || settings.ttsCloudEnabled
+            || settings.liveMeetingAdviceEnabled
+        // When local LLM is active, structured/processing fires on-device — only
+        // truly remote features (proactive insights, cloud TTS, live meeting
+        // advice) count as «cloud features».
+        let actualCloudFeatures = hasLocalLLM
+            ? (settings.proactiveEnabled || settings.ttsCloudEnabled || settings.liveMeetingAdviceEnabled)
+            : cloudFeatures
+        let hasCloud = primaryCloud || actualCloudFeatures
+        let hasLocalDictation = !primaryCloud
+
+        // Six possible states, ordered by likelihood for status pip display:
+        if hasLocalDictation && hasLocalLLM && !hasCloud {
+            return "on-device+local"  // fully on-device stack
+        }
+        if hasLocalDictation && hasLocalLLM && hasCloud {
+            return "on-device+local+cloud"  // hybrid: local Whisper + local LLM + cloud insight/TTS
+        }
+        if hasLocalLLM && hasCloud {
+            return "local+cloud"  // cloud Whisper + local LLM
+        }
+        if hasLocalLLM {
+            return "local"
+        }
+        if hasCloud && hasLocalDictation { return "on-device+cloud" }
+        if hasCloud { return "cloud" }
+        return "on-device"
+    }
+
+    /// Color follows the label's "leaning":
+    ///   - all-local labels → green (idle) — no network roundtrips
+    ///   - all-cloud → light blue (postProcess) — networked, semantically remote
+    ///   - hybrid (mix) → orange (processing) — intermediate
+    private var processingModeColor: Color {
+        switch processingModeLabel {
+        case "cloud":                       return MW.postProcess
+        case "on-device+cloud",
+             "local+cloud",
+             "on-device+local+cloud":       return MW.processing
+        default:                            return MW.idle   // "on-device" / "local" / "on-device+local"
+        }
+    }
+
+    private var tierLabel: String {
+        license.isPro ? "pro" : "free"
+    }
+
+    private var tierColor: Color {
+        // Pro = green (active subscription); free = dim grey (no accent steal).
+        license.isPro ? MW.idle : MW.textDim
     }
 
     @ViewBuilder
@@ -139,14 +253,12 @@ struct MainWindowView: View {
             DashboardView(coordinator: coordinator)
         case .library:
             LibraryView()
-        case .projects:
-            ProjectsView()
-        case .goals:
-            GoalsView()
-        case .tasks:
-            TasksView()
+        case .workspace:
+            WorkspaceView()
+        case .weeklyInsights:
+            WeeklyInsightsView()
         case .chat:
-            ChatView()
+            ChatWithInboxView()
         case .dictionary:
             DictionaryView()
         case .settings:

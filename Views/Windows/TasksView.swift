@@ -15,6 +15,8 @@ struct TasksView: View {
     private var tasks: [TaskItem]
 
     @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject private var license = LicenseService.shared
+    @ObservedObject private var localLLM = LocalLLMService.shared
     @State private var isExtracting = false
     @State private var extractionResult: String?
     @State private var candidatesExpanded = true
@@ -25,7 +27,16 @@ struct TasksView: View {
     /// Voice / calendar / user-promoted.
     private var committedTasks: [TaskItem] { tasks.filter { $0.effectiveStatus == "committed" } }
     /// REVIEW bin = status=="staged". Screen-inferred candidates awaiting user decision.
-    private var stagedTasks: [TaskItem] { tasks.filter { $0.effectiveStatus == "staged" } }
+    /// 2026-05-29 — auto-hide candidates left unreviewed > 7 days (`TaskHygiene`)
+    /// so the review pile stops growing unbounded (was 286 staged). Hidden ≠
+    /// deleted: the rows stay in SwiftData, just drop out of this list.
+    private var stagedTasks: [TaskItem] {
+        let now = Date()
+        return tasks.filter {
+            $0.effectiveStatus == "staged"
+                && !TaskHygiene.isStaleUnreviewedCandidate(status: "staged", createdAt: $0.createdAt, now: now)
+        }
+    }
 
     /// ITER-013 — split committed list by ownership.
     /// MY tasks: assignee == nil (or empty whitespace). Owner is the user.
@@ -51,8 +62,14 @@ struct TasksView: View {
             }
     }
 
+    /// ITER-047 Element B — generic gate (local LLM counts) for the reminder bar.
+    private var hasLLMAccess: Bool {
+        LLMAccess.has(apiKey: settings.activeAPIKey, isPro: license.isPro, localReady: localLLM.isReady)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if !hasLLMAccess { LLMAccessBar() }
             header
             Rectangle().fill(MW.border).frame(height: MW.hairline)
             content
@@ -212,11 +229,18 @@ struct TasksView: View {
             // completedAt=now). Counts toward Shipped/Done stats. Disappears
             // from staged list. The "right" thing for the "I already did this" case.
             Button {
-                item.status = "committed"
-                item.completed = true
-                item.completedAt = Date()
-                item.updatedAt = Date()
-                try? modelContext.save()
+                // SB-3 — commit + Obsidian re-export + MCP refresh, atomically:
+                // the hook fires only if the save succeeds (no divergence).
+                do {
+                    try MutationService.shared.commit(.taskSaved(item.id), in: modelContext) {
+                        item.status = "committed"
+                        item.completed = true
+                        item.completedAt = Date()
+                        item.updatedAt = Date()
+                    }
+                } catch {
+                    NSLog("[TasksView] mark-done save failed: %@", error.localizedDescription)
+                }
             } label: {
                 Image(systemName: "checkmark")
                     .font(.system(size: 12, weight: .medium))
@@ -230,9 +254,14 @@ struct TasksView: View {
             // + SAVE FOR LATER — promote to MY TASKS active (old ✓ behavior).
             // Use case: screen detected something user wants to do later, not yet.
             Button {
-                item.status = "committed"
-                item.updatedAt = Date()
-                try? modelContext.save()
+                do {
+                    try MutationService.shared.commit(.taskSaved(item.id), in: modelContext) {
+                        item.status = "committed"
+                        item.updatedAt = Date()
+                    }
+                } catch {
+                    NSLog("[TasksView] save-for-later save failed: %@", error.localizedDescription)
+                }
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 11, weight: .medium))
@@ -245,10 +274,17 @@ struct TasksView: View {
 
             // ✗ DISMISS — hide, kept for dedup history.
             Button {
-                item.status = "dismissed"
-                item.isDismissed = true
-                item.updatedAt = Date()
-                try? modelContext.save()
+                // SB-3 — soft dismiss; the vault file is removed by the hook ONLY
+                // if the save succeeded (was: unconditional delete after try? save).
+                do {
+                    try MutationService.shared.commit(.taskDismissed(item.id), in: modelContext) {
+                        item.status = "dismissed"
+                        item.isDismissed = true
+                        item.updatedAt = Date()
+                    }
+                } catch {
+                    NSLog("[TasksView] dismiss save failed: %@", error.localizedDescription)
+                }
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .medium))
@@ -291,10 +327,15 @@ struct TasksView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Button {
-                    item.completed.toggle()
-                    item.completedAt = item.completed ? Date() : nil
-                    item.updatedAt = Date()
-                    try? modelContext.save()
+                    do {
+                        try MutationService.shared.commit(.taskSaved(item.id), in: modelContext) {
+                            item.completed.toggle()
+                            item.completedAt = item.completed ? Date() : nil
+                            item.updatedAt = Date()
+                        }
+                    } catch {
+                        NSLog("[TasksView] toggle save failed: %@", error.localizedDescription)
+                    }
                 } label: {
                     Image(systemName: item.completed ? "checkmark.square.fill" : "square")
                         .font(.system(size: 14))
@@ -317,9 +358,14 @@ struct TasksView: View {
                 }
 
                 Button {
-                    item.isDismissed = true
-                    item.updatedAt = Date()
-                    try? modelContext.save()
+                    do {
+                        try MutationService.shared.commit(.taskDismissed(item.id), in: modelContext) {
+                            item.isDismissed = true
+                            item.updatedAt = Date()
+                        }
+                    } catch {
+                        NSLog("[TasksView] dismiss save failed: %@", error.localizedDescription)
+                    }
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 10))
@@ -413,6 +459,7 @@ struct TasksView: View {
             extractionResult = delta > 0
                 ? "Added \(delta) new \(delta == 1 ? "task" : "tasks")"
                 : "No new tasks (nothing actionable in the last transcript)"
+                NSLog("[TasksView] EXTRACT NOW → banner=%@ (delta=%d, extractor lastError=%@)", delta > 0 ? "added" : "no new tasks", delta, appDelegate.taskExtractor.lastError ?? "none")
             isExtracting = false
         }
     }

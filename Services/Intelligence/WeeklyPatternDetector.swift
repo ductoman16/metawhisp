@@ -23,6 +23,12 @@ import SwiftData
 /// spec://iterations/ITER-022-G5-weekly-patterns
 @MainActor
 final class WeeklyPatternDetector: ObservableObject {
+    /// ITER-041 — Sunday roll-up synthesis on medium tier. Future
+    /// optimization: incremental daily theme extraction on mini, only
+    /// synthesize on Sunday — but that's a separate iteration.
+    static let llmTier: LLMTier = .medium
+    static let llmServiceId: String = "WeeklyPatternDetector"
+
     @Published var isRunning = false
     @Published var lastError: String?
     @Published var lastGenerationAt: Date?
@@ -55,6 +61,7 @@ final class WeeklyPatternDetector: ObservableObject {
             }
         }
         NSLog("[Pattern] ✅ Scheduler started")
+        NSLog("[Pattern] Fires Sunday %02d:00 · last digest: %@", settings.weeklyPatternsHour, mostRecentDigest().map({ String(format: "%.0f days ago", Date().timeIntervalSince($0.createdAt) / 86400) }) ?? "none")
     }
 
     func stopScheduler() {
@@ -87,6 +94,7 @@ final class WeeklyPatternDetector: ObservableObject {
 
     @discardableResult
     private func generate(postNotification: Bool) async -> PatternDigest? {
+        let generateStartedAt = Date()
         guard !isRunning else { return nil }
         guard hasLLMAccess else {
             NSLog("[Pattern] No LLM access — skipping")
@@ -109,6 +117,7 @@ final class WeeklyPatternDetector: ObservableObject {
         let convs = fetchConversations(ctx: ctx, from: windowStart)
         let memories = fetchMemories(ctx: ctx, from: windowStart)
         let tasks = fetchTasks(ctx: ctx, from: windowStart)
+        NSLog("[Pattern] ▶ Generate trigger=%@ window=%dd conv=%d mem=%d tasks=%d", postNotification ? "timer" : "manual", windowDays, convs.count, memories.count, tasks.count)
 
         guard convs.count >= minConversationsToRun else {
             NSLog("[Pattern] Quiet window (%d conv) — writing empty digest", convs.count)
@@ -130,6 +139,7 @@ final class WeeklyPatternDetector: ObservableObject {
 
         // ── Build prompt context ─────────────────────────────────────────────
         let userPrompt = buildPrompt(conversations: convs, memories: memories, tasks: tasks, windowDays: windowDays)
+        NSLog("[Pattern] Prompt %d chars (cap 16000)", userPrompt.count)
 
         // ── LLM call ─────────────────────────────────────────────────────────
         let response: String
@@ -158,6 +168,7 @@ final class WeeklyPatternDetector: ObservableObject {
         NSLog("[Pattern] ✅ Generated: themes=%d people=%d stuck=%d insights=%d (analysed %d conv)",
               parsed.themes.count, parsed.people.count, parsed.stuckLoops.count,
               parsed.insights.count, convs.count)
+              NSLog("[Pattern] Done in %.1fs · response %d chars · card=%@", Date().timeIntervalSince(generateStartedAt), response.count, postNotification ? "yes" : "no")
 
         if postNotification {
             postRecapNotification(digest: digest)
@@ -289,8 +300,8 @@ final class WeeklyPatternDetector: ObservableObject {
             }
         }
         guard let raw = try? JSONDecoder().decode(Raw.self, from: data) else {
-            NSLog("[Pattern] ⚠️ Parse failed — raw response prefix: %@",
-                  String(extracted.prefix(200)))
+            NSLog("[Pattern] ⚠️ parse failed — response %d chars",
+                  extracted.count)
             return ParsedDigest(themes: [], people: [], stuckLoops: [], insights: [])
         }
         let clean: ([String]?) -> [String] = {
@@ -344,17 +355,17 @@ final class WeeklyPatternDetector: ObservableObject {
         if !digest.insights.isEmpty { lines.append("Insights: \(digest.insights.count)") }
         let body = lines.isEmpty
             ? "Quiet week — patterns recap saved."
-            : lines.joined(separator: " · ") + " — open Insights"
+            : lines.joined(separator: " · ") + " — open Weekly Insights"
         let note = MWNotification(
             kind: .advice,
             title: "Weekly patterns ready",
             body: body,
             onTap: {
-                NSApp.activate(ignoringOtherApps: true)
-                NotificationCenter.default.post(
-                    name: .switchMainTab,
-                    object: MainWindowView.SidebarTab.tasks
-                )
+                // Space-throw fix (2026-06-10): NSApp.activate() snapped the
+                // user to the main window's Space. openMainWindow re-places it
+                // on the CURRENT Space. Opens the Weekly Insights tab — the
+                // digest this notification announces now lives there.
+                Task { @MainActor in AppDelegate.shared?.openMainWindow(tab: .weeklyInsights) }
             }
         )
         Task { @MainActor in MWNotificationStack.shared.push(note) }
@@ -383,7 +394,7 @@ final class WeeklyPatternDetector: ObservableObject {
 
     private func fetchMemories(ctx: ModelContext, from: Date) -> [UserMemory] {
         var desc = FetchDescriptor<UserMemory>(
-            predicate: #Predicate { !$0.isDismissed && $0.createdAt >= from },
+            predicate: #Predicate { !$0.isDismissed && !$0.needsReview && $0.createdAt >= from },
             sortBy: [SortDescriptor(\.createdAt, order: .forward)]
         )
         desc.fetchLimit = 60
@@ -424,11 +435,15 @@ final class WeeklyPatternDetector: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 60
 
-        let body: [String: Any] = ["system": system, "user": user]
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user,
+            tier: Self.llmTier, serviceId: Self.llmServiceId
+        )
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+        NSLog("[Pattern] ❌ Proxy HTTP %d%@", http.statusCode, StructuredGenerator.proxyReason(data))
             throw NSError(domain: "Pattern", code: http.statusCode,
                           userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])
         }

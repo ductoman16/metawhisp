@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import EventKit
 import Foundation
 import Sparkle
 import SwiftData
@@ -19,6 +20,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var eventMonitor: Any?
+    /// KVO subscription on `NSApp.effectiveAppearance` — fires when macOS flips
+    /// system Light/Dark (Sunset/Sunrise auto-switch, Control Centre toggle, or
+    /// `defaults write -g AppleInterfaceStyle`). We use it to push the new
+    /// appearance to the popover + every open window so SwiftUI views inside
+    /// re-resolve `Color.primary`, `MW.bg`, `MW.textPrimary`, etc. against the
+    /// current scheme. Without this observer NSPopover and detached NSWindows
+    /// cache their effectiveAppearance at creation time, leading to the
+    /// black-on-black symptom in the menu-bar popover and History window when
+    /// the system flips theme while the app is running. Owner-layer fix —
+    /// individual views stay untouched. spec://feedback#theme-propagation.
+    private var appearanceObservation: NSKeyValueObservation?
 
     // Services
     /// Top-level mic capture — used by dictation (Right ⌘ short tap) and
@@ -41,6 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let textInserter = TextInsertionService()
     let soundService = SoundService()
     let hotkeyService = HotkeyService()
+    let layoutSwitchController = LayoutSwitchController()
+    let layoutFixFeedback = LayoutFixFeedbackController()
+#if DEBUG
+    /// I0-only, started exclusively with `--layout-fix-event-tap-probe`.
+    private var layoutFixEventTapProbe: GlobalInputEventTapProbe?
+#endif
     let modelManager = ModelManagerService()
     let historyService = HistoryService()
     let screenContext = ScreenContextService()
@@ -54,6 +72,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let projectAggregator = ProjectAggregator()
     let chatToolExecutor = ChatToolExecutor()
     let proactiveContextService = ProactiveContextService()
+
+    /// ITER-067 — the only thing allowed to put a Screen Agent comment on
+    /// screen, and the only place its lifecycle is recorded. Built once the
+    /// store is available.
+    private(set) var screenAgentDelivery: ScreenAgentDeliveryService?
+
+    /// ITER-069 — the vision boundary: injected production transport, frame
+    /// cache owned by capture, one call per run.
+    private(set) var screenAgentVision: ScreenAgentVisionClient?
+
+    /// Open the Inbox on a specific comment. Wired in ITER-068 to the MetaChat
+    /// surface; for now it brings the window forward so a clicked card leads
+    /// somewhere instead of vanishing.
+    @MainActor
+    func openScreenAgentInbox(selecting itemID: UUID? = nil) {
+        pendingScreenAgentItemID = itemID
+        openMainWindow(tab: .chat)
+        // The window and the pane may both already be where we want them, in
+        // which case nothing would otherwise redraw.
+        NotificationCenter.default.post(name: .screenAgentShowInboxPane, object: nil)
+        if let itemID {
+            NotificationCenter.default.post(name: .screenAgentOpenItem, object: itemID)
+        }
+        // Looking at the Inbox is what makes the waiting comments no longer
+        // waiting. The mark is the whole clearing mechanism — the journal rows
+        // themselves are history and are not rewritten.
+        AppSettings.shared.screenAgentInboxLastOpenedAt = Date().timeIntervalSince1970
+        NSLog("[ScreenAgentInbox] inbox opened — target=%@", itemID == nil ? "list" : "one item")
+        NSLog("[MetaWhisp] Screen Agent inbox opened (selecting item=%d)", itemID == nil ? 0 : 1)
+        refreshScreenAgentBadge()
+    }
+
+    /// ⌘⌥O, and the unread count beside the menu bar icon.
+    private var screenAgentInboxHotkey: ScreenAgentInboxHotkey?
+
+    @MainActor
+    func setUpScreenAgentInboxShortcut() {
+        let hotkey = ScreenAgentInboxHotkey { [weak self] in
+            self?.openScreenAgentInbox()
+        }
+        hotkey.register()
+        screenAgentInboxHotkey = hotkey
+        refreshScreenAgentBadge()
+    }
+
+    /// The count rides beside the icon as a short digit string. HIG is blunt
+    /// about long menu bar titles — on Tahoe they push neighbouring items, and
+    /// our own, off the screen — so it stays one or two characters and
+    /// disappears entirely at zero.
+    @MainActor
+    func refreshScreenAgentBadge() {
+        guard let button = statusItem?.button else { return }
+        let since = Date(timeIntervalSince1970: AppSettings.shared.screenAgentInboxLastOpenedAt)
+        let count = screenAgentDelivery?.unreadCount(since: since) ?? 0
+        NSLog("[ScreenAgentInbox] badge — %d comment(s) waiting, inbox last opened %@", count, AppSettings.shared.screenAgentInboxLastOpenedAt > 0 ? String(format: "%.0f min ago", Date().timeIntervalSince(since) / 60) : "never")
+        NSLog("[MetaWhisp] Screen Agent badge: %d waiting (mark %.0fh ago)", count, Date().timeIntervalSince(since) / 3600)
+        guard count > 0 else {
+            button.attributedTitle = NSAttributedString(string: "")
+            button.toolTip = nil
+            return
+        }
+        let text = count > 9 ? "9+" : String(count)
+        button.attributedTitle = NSAttributedString(
+            string: " \(text)",
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.labelColor
+            ])
+        button.toolTip = "\(count) comment\(count == 1 ? "" : "s") waiting — ⌘⌥O"
+    }
+
+    /// The comment a click asked to open, read by the Inbox when it appears.
+    private(set) var pendingScreenAgentItemID: UUID?
+
+    /// ITER-072 — what the Screen Agent is doing, assembled from the pieces
+    /// that decide it. The feature's normal state is silence, so without this
+    /// a broken one and a working one look identical.
+    @MainActor
+    func screenAgentHealth() -> ScreenAgentHealth {
+        let settings = AppSettings.shared
+        let policy = ScreenContextPolicy.effective(
+            alwaysExcluded: [],
+            mode: settings.screenContextMode,
+            appList: settings.screenContextAppList
+        )
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let appName = frontApp?.localizedName
+        let allowed = ScreenContextPolicy.isCaptureAllowed(
+            appName: appName ?? "",
+            bundleID: frontApp?.bundleIdentifier ?? "",
+            blacklist: policy.blacklist,
+            whitelist: policy.whitelist
+        )
+        // Stage 2.1-ter — the status line reads the same rule the polling loop
+        // obeys. Without this it says "Watching Claude" while the loop is
+        // skipping it, which is the status line lying in the one place it
+        // exists to stop happening.
+        let skippedAsAssistant = allowed && !ScreenContextPolicy.isAmbientCaptureAllowed(
+            appName: appName ?? "",
+            bundleID: frontApp?.bundleIdentifier ?? "",
+            blacklist: policy.blacklist,
+            whitelist: policy.whitelist,
+            defaultExcluded: ScreenContextPolicy.assistantWindows
+        )
+        return ScreenAgentHealth.evaluate(
+            featureEnabled: settings.proactiveEnabled && settings.screenContextEnabled,
+            paused: settings.screenAgentPaused,
+            hasPermission: CGPreflightScreenCaptureAccess(),
+            allowlistIsActiveAndEmpty: policy.whitelist?.isEmpty == true,
+            currentAppAllowed: allowed,
+            currentAppIsAssistant: skippedAsAssistant,
+            currentApp: appName,
+            captureOutcome: screenContext.lastCaptureOutcome
+        )
+    }
+
+    @MainActor
+    func consumePendingScreenAgentItem() -> UUID? {
+        defer { pendingScreenAgentItemID = nil }
+        return pendingScreenAgentItemID
+    }
     /// ITER-027 — produces ONE actionable insight per evaluation tick
     /// (replaces cosine-retrieval list of related conversations). Wired
     /// into `proactiveContextService` so the existing `onNewContext` hook
@@ -69,6 +208,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let fileMemoryExtractor = FileMemoryExtractor()
     let appleNotesReader = AppleNotesReaderService()
     let obsidianSync = ObsidianSyncService()
+    /// ITER-035 v2 (2026-05-12) — replaces `obsidianSync` (Journal.md) and
+    /// `MeetingObsidianWriter` (flat Meetings/) with a date-first folder layout
+    /// + project-first memories + two-way task delete. Old services remain in
+    /// the codebase for legacy data; new exports go through this one.
+    let obsidianExporter = ObsidianExporter()
     let calendarReader = CalendarReaderService()
     let ttsService = TTSService()
     let floatingVoiceWindow = FloatingVoiceWindowController()
@@ -90,6 +234,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var selectionTranslator: SelectionTranslator!
     var updaterController: SPUStandardUpdaterController!
     private var cancellables = Set<AnyCancellable>()
+    /// ITER-053.1 — 12h repeating screen-history retention prune.
+    private var screenRetentionTimer: Timer?
 
     // Call auto-detection state (ITER-002). Tracks whether the currently-active
     // recording was started by auto-detect — only then do we auto-stop on call end.
@@ -114,6 +260,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var calendarHardStopTask: Task<Void, Never>?
     /// Counter for `notifyAndExtend` rounds. Reset on each new recording.
     private var calendarEndNotifyAttempts: Int = 0
+    /// ITER-035-followup (2026-05-12) — per-app cooldown for the «CALL DETECTED»
+    /// notification card. The underlying `CallSessionMachine` already de-dupes
+    /// while the session is alive, but it clears the session after the 180s
+    /// nil-debounce — so if the user tab-switches off the meeting tab for
+    /// > 3 min during a long call (very common), the next time they tab back
+    /// the system treats it as a fresh call and fires the card again. The
+    /// user reported this UX as «card вылезает каждый раз когда переключаю
+    /// экран на протяжении созвона». This map enforces a 30-min cooldown on
+    /// the card itself — independent of session-machine state.
+    /// Key: callName ("Google Meet" etc). Value: timestamp of last card fired.
+    private var lastCallCardFiredAt: [String: Date] = [:]
     /// Fast 1-sec polling loop for `MeetingAutoStartGate`. Samples frontmost
     /// window state, audio level, calendar events; feeds to gate; on
     /// `.fallbackReady` / `.calendarReady` runs the countdown + audio-sniff
@@ -143,9 +300,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Set on auto-start path; nil when user pressed RECORD manually.
     private var currentMeetingCallContext: String?
 
+    nonisolated static func shouldStartUpdater(bundleInfo: [String: Any]?) -> Bool {
+        bundleInfo?["MetaWhispDisableUpdates"] as? Bool != true
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
         FileLogger.setup()
+
+        // ITER-055 — black box for the recurring "throws me to another screen /
+        // Space" bug. Log every Space switch with the frontmost app + cursor
+        // screen so a repro shows whether OUR window ops caused the jump. Paired
+        // with MainWindowController's [SpaceTrace] placement logs.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { _ in
+            let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+            let mouse = NSEvent.mouseLocation
+            let mouseScreen = NSScreen.screens.firstIndex { NSMouseInRect(mouse, $0.frame, false) }
+            NSLog("[SpaceTrace] activeSpaceDidChange — frontmost=%@ cursorScreen=%@",
+                  front, mouseScreen.map(String.init) ?? "?")
+            // The observer used to only watch. A window left visible on the
+            // Space the user just left is what the next activation drags them
+            // back to (2026-09-08).
+            Self.shared?.mainWindow.unbindIfLeftBehind()
+        }
 
         // Apply saved theme
         MW.applyTheme(AppSettings.shared.appTheme)
@@ -168,10 +347,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        // Sparkle auto-updater
-        updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+#if DEBUG
+        startLayoutFixEventTapProbeIfRequested()
+#endif
+
+        // AUD-024 — one-time migration of secrets from the legacy plaintext
+        // `.secrets` file into the Keychain. Runs in the signed app (valid
+        // Keychain ACLs) and only after the single-instance guard, so two
+        // instances never race on the file. No-op once already migrated.
+        KeychainHelper.migrateLegacySecretsIfNeeded()
+
+        // Fork bundles must never replace themselves with an upstream update.
+        if Self.shouldStartUpdater(bundleInfo: Bundle.main.infoDictionary) {
+            updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+            NSLog("[MetaWhisp] Sparkle started — v%@ (build %@), autoCheck=%@, lastCheck=%@", Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?", Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?", updaterController.updater.automaticallyChecksForUpdates ? "on" : "off", updaterController.updater.lastUpdateCheckDate.map { String(format: "%.1fh ago", Date().timeIntervalSince($0) / 3600) } ?? "never")
+        }
 
         NSLog("[MetaWhisp] Launched")
+
+        // macOS 26 Tahoe — disable window-state restoration. The Tahoe
+        // saved-window-state apparatus caches NSWindow Auto Layout
+        // constraints across launches and replays them on next start. If
+        // the previous session ended mid-NSISEngine-recursion (a SwiftUI
+        // view with constraint cycle, common on macOS 26's stricter
+        // layout engine), restoration re-creates the broken state and
+        // crashes again on every relaunch — even after a code fix
+        // (user-reported loop 2026-05-19, the `open` command kept
+        // re-poisoning the freshly-built process). Disabling restoration
+        // forces a clean layout on every launch.
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+
+        // ITER-039 — pre-warm MLX/Metal on the MAIN thread at launch.
+        // First MLX call has main-thread affinity (Metal context init).
+        // Without this, later `MLXArray.zeros([1])` on a background GCD
+        // thread inside `LocalLLMService.buildModelSync` SIGKILLs the
+        // process before any traps fire. We pay ~10 ms here once vs
+        // crash-on-activate every time.
+        LocalLLMService.prewarmMLX()
+
+        // ITER-039 — auto-load re-enabled 2026-05-22 after rooting out
+        // the 35 GB MLX memory blow-up from earlier (commit 656de4a).
+        //
+        // Real root cause (was hidden behind "looks like a leak"):
+        // mlx-swift defaults `Memory.cacheLimit` to `Memory.memoryLimit`,
+        // which on 64 GB Macs is effectively unbounded. MLX's buffer
+        // reuse only matches IDENTICAL shapes — our Insight/Reactor/
+        // Extractor calls fire with varied prompt sizes (3426, 3607,
+        // 2768, 3582, …), so every prefill spawns fresh-sized arenas
+        // that pile into the "recently used" pool without ever being
+        // reclaimed. Six back-to-back generations accreted ~35 GB.
+        //
+        // Fix in `LocalLLMService.prewarmMLX` + `runGenerationSync`:
+        //   - `Memory.cacheLimit = 512 MB`  (bounded reuse pool)
+        //   - `Memory.memoryLimit = 6 GB`   (hard ceiling)
+        //   - `Memory.clearCache()` at the end of every generation
+        //   - Memory snapshot logged per generation: `[ITER-039 mem] …`
+        //
+        // loadModel itself was already on a `DispatchQueue.global(qos:
+        // .userInitiated)` thread (since 2026-05-13), so main thread
+        // is not blocked. The auto-load completes ~12 s after launch
+        // and any service that sees `isReady = true` will use local
+        // Phi-4 instead of the cloud path.
+        if AppSettings.shared.localLLMEnabled,
+           !AppSettings.shared.localLLMActiveModelID.isEmpty {
+            let modelID = AppSettings.shared.localLLMActiveModelID
+            NSLog("[ITER-039] auto-loading %@ in background…", modelID)
+            Task { @MainActor in
+                do {
+                    try await LocalLLMService.shared.loadModel(id: modelID)
+                    NSLog("[ITER-039] ✅ auto-load complete — local LLM is now the priority generator")
+                } catch {
+                    NSLog("[ITER-039] ❌ auto-load failed: %@ — falling back to cloud", error.localizedDescription)
+                }
+            }
+        }
+
+        // ITER-051 F1.8 — whenever a local model BECOMES ready (startup
+        // auto-load ~12 s in, the Settings toggle, or «Load now»), re-drain
+        // the extraction queues. The startup backfill runs before the load
+        // finishes, so for local-only users every queued conversation came
+        // back `.retryLater` and then sat until the NEXT conversation close.
+        // Both drains self-guard (store health, feature toggles, queue empty).
+        LocalLLMService.shared.$isReady
+            .removeDuplicates()
+            .filter { $0 }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                NSLog("[ITER-051] local model ready — re-draining extraction queues")
+                self.memoryExtractor.backfillPending()
+                self.taskExtractor.backfillPending()
+            }
+            .store(in: &cancellables)
 
         // Register URL scheme handler (metawhisp://auth?token=...)
         NSAppleEventManager.shared().setEventHandler(
@@ -201,6 +468,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         coordinator.taskExtractor = taskExtractor
         coordinator.conversationGrouper = conversationGrouper
         coordinator.chatService = chatService
+        // ITER-035 v2: each saved dictation triggers a markdown export.
+        coordinator.obsidianExporter = obsidianExporter
         chatService.ttsService = ttsService
         selectionTranslator = SelectionTranslator(
             textProcessor: coordinator.textProcessor!,
@@ -214,12 +483,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentSize = NSSize(width: 300, height: 300)
         popover.behavior = .applicationDefined
         popover.delegate = self
+        // Pin popover's appearance to NSApp.effectiveAppearance at creation
+        // and re-pin on every system theme change (see appearanceObservation
+        // setup below). NSPopover otherwise caches `.aqua` from the menu-bar
+        // status item and never re-evaluates → SwiftUI Color.primary inside
+        // the popover stays light while the popover background goes dark
+        // → unreadable black-on-black labels.
+        popover.appearance = NSApp.effectiveAppearance
         popover.contentViewController = NSHostingController(
             rootView: PopoverRootView(
                 coordinator: coordinator,
                 recorder: recorder,
                 meetingRecorder: meetingRecorder,
                 screenContext: screenContext,
+                dailySummary: dailySummaryService,
                 closePopover: { [weak self] in self?.closePopover() },
                 openMainWindow: { [weak self] in self?.openMainWindow() },
                 onMeetingToggle: { [weak self] in self?.toggleMeetingRecording() }
@@ -227,13 +504,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         self.popover = popover
 
+        // Observe system Light/Dark flips and propagate to popover + all
+        // currently-open windows. Using KVO on `effectiveAppearance` (not the
+        // legacy `NSWorkspace.didChangeColorSchemeNotification`) — KVO fires
+        // for every transition: system auto Sunset/Sunrise, Control-Centre
+        // toggle, manual `defaults write`, and the case where the user
+        // overrides app theme via Settings. The resulting refresh is
+        // idempotent — setting `appearance` to the value it already has is
+        // a no-op for AppKit. Captures `self` weakly so `applicationWillTerminate`
+        // doesn't need to invalidate the observation explicitly.
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            // KVO fires on whichever queue the change happened on. AppKit
+            // appearance changes always come from the main thread already,
+            // but Task @MainActor guarantees it for Swift 6 strict concurrency.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let appearance = NSApp.effectiveAppearance
+                self.popover?.appearance = appearance
+                for window in NSApp.windows {
+                    // Skip windows that explicitly opted out by setting
+                    // their own `appearance` (none currently do — but if
+                    // a future view needs a permanent override, it can
+                    // pin its window.appearance and we leave it alone here).
+                    // Detection: if window.appearance is non-nil AND
+                    // different from NSApp.effectiveAppearance, the view
+                    // chose that override on purpose. Today no view does
+                    // this — DictionaryView pins via SwiftUI .colorScheme,
+                    // not NSWindow.appearance — so unconditional sync is safe.
+                    window.appearance = appearance
+                }
+            }
+        }
+
         // Status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = Self.createMWMenuBarIcon()
             button.action = #selector(togglePopover)
             button.target = self
+            button.imagePosition = .imageLeading  // the unread count sits after it
         }
+        setUpScreenAgentInboxShortcut()
 
         // Bind floating overlay to coordinator stage + audio levels
         overlay.bind(to: coordinator, recorder: recorder)
@@ -243,12 +554,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             await setupServices()
         }
 
-        // Show onboarding on first launch, otherwise open main window
+        // Show onboarding ONLY on first launch. After onboarding, app
+        // starts silently in the menubar — no auto-open of the main window.
+        //
+        // **Why we removed auto-open** (2026-05-13, user-reported repeatedly):
+        // calling `openMainWindow()` here triggered `setActivationPolicy(.regular)`
+        // + `makeKeyAndOrderFront`, which macOS handled by either dragging
+        // the user across Spaces to wherever the previous window frame was
+        // remembered, OR popping the user out of someone else's fullscreen
+        // to an empty Desktop Space to render our window. Either way the
+        // user-visible symptom was «через несколько секунд после апдейта
+        // приложение кидает в другой экран». User now opens the main
+        // window explicitly via the menubar icon → Settings/Dashboard/etc.
         if !AppSettings.shared.hasCompletedOnboarding {
             onboardingWindow.coordinator = coordinator
+            onboardingWindow.modelManager = modelManager
             onboardingWindow.show()
-        } else {
-            openMainWindow()
         }
 
         // Menu bar icon stays MW logo — no state changes needed
@@ -256,38 +577,314 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Watch for engine changes to load/unload WhisperKit model dynamically
         var lastEngine = AppSettings.shared.transcriptionEngine
+        var lastSelectedModel = AppSettings.shared.selectedModel
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
             .sink { [weak self] _ in
                 guard let self else { return }
                 let newEngine = AppSettings.shared.transcriptionEngine
+                // FREE-7 (beyond onboarding): selecting a different downloaded
+                // model in Settings must reload the engine — otherwise dictation
+                // keeps using the previously-loaded model while history records
+                // the newly-selected one.
+                let newModel = AppSettings.shared.selectedModel
+                if newModel != lastSelectedModel {
+                    lastSelectedModel = newModel
+                    if newEngine != "cloud" {
+                        Task { @MainActor in
+                            guard self.modelManager.isDownloaded(newModel),
+                                  let variant = self.modelManager.variantName(newModel),
+                                  let engine = self.whisperEngine,
+                                  self.coordinator.loadedWhisperModelId != newModel else { return }
+                            do {
+                                try await engine.loadModel(variant, progressHandler: nil)
+                                self.coordinator.loadedWhisperModelId = newModel
+                                self.modelManager.failedToLoadModelId = nil
+                                NSLog("[MetaWhisp] ✅ Reloaded on model select: \(variant)")
+                            } catch {
+                                NSLog("[MetaWhisp] ❌ Reload-on-select failed: \(error)")
+                                // Codex — a swallowed failure left Settings
+                                // rendering a calm "ACTIVE" next to a model that
+                                // never loaded, with no way to retry.
+                                self.coordinator.lastError = "Failed to load model: \(error.localizedDescription)"
+                                self.modelManager.failedToLoadModelId = newModel
+                            }
+                        }
+                    }
+                }
                 guard newEngine != lastEngine else { return }
                 lastEngine = newEngine
                 Task { @MainActor in
                     if newEngine == "cloud" {
                         NSLog("[MetaWhisp] ☁️ Switched to Cloud — deallocating WhisperKit to free RAM")
+                        // ITER-058.3 (Codex) — a runtime switch to cloud must
+                        // also kill an in-flight background best-model download
+                        // and the upgrade plan; previously only the onboarding
+                        // path cleared the flag and the 950 MB kept downloading.
+                        let quickStartOwned = AppSettings.shared.pendingBestModelUpgrade
+                        AppSettings.shared.pendingBestModelUpgrade = false
+                        if ModelBootstrap.shouldCancelDownload(
+                            currentDownloadModel: self.modelManager.currentDownloadModel,
+                            quickStartOwned: quickStartOwned) {
+                            self.modelManager.cancelDownload()
+                            NSLog("[ModelBootstrap] Cancelled in-flight local download — cloud path active")
+                        }
                         await self.whisperEngine?.unloadModel()
                         self.whisperEngine = nil
                         self.coordinator.whisperEngine = nil
+                        self.coordinator.loadedWhisperModelId = nil
                     } else {
                         NSLog("[MetaWhisp] 💻 Switched to On-device — creating WhisperKit engine...")
                         let engine = WhisperKitEngine()
                         self.whisperEngine = engine
                         self.coordinator.whisperEngine = engine
+                        self.coordinator.loadedWhisperModelId = nil
                         let modelId = AppSettings.shared.selectedModel
                         if self.modelManager.isDownloaded(modelId),
                            let variant = self.modelManager.variantName(modelId) {
                             do {
                                 try await engine.loadModel(variant, progressHandler: nil)
+                                self.coordinator.loadedWhisperModelId = modelId
+                                self.modelManager.failedToLoadModelId = nil
                                 NSLog("[MetaWhisp] ✅ Model loaded successfully")
                             } catch {
                                 NSLog("[MetaWhisp] ❌ Failed to load model: \(error)")
                                 self.coordinator.lastError = "Failed to load model: \(error.localizedDescription)"
+                                // Same reason as reload-on-select: the Settings
+                                // row must turn into RETRY, not stay "ACTIVE".
+                                self.modelManager.failedToLoadModelId = modelId
                             }
                         }
                     }
                 }
             }
             .store(in: &cancellables)
+
+        // FREE-1: a model finishing download must also be LOADED into the engine.
+        // The engine-change observer above only fires on an engine SWITCH;
+        // onboarding sets "ondevice" (already the default), so a freshly-
+        // downloaded model would sit on disk unloaded → "Engine not ready" on the
+        // first dictation. Auto-load it here and publish readiness.
+        modelManager.$phase
+            .receive(on: RunLoop.main)
+            .sink { [weak self] phase in
+                guard let self, phase == .done else { return }
+                guard AppSettings.shared.transcriptionEngine != "cloud" else {
+                    // Cloud engine active but a download just finished — still
+                    // drive the background upgrade bookkeeping (ITER-058.3).
+                    self.driveModelUpgrade()
+                    return
+                }
+                let modelId = AppSettings.shared.selectedModel
+                guard self.modelManager.isDownloaded(modelId),
+                      let variant = self.modelManager.variantName(modelId),
+                      let engine = self.whisperEngine,
+                      self.coordinator.loadedWhisperModelId != modelId else {
+                    self.driveModelUpgrade()
+                    return
+                }
+                Task { @MainActor in
+                    do {
+                        try await engine.loadModel(variant, progressHandler: nil)
+                        self.coordinator.loadedWhisperModelId = modelId
+                        self.modelManager.failedToLoadModelId = nil
+                        NSLog("[MetaWhisp] ✅ Auto-loaded downloaded model: \(variant)")
+                        // ITER-058.3 — background best-model upgrade driver:
+                        // after Base loads, start the Large download; after
+                        // Large lands, hot-swap. Success path ONLY — driving
+                        // after a failure would clobber the .failed surface
+                        // with .downloading (review finding).
+                        self.driveModelUpgrade()
+                    } catch {
+                        NSLog("[MetaWhisp] ❌ Auto-load failed: \(error)")
+                        // ITER-058.3 (closes ITER-051 §1 P1) — a swallowed load
+                        // failure used to block onboarding NEXT forever next to
+                        // a ✓-marked model. Surface it where the wizard (and
+                        // Settings) already render download failures. The RETRY
+                        // affordance re-runs startDownload (cached files =
+                        // seconds) → .done → this load retries.
+                        self.modelManager.phase = .failed(
+                            "Model downloaded but failed to load — tap RETRY")
+                        self.modelManager.failedToLoadModelId = modelId
+                        self.coordinator.lastError = "Model failed to load: \(error.localizedDescription)"
+                    }
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// ITER-058.3 — one step of the quick-start → best-model upgrade plan.
+    /// Pure decision in `ModelBootstrap.upgradeAction`; this just executes it.
+    @MainActor func driveModelUpgrade() {
+        let settings = AppSettings.shared
+        let action = ModelBootstrap.upgradeAction(
+            pending: settings.pendingBestModelUpgrade,
+            selectedModel: settings.selectedModel,
+            // LOADED, not just on disk (Codex): a corrupt quick model must not
+            // hand the download slot to the 950 MB upgrade.
+            quickModelLoaded: coordinator.loadedWhisperModelId == ModelBootstrap.quickModelId,
+            bestDownloaded: modelManager.isDownloaded(ModelBootstrap.bestModelId),
+            isDownloading: modelManager.isDownloading,
+            isPro: LicenseService.shared.isPro,
+            engineIsCloud: settings.transcriptionEngine == "cloud",
+            freeBytes: ModelBootstrap.freeDiskBytes()
+        )
+        switch action {
+        case .none:
+            break
+        case .cancelPlan:
+            // The user went cloud/Pro — no local upgrade, no notification.
+            settings.pendingBestModelUpgrade = false
+            // Also stop an in-flight best-model download (review: clearing the
+            // flag alone still delivered the remaining ~950 MB).
+            if modelManager.currentDownloadModel == ModelBootstrap.bestModelId {
+                modelManager.cancelDownload()
+            }
+            NSLog("[ModelBootstrap] Upgrade plan cancelled — cloud/Pro path active")
+        case .startDownload:
+            NSLog("[ModelBootstrap] ⬇️ Best model downloading in background")
+            modelManager.startDownload(ModelBootstrap.bestModelId)
+        case .swapNow:
+            Task { @MainActor in await self.performBestModelSwap() }
+        case .skipLowDisk:
+            settings.pendingBestModelUpgrade = false
+            NSLog("[ModelBootstrap] ⚠️ Best-model upgrade skipped — low disk")
+            MWNotificationStack.shared.push(MWNotification(
+                kind: .advice, title: "Model upgrade skipped",
+                body: "Not enough free space for the best model (~2.5 GB needed). Get it anytime in Settings → Models."))
+        }
+    }
+
+    /// ITER-058.3 (review-hardened) — the swap LOADS FIRST, announces after.
+    /// selectedModel/pending/notification flip only on a successful load, so:
+    /// - a corrupt partial download (quit mid-950 MB) never becomes "active";
+    /// - onboarding readiness (loadedWhisperModelId == selectedModel) never
+    ///   dips during the minutes-long first CoreML load — Base keeps serving.
+    /// On load failure the partial model dir is deleted and the plan re-drives
+    /// (bounded: gives up if the files can't be removed).
+    private var isSwappingBestModel = false
+
+    /// The plan can die while a swap load runs for minutes (explicit Settings
+    /// pick, cloud key validated, Pro activated) — commit nothing in that case.
+    @MainActor private func upgradePlanStillActive() -> Bool {
+        let s = AppSettings.shared
+        return s.pendingBestModelUpgrade
+            && s.selectedModel == ModelBootstrap.quickModelId
+            && s.transcriptionEngine != "cloud"
+            && !LicenseService.shared.isPro
+    }
+
+    @MainActor private func performBestModelSwap() async {
+        guard !isSwappingBestModel else { return }
+        guard upgradePlanStillActive() else { return }
+        let settings = AppSettings.shared
+        guard let engine = whisperEngine,
+              let variant = modelManager.variantName(ModelBootstrap.bestModelId) else { return }
+        isSwappingBestModel = true
+        defer { isSwappingBestModel = false }
+        do {
+            try await engine.loadModel(variant, progressHandler: nil)
+            // A swap load runs for minutes — long enough for a cloud round-trip
+            // (cloud → on-device) to REPLACE `whisperEngine` underneath it. A
+            // stale task must never speak for the live engine (Codex: it could
+            // set `loadedWhisperModelId` while the real engine was still
+            // loading, so onboarding read "ready" on an engine that wasn't).
+            guard whisperEngine === engine, coordinator.whisperEngine === engine else {
+                await engine.unloadModel()
+                NSLog("[ModelBootstrap] Swap landed on a stale engine — unloaded it, global state untouched")
+                return
+            }
+            // The kit is ALREADY swapped inside loadModel — record reality
+            // immediately (Codex: the old code checked the plan first, so for
+            // the length of the check/restore the engine ran Large while
+            // `loadedWhisperModelId` still claimed Base).
+            coordinator.loadedWhisperModelId = ModelBootstrap.bestModelId
+            // Re-check after the minutes-long first CoreML load: the user may
+            // have explicitly picked another model or gone cloud/Pro meanwhile
+            // — their choice wins; restore their engine and walk away.
+            guard upgradePlanStillActive() else {
+                NSLog("[ModelBootstrap] Swap finished but the plan died mid-load — restoring user's pick")
+                let chosen = settings.selectedModel
+                // Cloud/Pro won the race: the engine-switch observer already
+                // unloaded ITS reference, but this task holds the old engine —
+                // which now has Large resident. Free it and stop claiming a
+                // loaded model (Codex: reopened the "cloud frees RAM / don't
+                // lie about the loaded model" hole).
+                if settings.transcriptionEngine == "cloud" || LicenseService.shared.isPro {
+                    await engine.unloadModel()
+                    if self.whisperEngine === engine { self.whisperEngine = nil }
+                    coordinator.loadedWhisperModelId = nil
+                    NSLog("[ModelBootstrap] Cloud/Pro won mid-swap — unloaded the local engine")
+                    return
+                }
+                if modelManager.isDownloaded(chosen),
+                   let chosenVariant = modelManager.variantName(chosen) {
+                    do {
+                        try await engine.loadModel(chosenVariant, progressHandler: nil)
+                        guard whisperEngine === engine, coordinator.whisperEngine === engine else {
+                            await engine.unloadModel()
+                            return
+                        }
+                        coordinator.loadedWhisperModelId = chosen
+                    } catch {
+                        // Never lie about which model is running (Codex: `try?`
+                        // swallowed this and left a silent settings/engine
+                        // mismatch). State stays truthful; the error is visible.
+                        NSLog("[ModelBootstrap] ⚠️ Could not restore %@ after aborted swap: %@",
+                              chosen, error.localizedDescription)
+                        coordinator.lastError =
+                            "Couldn't switch back to \(chosen) — still using Large V3 Turbo. Pick it again in Settings."
+                        // …and mark it, or Settings paints a calm ACTIVE on the
+                        // model that just refused to load (Codex).
+                        modelManager.failedToLoadModelId = chosen
+                    }
+                }
+                return
+            }
+            // Loaded-first ordering: the FREE-7 selectedModel observer sees
+            // loadedWhisperModelId already equal and no-ops (no double load).
+            coordinator.loadedWhisperModelId = ModelBootstrap.bestModelId
+            modelManager.failedToLoadModelId = nil
+            settings.selectedModel = ModelBootstrap.bestModelId
+            settings.pendingBestModelUpgrade = false
+            settings.bestModelUpgradeAttempts = 0
+            // A stale .failed from an earlier Base hiccup must not keep showing
+            // "retry" next to a working upgraded engine.
+            if case .failed = modelManager.phase { modelManager.phase = .done }
+            NSLog("[ModelBootstrap] ✅ Upgraded to Large V3 Turbo")
+            MWNotificationStack.shared.push(MWNotification(
+                kind: .advice, title: "Model upgraded",
+                body: "Large V3 Turbo is now active — best transcription quality."))
+        } catch {
+            // Retry cap (review): without it a deterministic load failure loops
+            // download → fail → delete → re-download forever. Transient failures
+            // keep the files — WhisperKit's loader self-repairs missing pieces
+            // on the next attempt (next .done event or next launch).
+            // The best model is on disk but doesn't load — say so, so its card
+            // offers RETRY instead of a ✓ (Codex).
+            modelManager.failedToLoadModelId = ModelBootstrap.bestModelId
+            let attempts = settings.bestModelUpgradeAttempts + 1
+            settings.bestModelUpgradeAttempts = attempts
+            if attempts >= 3 {
+                settings.pendingBestModelUpgrade = false
+                let dir = ModelManagerService.defaultHubPath.appendingPathComponent(variant)
+                try? FileManager.default.removeItem(at: dir)
+                modelManager.refreshDownloaded()
+                // Drop the marker only if the files ACTUALLY went away. A failed
+                // delete (dir busy, permissions) leaves the broken model on disk
+                // — clearing it there would paint a healthy ✓ on it (Codex).
+                if !modelManager.isDownloaded(ModelBootstrap.bestModelId) {
+                    modelManager.failedToLoadModelId = nil
+                }
+                NSLog("[ModelBootstrap] ❌ Best-model load failed %d times (%@) — upgrade abandoned",
+                      attempts, error.localizedDescription)
+                MWNotificationStack.shared.push(MWNotification(
+                    kind: .advice, title: "Model upgrade paused",
+                    body: "The best model couldn't load on this Mac — keeping the quick model. You can try Large V3 Turbo in Settings anytime."))
+            } else {
+                NSLog("[ModelBootstrap] ⚠️ Best-model load failed (attempt %d/3, %@) — will retry later",
+                      attempts, error.localizedDescription)
+            }
+        }
     }
 
     @objc private func togglePopover() {
@@ -334,6 +931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSLog("[MetaWhisp] Microphone permission: %@", granted ? "GRANTED" : "DENIED")
         if !granted {
             coordinator.lastError = "🎤 Microphone denied — press Right ⌘ to retry (opens Settings)"
+            NSLog("[MetaWhisp] Microphone denied — all three request strategies failed (AVAudioApplication, AVCaptureDevice, AVAudioEngine touch); macOS now holds a standing decision, so requestAccess will not prompt again and only System Settings > Privacy > Microphone can change it")
         }
 
         // 2. Request accessibility (needed for text insertion via Cmd+V)
@@ -356,6 +954,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             onVoiceQuestionStop: { [weak self] in self?.coordinator.stopVoiceQuestion() }
         )
 
+        layoutSwitchController.onAutomaticCorrection = { [weak self] correction in
+            self?.layoutFixFeedback.show(correction)
+        }
+        let layoutFixState = layoutSwitchController.start()
+        NSLog("[LayoutFix] Runtime state: %@", layoutFixState.rawValue)
+        NSLog("[LayoutFix] Armed: auto=%@, doubleShift=%@, switchSource=%@, inputSource=%@", AppSettings.shared.layoutFixAutoEnabled ? "on" : "off", AppSettings.shared.layoutFixDoubleShiftEnabled ? "on" : "off", AppSettings.shared.layoutFixSwitchInputSource ? "on" : "off", InputSourceService().currentLayout()?.rawValue ?? "unsupported")
+
         // 4. Find downloaded models
         await modelManager.fetchAvailableModels()
         NSLog("[MetaWhisp] Downloaded models: %@", "\(modelManager.downloadedModels)")
@@ -365,6 +970,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSLog("[MetaWhisp] 🔄 Pro subscription detected — auto-switching to cloud transcription")
             AppSettings.shared.transcriptionEngine = "cloud"
         }
+
+        // 5a. ITER-034.3 (2026-05-11) — one-time auto-promote `processingMode`
+        // from default "raw" to "structured" for Pro users. User feedback:
+        // «никогда не структурирует текст и не добавляет буллеты хотя должен».
+        // Pro pays for the AI cleanup-with-bullets feature, so they should get
+        // it without having to find Settings → Processing Mode. Flag-gated so
+        // we only do this ONCE — if the user explicitly moves back to "raw"
+        // later, we don't fight them on the next launch.
+        if LicenseService.shared.isPro
+            && !AppSettings.shared.didAutoPromoteProcessingMode
+            && AppSettings.shared.processingMode == "raw" {
+            NSLog("[MetaWhisp] 🔄 Pro on default raw — auto-promoting processingMode to structured")
+            AppSettings.shared.processingMode = "structured"
+        }
+        // Mark as done regardless of whether we promoted (Free users, or Pro
+        // users who'd already moved off raw — neither needs the promotion
+        // again on the next launch).
+        AppSettings.shared.didAutoPromoteProcessingMode = true
 
         // 6. Load selected model (skip if cloud transcription is selected — WhisperKit not created, saves ~1 GB RAM)
         let isCloudMode = AppSettings.shared.transcriptionEngine == "cloud"
@@ -384,6 +1007,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 NSLog("[MetaWhisp] Loading model: \(variant)...")
                 do {
                     try await engine.loadModel(variant, progressHandler: nil)
+                    coordinator.loadedWhisperModelId = modelId
+                    modelManager.failedToLoadModelId = nil
                     NSLog("[MetaWhisp] ✅ Model loaded successfully")
                     if coordinator.lastError?.contains("model") == true {
                         coordinator.lastError = nil
@@ -391,12 +1016,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 } catch {
                     NSLog("[MetaWhisp] ❌ Failed to load model: \(error)")
                     coordinator.lastError = "Failed to load model: \(error.localizedDescription)"
+                    // ITER-058.3 (Codex) — surface it so the wizard/Settings
+                    // offer a reachable RETRY instead of a ✓-looking dead model.
+                    modelManager.phase = .failed("Model failed to load — tap RETRY")
+                    modelManager.failedToLoadModelId = modelId
                 }
             } else {
                 NSLog("[MetaWhisp] ⚠️ No downloaded model found for '\(modelId)'")
                 coordinator.lastError = "No model loaded. Go to Settings to download one."
             }
         }
+
+        await ForkTranscriptionSmoke.runIfRequested(coordinator: coordinator)
+
+        // 6a. ITER-058.3 — resume an interrupted quick-start upgrade. Runs
+        // strictly AFTER the Pro auto-switch (step 5: a fresh Pro cancels the
+        // plan instead of downloading ~1 GB) and AFTER engine creation (step 6:
+        // a resumed swap needs a live engine to load into). Base-first rule
+        // lives in upgradeAction — a quit mid-Base-download resumes Base via
+        // the wizard, not by grabbing the slot for the 950 MB model.
+        driveModelUpgrade()
 
         // 7. Configure screen context with persistence
         screenContext.configure(modelContainer: historyService.modelContainer)
@@ -440,17 +1079,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // Realtime task reactor (ITER-006): fire LLM task classifier on each new ScreenContext.
         // Self-gated by settings toggle + debounce — wiring is fire-and-forget.
+        screenAgentDelivery = ScreenAgentDeliveryService(container: historyService.modelContainer)
+        screenAgentVision = ScreenAgentVisionClient(
+            transport: ScreenAgentProVisionTransport(
+                licenseKey: { LicenseService.shared.licenseKey }),
+            cache: screenContext.frameCache)
         realtimeScreenReactor.configure(modelContainer: historyService.modelContainer)
         realtimeScreenReactor.meetingRecorder = meetingRecorder
-        screenContext.onContextPersisted = { [weak self] ctx in
-            Task { @MainActor in
-                await self?.realtimeScreenReactor.react(to: ctx)
-                // ITER-015 — proactive chip evaluates the same context, gated hard
-                // by settings / cooldown / blacklist / composing-intent inside.
-                self?.proactiveContextService.onNewContext(ctx)
-            }
+        screenContext.onContextPersisted = { [weak self] ctx, forcedReread in
+            // ITER-064A.4 — two independent consumers of the same context. The
+            // reactor's model call is allowed 20 s; the proactive path used to
+            // wait behind it and so evaluated screens the user had left.
+            // ITER-015 — proactive is gated hard by settings / cooldown /
+            // blacklist inside `onNewContext`.
+            ScreenContextFanout.dispatch(
+                ctx,
+                isForcedReread: forcedReread,
+                toTaskReactor: { [weak self] c in await self?.realtimeScreenReactor.react(to: c) },
+                toProactive: { [weak self] c in self?.proactiveContextService.onNewContext(c) }
+            )
         }
         if AppSettings.shared.screenContextEnabled {
+            // Degraded gating lives inside ScreenContextService.startMonitoring so it
+            // covers every start path (launch / Settings toggle / didBecomeActive).
             let interval = AppSettings.shared.screenContextInterval
             screenContext.startMonitoring(interval: interval)
         }
@@ -458,8 +1109,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 9a. Configure MemoryExtractor + TaskExtractor — both trigger-based on voice transcription.
         // : voice transcript input, not periodic screen OCR polling.
         // spec://iterations/ITER-001#architecture.extractor + spec://BACKLOG#B1
-        memoryExtractor.configure(screenContext: screenContext, modelContainer: historyService.modelContainer)
-        taskExtractor.configure(screenContext: screenContext, modelContainer: historyService.modelContainer)
+        memoryExtractor.configure(modelContainer: historyService.modelContainer)
+        taskExtractor.configure(modelContainer: historyService.modelContainer)
+        // SB-1 — drain any conversations left queued by a previous session
+        // (app quit/crash before extraction completed), now that the container
+        // is configured.
+        memoryExtractor.backfillPending()
+        taskExtractor.backfillPending()
 
         // 9c. Configure ChatService (RAG over memories + transcripts + tasks + screen OCR).
         // spec://BACKLOG#B2 + spec://iterations/ITER-003-screen-aware-intelligence#scope.1
@@ -478,6 +1134,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 9d. Configure ConversationGrouper (C1.1) + StructuredGenerator (C1.2).
         // Grouper fires StructuredGenerator + extractors on conversation close.
         conversationGrouper.configure(modelContainer: historyService.modelContainer)
+
+        // ITER-037 — start MCP snapshot writer. Dumps memories / tasks /
+        // conversations to `~/Library/Application Support/MetaWhisp/mcp-snapshot.json`
+        // every 5 min so the standalone `metawhisp-mcp` CLI can answer
+        // Claude Desktop tool calls without sharing the SwiftData store.
+        // AUD-029 — applyEnabledState() honours the mcpEnabled opt-in: it starts
+        // the writer only if the user enabled MCP, otherwise it purges any stale
+        // snapshot so opted-out users keep no plaintext copy on disk.
+        // AUD-007 / ITER-049 A2b — in a degraded (temporary in-memory) session the
+        // store is empty; background extractors/exporters would process nothing and
+        // writers like the MCP snapshot would overwrite the on-disk JSON with empty
+        // data. Keep degraded a read-only recovery shell: services are still
+        // configured (so the UI doesn't crash) but their periodic timers / one-shot
+        // writers never start. In a healthy session storeHealthy == true, so the
+        // normal path is unchanged.
+        let storeHealthy = historyService.health.isHealthy
+        MCPSnapshotService.shared.configure(container: historyService.modelContainer)
+        if storeHealthy { MCPSnapshotService.shared.applyEnabledState() }
+        if !storeHealthy { NSLog("[MCPSnapshot] ⚠️ writer not started — store degraded; on-disk snapshot left stale") }
         structuredGenerator.configure(modelContainer: historyService.modelContainer)
         // Wire embedding so StructuredGenerator embeds each closed conversation
         // right after title/overview populate (ITER-011).
@@ -494,13 +1169,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // periodic catches anything that closes WHILE the app is up but the
         // proxy was briefly unavailable. Together they make "Quick note" stuck
         // forever impossible.
-        Task { @MainActor [weak self] in
-            await self?.structuredGenerator.backfillPlaceholders()
-            self?.structuredGenerator.startPeriodicBackfill()
+        if storeHealthy {
+            Task { @MainActor [weak self] in
+                await self?.structuredGenerator.backfillPlaceholders()
+                self?.structuredGenerator.startPeriodicBackfill()
+            }
         }
 
         // 9d+. Embedding service (ITER-008 + ITER-011) — semantic RAG + dedup for Pro users.
         embeddingService.configure(modelContainer: historyService.modelContainer)
+        // (ITER-057.1 promotion loop starts further down, strictly AFTER the
+        // ITER-007 staged-tasks migration — see that Task block.)
 
         // ITER-026 — one-time cleanup of calendar-derived TaskItems. The old
         // CalendarReaderService.scanNow pipeline turned every upcoming event
@@ -508,8 +1187,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // context for weeks. The pipeline is gone; here we dismiss whatever
         // it left behind so the user doesn't have to bulk-clean by hand.
         Task { @MainActor [weak self] in
-            self?.migrateCalendarTasksOnce()
-            self?.migrateSilenceStopMinutesOnce()
+            // ITER-049 A2 — these one-time store migrations set persistent @AppStorage
+            // flags; running them against the empty degraded store would mark them done
+            // and skip the real migration forever. cleanupStaleRecoveryWavs is store-free.
+            if storeHealthy {
+                self?.migrateCalendarTasksOnce()
+                self?.migrateSilenceStopMinutesOnce()
+            }
+            // ITER-034.2 (2026-05-11) — prune Recovery/ orphans (>7 days old).
+            // Daily audit found 12 MB of stale .wav files from May 7-8, no
+            // cleanup code anywhere in the project. Idempotent: zero-op when
+            // dir is fresh, deletes whatever's >7d when there's accumulated
+            // junk. Not gated by a flag because deleting old wavs is always
+            // safe — recovery only re-uses files written this session.
+            self?.cleanupStaleRecoveryWavs()
+            // ITER-053.1 — screen-history retention. Raw OCR rows and Rewind
+            // observations past their windows are deleted at launch (and every
+            // 12h below). Gated on storeHealthy like the migrations: pruning
+            // against a degraded in-memory store would be a silent no-op that
+            // never touches the real data.
+            if storeHealthy {
+                self?.pruneScreenHistory()
+                // ITER-053.4 slice 2 — semantic backfill runs AFTER the prune
+                // (never embed rows that retention is about to delete) and only
+                // while the user has screen capture enabled (Codex review —
+                // a disabled toggle must also stop cloud embedding of old rows).
+                if AppSettings.shared.screenContextEnabled, let self {
+                    self.embeddingService.backfillObservationEmbeddings(in: self.historyService.modelContainer)
+                }
+            }
+        }
+
+        // ITER-053.1 — repeat the retention prune every 12h for long-running
+        // sessions (the app lives in the menu bar for weeks; launch-only
+        // pruning would let the store creep between restarts).
+        screenRetentionTimer = Timer.scheduledTimer(withTimeInterval: 12 * 3600, repeats: true) { _ in
+            Task { @MainActor [weak self] in self?.pruneScreenHistory() }
         }
 
         // ITER-027 — Proactive context service is now powered by the
@@ -526,6 +1239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // "ChatApp"/"ЧатЭп"/"ChatAppAI" collapse to one canonical row.
         projectAggregator.configure(modelContainer: historyService.modelContainer)
         Task { @MainActor [weak self] in
+            // ITER-049 A2 — skip project backfill + the one-shot curative pass (which
+            // sets a persistent @AppStorage flag) in a degraded session.
+            guard storeHealthy else { return }
             // Wait longer than the embeddings backfill so the centroid pass below has
             // vectors to work with.
             try? await Task.sleep(for: .seconds(15))
@@ -551,24 +1267,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 9d++. Daily summary (ITER-009) — nightly recap with scheduled delivery.
         dailySummaryService.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.dailySummaryEnabled {
+        if AppSettings.shared.dailySummaryEnabled, storeHealthy {
             dailySummaryService.startScheduler()
         }
 
         // ITER-022 G5 — Weekly cross-conversation pattern digest. Sunday wall-clock
         // scheduler ticks every 5 min; fires once per week.
         weeklyPatternDetector.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.weeklyPatternsEnabled {
+        if AppSettings.shared.weeklyPatternsEnabled, storeHealthy {
             weeklyPatternDetector.startScheduler()
         }
 
-        // One-time migration for Staged Tasks (ITER-007):
-        // Before this rollout all screen-inferred tasks landed in the main Tasks list
-        // and produced noise. Move active screen-origin tasks into the "staged" bin so
-        // they surface in REVIEW CANDIDATES and the user decides per-item.
-        // Fetch filter kept simple (predicate can't mix Optional nil-checks w/o tripping
-        // the type checker); refine in memory.
+        // One-time migration for Staged Tasks (ITER-007). ITER-057.1 (Codex):
+        // it had NO flag and re-ran EVERY launch — demoting screen tasks the
+        // user (or the promotion loop) had promoted. Flag-gated now; the
+        // promotion loop starts strictly AFTER it so a launch can't promote →
+        // demote → re-promote the same rows.
         Task { @MainActor in
+            defer {
+                // ITER-057.1 — promotion loop: keeps ≈5 screen-sourced tasks
+                // active (silent startup pass; slot-vacated + 5-min safety
+                // passes may notify, opt-in). Starts after the migrations above
+                // settle, only against a healthy store.
+                if storeHealthy {
+                    TaskPromotionService.shared.configure(modelContainer: historyService.modelContainer)
+                    TaskPromotionService.shared.start()
+                    // ITER-057.2 — hourly LLM re-ranking of staged candidates;
+                    // promotion picks by relevanceScore instead of recency.
+                    TaskPrioritizationService.shared.configure(modelContainer: historyService.modelContainer)
+                    TaskPrioritizationService.shared.start()
+                }
+            }
+            // ITER-057.5 — one-time cleanup: system permission dialogs
+            // (SecurityAgent / UserNotificationCenter / loginwindow) produced junk
+            // tasks before the task whitelist existed («Allow keychain access for
+            // xctest»). Dismiss them — the whitelist stops new ones at the source.
+            if storeHealthy, !AppSettings.shared.didDismissSystemDialogTasks {
+                let ctx = ModelContext(historyService.modelContainer)
+                let apps = TaskExtractionFilters.systemDialogSourceApps
+                let desc = FetchDescriptor<TaskItem>(
+                    predicate: #Predicate<TaskItem> { !$0.isDismissed && !$0.completed })
+                let junk = ((try? ctx.fetch(desc)) ?? []).filter {
+                    $0.screenContextId != nil && $0.sourceApp.map(apps.contains) == true
+                }
+                var cleanupFailed = false
+                for task in junk {
+                    do {
+                        // MutationService so the vault file of a promoted junk task
+                        // is removed too (dismiss hook), not just the DB row.
+                        // updatedAt deliberately untouched: the negative-example
+                        // prompt lists sort by updatedAt, and a batch of junk
+                        // dismissals must not evict the user's real dismissals.
+                        try MutationService.shared.commit(.taskDismissed(task.id), in: ctx) {
+                            task.isDismissed = true
+                            task.status = "dismissed"
+                        }
+                    } catch {
+                        cleanupFailed = true
+                        NSLog("[AppDelegate] ⚠️ system-dialog task cleanup failed — will retry next launch: %@",
+                              error.localizedDescription)
+                        break
+                    }
+                }
+                if !cleanupFailed {
+                    if !junk.isEmpty {
+                        NSLog("[AppDelegate] Dismissed %d junk tasks from system dialogs (ITER-057.5)", junk.count)
+                    }
+                    AppSettings.shared.didDismissSystemDialogTasks = true
+                }
+            }
+            guard storeHealthy, !AppSettings.shared.didMigrateScreenTasksToStaged else { return }
             let ctx = ModelContext(historyService.modelContainer)
             let desc = FetchDescriptor<TaskItem>(
                 predicate: #Predicate<TaskItem> { !$0.isDismissed }
@@ -577,13 +1345,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let candidates = all.filter {
                 $0.screenContextId != nil && ($0.status == nil || $0.status == "committed")
             }
-            guard !candidates.isEmpty else { return }
             for task in candidates {
                 task.status = "staged"
                 task.updatedAt = Date()
             }
-            try? ctx.save()
-            NSLog("[AppDelegate] Migrated %d existing screen-origin tasks → staged", candidates.count)
+            if candidates.isEmpty {
+                AppSettings.shared.didMigrateScreenTasksToStaged = true
+            } else {
+                do {
+                    try ctx.save()
+                    NSLog("[AppDelegate] Migrated %d existing screen-origin tasks → staged", candidates.count)
+                    // Codex review — flag ONLY after a successful save; a
+                    // transient failure must retry on the next launch.
+                    AppSettings.shared.didMigrateScreenTasksToStaged = true
+                } catch {
+                    NSLog("[AppDelegate] ⚠️ staged-tasks migration save failed — will retry next launch: %@",
+                          error.localizedDescription)
+                }
+            }
         }
 
         // Periodic sweep: close dictation conversations idle past the gap (10 min) so
@@ -598,34 +1377,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 9e. Configure ScreenExtractor (Phase 2 R1) — hourly batch analysis of screen activity.
         screenExtractor.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.screenExtractionEnabled {
+        if AppSettings.shared.screenExtractionEnabled, storeHealthy {
             screenExtractor.startPeriodic(interval: AppSettings.shared.screenExtractionInterval)
         }
 
         // 9f. Configure FileIndexer + FileMemoryExtractor (Phase 3 E1).
         fileIndexer.configure(modelContainer: historyService.modelContainer)
         fileMemoryExtractor.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.fileIndexingEnabled {
+        if AppSettings.shared.fileIndexingEnabled, storeHealthy {
             fileIndexer.startPeriodic(interval: AppSettings.shared.fileIndexingInterval)
         }
 
         // 9g. Configure AppleNotesReader (Phase 3 E2).
         appleNotesReader.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.appleNotesEnabled {
+        if AppSettings.shared.appleNotesEnabled, storeHealthy {
             appleNotesReader.startPeriodic(interval: AppSettings.shared.appleNotesInterval)
         }
 
-        // 9g.1 Configure ObsidianSync (2026-04-28). Outbound: appends new
-        // memories to <vault>/MetaWhisp/Journal.md so they propagate into
-        // the user's broader Obsidian-based knowledge graph.
+        // 9g.1 Configure Obsidian export (ITER-035 v2, 2026-05-12).
+        // New date-first layout via `obsidianExporter`. Legacy
+        // `obsidianSync.startPeriodic()` is intentionally NOT called — its
+        // append-only Journal.md path is superseded. The instance stays around
+        // only so existing wiring compiles; future iteration removes it
+        // entirely after migration script ships.
+        obsidianExporter.configure(modelContainer: historyService.modelContainer)
         obsidianSync.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.obsidianSyncEnabled {
-            obsidianSync.startPeriodic()
-        }
+        // NB: NOT calling obsidianSync.startPeriodic() — replaced by per-save hooks.
 
         // 9h. Configure CalendarReader (Phase 3 E3).
         calendarReader.configure(modelContainer: historyService.modelContainer)
-        if AppSettings.shared.calendarReaderEnabled {
+        if AppSettings.shared.calendarReaderEnabled, storeHealthy {
             calendarReader.startPeriodic(interval: AppSettings.shared.calendarReaderInterval)
             // ITER-018 — backfill calendar links for completed conversations
             // that landed before the linker existed. Bounded to last 90 days.
@@ -675,6 +1456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// Watch for intelligence feature toggles and react in realtime.
     private func observeIntelligenceSettings() {
+        var lastVisualConsent = AppSettings.shared.screenAgentVisualConsent
         var lastScreenContext = AppSettings.shared.screenContextEnabled
         var lastAdvice = AppSettings.shared.adviceEnabled
         var lastMeeting = AppSettings.shared.meetingRecordingEnabled
@@ -685,6 +1467,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard let self else { return }
                 let newScreenContext = AppSettings.shared.screenContextEnabled
                 let newAdvice = AppSettings.shared.adviceEnabled
+
+                // ITER-069 — revoking visual consent empties the frame cache
+                // immediately; a frame captured under consent does not outlive
+                // the consent it was captured under.
+                let newVisualConsent = AppSettings.shared.screenAgentVisualConsent
+                if newVisualConsent != lastVisualConsent {
+                    lastVisualConsent = newVisualConsent
+                    if !newVisualConsent {
+                        Task { @MainActor in self.screenContext.frameCache.invalidateAll() }
+                    }
+                }
 
                 if newScreenContext != lastScreenContext {
                     lastScreenContext = newScreenContext
@@ -792,6 +1585,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 NSLog("[CallDetect] %@ user declined recording for this session — suppress (no auto-restart)", callName)
                 return
             case let .fireNotify(name, armCountdown):
+                // ITER-035-followup (2026-05-12) — outer per-app cooldown.
+                // CallSessionMachine de-dupes ONLY while the session is alive.
+                // It clears after the 180s nil-debounce (when window-scan
+                // stops seeing the meeting tab). If user tab-switches off the
+                // meeting for > 3 min, next return = fresh session = new card.
+                // Result: card flashes every time during a long meeting. We
+                // suppress here regardless of session state if we already
+                // showed the card for this name within the last 30 min.
+                let cardCooldown: TimeInterval = 30 * 60
+                if let lastFired = lastCallCardFiredAt[name],
+                   Date().timeIntervalSince(lastFired) < cardCooldown {
+                    NSLog("[CallDetect] %@ — card shown %.0f sec ago < %.0fs cooldown, suppress",
+                          name, Date().timeIntervalSince(lastFired), cardCooldown)
+                    return
+                }
+                lastCallCardFiredAt[name] = Date()
+
                 // ITER-026 v2 — info-only "call detected" notification. Auto-start
                 // is now governed by `MeetingAutoStartGate` via the fast tick
                 // loop in `runMeetingAutoStartTick`. The gate requires
@@ -994,16 +1804,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 transcript: transcript
             )
             MeetingRecapState.shared.present(payload)
+            NSLog("[MeetingRecap] presented conv %@ — %.0fs meeting, title %d chars, overview %d chars, decisions=%d nextSteps=%d participants=%d tasks=%d memories=%d", conversationId.uuidString.prefix(8) as CVarArg, durationSec, title.count, overview.count, decisions.count, nextSteps.count, participants.count, taskCount, memoryCount)
+            NSLog("[MeetingRecap] presented — %.0fs meeting, %d action item(s), %d memory row(s), %d decision(s), %d next step(s)", durationSec, actionItems.count, memoryRows.count, decisions.count, nextSteps.count)
+            NSLog("[MeetingRecap] recap shown: %.0fs meeting, %d transcript chars, %d task(s), %d memory row(s)", durationSec, transcript.count, actionItems.count, memoryRows.count)
         }
 
-        // Per-meeting Obsidian markdown + calendar event notes patch.
-        // Self-contained — no-op if Obsidian sync isn't enabled.
+        // Per-meeting Obsidian markdown via new ITER-035 v2 exporter.
+        // Self-contained — no-op if Obsidian sync isn't enabled (the exporter
+        // bails inside `vaultURL()` when the path is unset/missing).
+        // NB: 2026-05-12 — replaced `MeetingObsidianWriter.shared.write(...)`
+        // which wrote to legacy flat `Meetings/<date> · <title>.md` layout.
+        // Calendar-event-notes patch is deferred to a follow-up — the new
+        // exporter doesn't touch EKEventStore yet.
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await MeetingObsidianWriter.shared.write(
-                conversationId: conversationId,
-                modelContainer: self.historyService.modelContainer
-            )
+            await self.obsidianExporter.exportConversation(conversationId)
         }
     }
 
@@ -1036,8 +1851,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 2h heartbeat, etc. without guessing from log neighbours
     /// (ITER-028.1, 2026-05-06 — every previous "why did the recording
     /// stop after 86s" question required cross-grepping).
+
+    /// Said before any transcription path — the BYOK paths save and return
+    /// early — and from every stop path, including the one that discards: a
+    /// transcript that reads complete must not hide that the user's side is
+    /// missing, and a recording thrown away because the mic was down must not
+    /// be thrown away silently (review rounds 6–11). The banner
+    /// (`keepFinalizationNote`) stays until the next meeting; the card is the
+    /// announcement. The words are `MicOutageReport`'s, so they are tested.
+    private func reportMicOutageIfAny(_ capture: MeetingRecorder.Capture, discarded: Bool = false) {
+        let input = MicOutageReport.Input(
+            outages: capture.outages, outageSeconds: capture.outageSeconds,
+            micDownAtStop: capture.micDownAtStop, tapSamples: capture.tapSamples,
+            noPermission: capture.micUnavailable == .noPermission,
+            noInputDevice: capture.micUnavailable == .noInputDevice,
+            silentRunSeconds: capture.micZeroRunSeconds, discarded: discarded,
+            audioAtStop: capture.micAudioAtStop)
+        guard input.outages > 0 || input.noPermission || input.noInputDevice
+                || input.silentRunSeconds >= MicOutageReport.silentRunFloorSeconds else { return }
+        NSLog("[MetaWhisp] mic report: %d outage(s) %.1fs, down at stop: %@, tap samples: %d, permission off: %@, no input device (known only for a mic that never produced): %@, silent run: %.0fs%@",
+              input.outages, input.outageSeconds, input.micDownAtStop ? "yes" : "no", input.tapSamples,
+              input.noPermission ? "yes" : "no", input.noInputDevice ? "yes" : "no", input.silentRunSeconds,
+              discarded ? " (recording discarded by the silence sniff)" : "")
+        guard let words = MicOutageReport.wording(input) else {
+            NSLog("[MetaWhisp] mic report kept to the log — below the card floor, or nothing to fix")
+            return
+        }
+        meetingRecorder.keepFinalizationNote(words.note, for: capture.generation)
+        NSLog("[MetaWhisp] mic report surfaced: menu-bar note%@", (words.title != nil && words.body != nil) ? " + card" : " only")
+        if let title = words.title, let body = words.body {
+            MWNotificationStack.shared.push(MWNotification(kind: .micOutage, title: title, body: body, onTap: nil))
+        }
+    }
+
     private func stopMeetingRecording(reason: String) {
         NSLog("[MetaWhisp] ▶️ stopMeetingRecording reason=%@", reason)
+        // A hand on the stop button ends this calendar event's auto-start for
+        // good. Without it the retry restarted a meeting the owner had just
+        // stopped, three times in four minutes while they were not on a call
+        // (owner's report, 2026-09-22 18:31).
+        if let eventID = recordingCalendarEventID, CalendarAutoStartRetry.isRefusal(stopReason: reason) {
+            MeetingAutoStartGate.shared.decline(eventID: eventID)
+        }
         // Reset auto-detect flag — any follow-up manual recording starts from a clean slate.
         // Without this a subsequent manual recording would be auto-stopped on the next call-end event.
         didAutoStartRecording = false
@@ -1075,20 +1930,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // or collected nothing, in which case we fall back to a full pass.
         let liveResult = liveMeetingAdvisor.finalize()
 
-        // Snapshot the tail audio (samples since the advisor's last successful
-        // tick) BEFORE `recorder.stop()` wipes the buffers. ≤ chunkSeconds of
-        // audio. peekSamples is non-destructive and safe while mic still runs.
-        let tailMic: [Float]
-        let tailSys: [Float]
-        if let live = liveResult {
-            tailMic = meetingRecorder.mic.peekSamples(from: live.micOffsetAtFinalize)
-            tailSys = meetingRecorder.systemAudio.peekSamples(from: live.sysOffsetAtFinalize)
-        } else {
-            tailMic = []
-            tailSys = []
-        }
-
-        let (micSamples, sysSamples) = meetingRecorder.stop()
+        // 2026-05-31 — the saved transcript now always comes from the full-buffer
+        // dual-stream pass below (per-channel, Me:/Them: labels), so the live
+        // advisor's tail snapshot is no longer needed for persistence.
+        let capture = meetingRecorder.stop()
+        let micSamples = capture.mic
+        let sysSamples = capture.system
         NSLog("[MetaWhisp] Meeting stopped: mic=%d samples, system=%d samples",
               micSamples.count, sysSamples.count)
 
@@ -1097,43 +1944,152 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
+        reportMicOutageIfAny(capture)
+
         Task {
+            // ITER-054 — BYOK Deepgram (optional): one diarized pass on the
+            // user's own key. Real speaker labels, 1× cost on THEIR Deepgram
+            // account, no engine needed, no Pro-quota booking (never touches
+            // our worker). Any failure falls through to the Whisper dual-stream
+            // below — this path can only add quality, never lose a meeting.
+            let deepgramKey = AppSettings.shared.deepgramKey
+            if !deepgramKey.isEmpty {
+                let dgStart = CFAbsoluteTimeGetCurrent()
+                do {
+                    let text = try await DeepgramMeetingTranscriber()
+                        .transcribe(mic: micSamples, system: sysSamples, apiKey: deepgramKey)
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { throw DeepgramMeetingTranscriber.DGError.emptyTranscript }
+                    let duration = Double(max(micSamples.count, sysSamples.count)) / 16000.0
+                    self.persistMeetingTranscript(fullText: trimmed, duration: duration,
+                                                  elapsed: CFAbsoluteTimeGetCurrent() - dgStart)
+                    NSLog("[MetaWhisp] ✅ Meeting transcribed via Deepgram BYOK: %.0fs audio in %.1fs",
+                          duration, CFAbsoluteTimeGetCurrent() - dgStart)
+                    return
+                } catch {
+                    NSLog("[MetaWhisp] ⚠️ Deepgram BYOK failed (%@) — falling back to Whisper dual-stream",
+                          error.localizedDescription)
+                }
+            }
+
+            // Same bargain on a different provider, tried after Deepgram
+            // because Deepgram is generally available and this model is in
+            // public preview — and a preview model is exactly what took the
+            // vision path down this month when Groq withdrew llama-4. Failure
+            // falls through to the Whisper dual-stream below, same as above.
+            let geminiKey = AppSettings.shared.geminiKey
+            if !geminiKey.isEmpty {
+                let gStart = CFAbsoluteTimeGetCurrent()
+                NSLog("[MetaWhisp] Gemini BYOK: sending %.0fs audio in %d slice(s)", Double(max(micSamples.count, sysSamples.count)) / 16000.0, GeminiMeetingTranscriber.sliceRanges(totalSamples: max(micSamples.count, sysSamples.count)).count)
+                do {
+                    let text = try await GeminiMeetingTranscriber()
+                        .transcribe(mic: micSamples, system: sysSamples, apiKey: geminiKey)
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else {
+                        throw GeminiMeetingTranscriber.GeminiError.emptyTranscript
+                    }
+                    let duration = Double(max(micSamples.count, sysSamples.count)) / 16000.0
+                    self.persistMeetingTranscript(fullText: trimmed, duration: duration,
+                                                  elapsed: CFAbsoluteTimeGetCurrent() - gStart)
+                    NSLog("[MetaWhisp] ✅ Meeting transcribed via Gemini BYOK: %.0fs audio in %.1fs",
+                          duration, CFAbsoluteTimeGetCurrent() - gStart)
+                    return
+                } catch {
+                    NSLog("[MetaWhisp] ⚠️ Gemini BYOK failed (%@) — falling back to Whisper dual-stream",
+                          error.localizedDescription)
+                }
+            }
+
             // Engine selection is the same for both paths — reads `coordinator.activeEngine`
             // at runtime so the user's current setting (cloud vs on-device) wins.
             guard let engine = coordinator.activeEngine, engine.isModelLoaded else {
                 let mode = AppSettings.shared.transcriptionEngine == "cloud" ? "Cloud" : "On-device"
-                coordinator.lastError = "\(mode) transcription not ready — open Settings and select a model"
+                // The buffers are locals here and this `return` used to be the
+                // end of them (audit, P1). Keep the audio, and say where.
+                let saved = self.rescueMeetingAudio(mic: micSamples, system: sysSamples,
+                                                    reason: "meeting transcribe: engine not ready")
+                let where_ = saved.mic ?? saved.system
+                coordinator.lastError = where_ == nil
+                    ? "\(mode) transcription not ready — open Settings and select a model"
+                    : "\(mode) transcription not ready — the meeting audio is saved in \(where_!.deletingLastPathComponent().path)"
                 NSLog("[MetaWhisp] ❌ Meeting transcribe: engine not ready (%@)", mode)
                 return
             }
 
             let startTime = CFAbsoluteTimeGetCurrent()
-            let fullText: String
-
+            NSLog("[MetaWhisp] Meeting finalize via %@: mic %.0fs, system %.0fs", engine.name, Double(micSamples.count) / 16000.0, Double(sysSamples.count) / 16000.0)
+            // 2026-05-31 — ALWAYS save via the per-channel dual-stream pass so the
+            // stored transcript carries Me:/Them: speaker labels ("who said what").
+            // The live advisor's partials already powered the real-time copilot
+            // DURING the meeting, but they're a single MIXED stream (no labels), so
+            // they're no longer reused for the saved transcript. Cost: re-transcribes
+            // both channels at finalize (~2×) — accepted trade for speaker accuracy.
+            // (`assembleMeetingTranscriptFromLive` is now dormant; kept as fallback.)
             if let live = liveResult {
-                NSLog("[MetaWhisp] Meeting reusing LiveAdvisor partials (%d collected, %d chars) — only tail needs transcribe",
-                      live.partialCount, live.text.count)
-                fullText = await self.assembleMeetingTranscriptFromLive(
-                    liveText: live.text,
-                    tailMic: tailMic,
-                    tailSys: tailSys,
-                    engine: engine
-                )
-            } else {
-                NSLog("[MetaWhisp] Meeting transcribing via %@ (no live partials — dual-stream pass)", engine.name)
-                fullText = await self.transcribeMeetingDualStream(mic: micSamples, system: sysSamples, engine: engine)
+                NSLog("[MetaWhisp] Meeting: %d live partials drove the copilot; saving via dual-stream for Me/Them labels", live.partialCount)
             }
+            let dual = await self.transcribeMeetingDualStream(mic: micSamples, system: sysSamples, engine: engine)
 
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             let duration = Double(max(micSamples.count, sysSamples.count)) / 16000.0
 
-            guard !fullText.isEmpty else {
-                NSLog("[MetaWhisp] Meeting transcription empty (all chunks silent or hallucinated)")
-                meetingRecorder.lastError = "🎤 No speech detected in recording"
+            guard !dual.text.isEmpty else {
+                // AUD-002 / ITER-060.5 — name the REAL cause: failed chunks,
+                // a mic that captured nothing (its start failure is swallowed
+                // into micOnlyMode), or genuine silence. Blaming the user's
+                // speech for a dead mic sent the founder chasing the wrong bug
+                // on 2026-08-10.
+                // The tap's own count from THIS meeting's snapshot: timeline
+                // silence would make an empty capture look like a quiet one,
+                // and the recorder's live fields may already belong to the
+                // next meeting.
+                let reason = MeetingRecorder.emptyTranscriptReason(
+                    failedChunks: dual.failedChunks,
+                    micSamples: capture.tapSamples,
+                    systemSamples: sysSamples.count,
+                    micPeakWasZero: capture.micChannelWasSilent
+                )
+                meetingRecorder.reportFinalization(error: reason.userMessage, for: capture.generation)
+                NSLog("[MetaWhisp] ❌ Meeting empty — %@ (mic=%d samples, system=%d samples, failedChunks=%d)",
+                      "\(reason)", micSamples.count, sysSamples.count, dual.failedChunks)
                 return
             }
 
+            // A dead mic does NOT produce an empty meeting — the other side
+            // still arrives through the system channel, so the guard above
+            // never fires and a Them:-only transcript saves as if complete.
+            // That is exactly what happened on 2026-08-12 and nobody was told.
+            if capture.micChannelWasSilent {
+                meetingRecorder.reportFinalization(
+                    error: MeetingRecorder.EmptyTranscriptReason.micDeliveredSilence.userMessage,
+                    for: capture.generation)
+                NSLog("[MetaWhisp] ⚠️ Meeting saved WITHOUT your side — mic channel was digital silence (%d samples)",
+                      micSamples.count)
+            }
+
+            // AUD-002 — partial success: mark the saved transcript incomplete so a
+            // dropped chunk is never hidden behind an apparently complete meeting.
+            let fullText = DualStreamMerger.markIncomplete(dual.text, failedChunks: dual.failedChunks)
+            if dual.failedChunks > 0 {
+                meetingRecorder.reportFinalization(
+                    error: "⚠️ \(dual.failedChunks) segment(s) couldn't be transcribed — saved transcript is incomplete",
+                    for: capture.generation)
+                NSLog("[MetaWhisp] ⚠️ Meeting saved with %d failed chunk(s) — marked incomplete", dual.failedChunks)
+            }
+            // Saved BEFORE the quota is booked. The booking is a network POST
+            // that retries for up to ~51s, and it used to be awaited first —
+            // so a finished transcript sat in memory, unsaved, for the whole
+            // of it, and a quit or a crash in that window took it (audit, P1).
+            // Booking cannot fail the meeting; losing the meeting can.
             self.persistMeetingTranscript(fullText: fullText, duration: duration, elapsed: elapsed)
+
+            // ITER-054 — book the meeting's quota ONCE, by wall-clock length,
+            // and ONLY when it was cloud-transcribed via the Pro proxy (chunks
+            // went out count_usage=false). On-device (WhisperKit) and free-tier
+            // BYOK meetings never touch the worker, so they book nothing.
+            if engine is CloudWhisperEngine, LicenseService.shared.isPro {
+                await LicenseService.shared.logMeetingUsage(minutes: duration / 60.0)
+            }
             NSLog("[MetaWhisp] ✅ Meeting transcribed: %.0fs audio → %d words in %.1fs", duration, fullText.split(separator: " ").count, elapsed)
         }
     }
@@ -1158,13 +2114,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         mic: [Float],
         system: [Float],
         engine: TranscriptionEngine
-    ) async -> String {
-        let micSegments = await transcribeStreamChunked(samples: mic, engine: engine, speaker: .me)
-        let sysSegments = await transcribeStreamChunked(samples: system, engine: engine, speaker: .them)
-        let merged = DualStreamMerger.mergeStreams(mic: micSegments, system: sysSegments)
-        NSLog("[MetaWhisp] Meeting dual-stream: mic=%d segments, system=%d segments → %d merged",
-              micSegments.count, sysSegments.count, merged.count)
-        return DualStreamMerger.renderTranscript(merged)
+    ) async -> (text: String, failedChunks: Int) {
+        // ITER-054 — bill the meeting ONCE by its real LENGTH, not by summing
+        // both channels. Both passes transcribe un-metered (countUsage: false);
+        // the caller (applyMeetingStop) logs the meeting's wall-clock minutes a
+        // single time. This bills "1h meeting = 60 min", independent of who
+        // talked or how much (a listening-only call bills the full hour too).
+        let micResult = await transcribeStreamChunked(samples: mic, engine: engine, speaker: .me, countUsage: false)
+        let sysResult = await transcribeStreamChunked(samples: system, engine: engine, speaker: .them, countUsage: false)
+        let merged = DualStreamMerger.mergeStreams(mic: micResult.segments, system: sysResult.segments)
+        // ITER-060: cross-segment cleanup — echo duplicates (speakers → mic
+        // bleed re-transcribed as «Me:»), consecutive-identical decoder loops,
+        // foreign-language fragments. Every drop is logged for recovery.
+        let sanitized = MeetingTranscriptSanitizer.sanitize(merged)
+        NSLog("[MetaWhisp] sanitize: %d dropped — %d consecutive-duplicate, %d cross-channel-echo, %d foreign-language-fragment", sanitized.dropped.count, sanitized.dropped.filter { $0.reason == "consecutive-duplicate" }.count, sanitized.dropped.filter { $0.reason == "cross-channel-echo" }.count, sanitized.dropped.filter { $0.reason.hasPrefix("foreign-language-fragment") }.count)
+        for drop in sanitized.dropped {
+            NSLog("[MetaWhisp] 🧹 sanitize: dropped (%@) — %d chars from %@", drop.reason, drop.segment.text.count, drop.segment.speaker == .me ? "me" : "them")
+            SuspectTranscriptLog.append(drop.segment.text, reason: drop.reason,
+                                        context: drop.segment.speaker == .me ? "Me merged" : "Them merged")
+        }
+        let failedChunks = micResult.failedChunks + sysResult.failedChunks
+        NSLog("[MetaWhisp] Meeting dual-stream: mic=%d segments, system=%d segments → %d merged, %d after sanitize (%d failed chunks)",
+              micResult.segments.count, sysResult.segments.count, merged.count, sanitized.kept.count, failedChunks)
+        return (DualStreamMerger.renderTranscript(sanitized.kept), failedChunks)
     }
 
     /// Transcribe ONE channel (mic or system) into per-chunk StreamSegments.
@@ -1172,16 +2144,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Each surviving chunk produces one StreamSegment whose start/end seconds
     /// reflect the chunk's position in the original buffer (for downstream
     /// time-sorted merge with the other channel).
+    /// Longest meeting chunk the finalize pass will send in one request.
+    ///
+    /// Was 300. Paired with a flat 60-second request budget that had no idea
+    /// how much audio it was carrying, that produced chunks nothing could
+    /// deliver: on 2026-08-24 a 167.9s, a 104.8s and a 149.4s chunk each failed
+    /// twice at the 60-second mark and were dropped from a saved transcript.
+    /// Chunks up to about 130s were coming back fine that same morning.
+    ///
+    /// Lowered so a single bad minute of network costs less of the call, and
+    /// pinned against the request budget by `MeetingChunkBudgetTests` so the
+    /// two constants can no longer drift apart unnoticed.
+    static let meetingTargetChunkSec = 150
+
     private func transcribeStreamChunked(
         samples: [Float],
         engine: TranscriptionEngine,
-        speaker: Speaker
-    ) async -> [StreamSegment] {
-        guard !samples.isEmpty else { return [] }
-        let chunks = AppDelegate.splitOnSilenceBoundaries(samples: samples, targetChunkSec: 300, searchWindowSec: 15)
+        speaker: Speaker,
+        countUsage: Bool
+    ) async -> (segments: [StreamSegment], failedChunks: Int) {
+        guard !samples.isEmpty else { return ([], 0) }
+        let chunks = AppDelegate.splitOnSilenceBoundaries(
+            samples: samples, targetChunkSec: Self.meetingTargetChunkSec, searchWindowSec: 15)
         let label = speaker == .me ? "Me" : "Them"
 
         var segments: [StreamSegment] = []
+        // AUD-002 — count chunks that fail every retry so the caller can mark the
+        // saved transcript incomplete instead of presenting a partial as full.
+        var failedChunks = 0
         var offsetSamples = 0
         for (i, rawChunk) in chunks.enumerated() {
             let chunkStartSec = Double(offsetSamples) / 16000.0
@@ -1189,31 +2179,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             offsetSamples += rawChunk.count
 
             // VAD trim — strip leading/trailing silence so Whisper has less
-            // material to hallucinate over.
-            let chunk = AppDelegate.trimSilenceEdges(samples: rawChunk)
-            let rms = TranscriptionCoordinator.calculateRMS(chunk)
-            NSLog("[MetaWhisp] Meeting %@ chunk %d/%d: %d→%d samples after trim, RMS=%.4f",
-                  label, i + 1, chunks.count, rawChunk.count, chunk.count, rms)
+            // material to hallucinate over. TR-8: keep the lead offset so the
+            // utterance timestamps below stay anchored to the RAW chunk position.
+            let (chunk, leadOffsetSamples) = AppDelegate.trimSilenceEdges(samples: rawChunk)
+            let leadSec = Double(leadOffsetSamples) / 16000.0
 
-            if chunk.count < 8000 || rms < 0.0005 {
+            // ITER-060.4 — cut interior silence (>2s gaps) before the decoder:
+            // long quiet stretches are the substrate Whisper hallucinates over
+            // («Продолжение следует…», word loops; the mostly-silent channel
+            // measured 2.2× the garbage). Every utterance timestamp below is
+            // mapped BACK to the original timeline via cutResult.map, so the
+            // Me/Them merge and the echo-dedup windows stay correct.
+            let cutResult = MeetingAudioSilenceCutter.cut(samples: chunk)
+            let decodeSamples = cutResult.samples
+            if decodeSamples.count != chunk.count {
+                NSLog("[MetaWhisp] ✂️ %@ chunk %d: cut %.1fs interior silence (%.1fs → %.1fs)",
+                      label, i + 1,
+                      Double(chunk.count - decodeSamples.count) / 16000.0,
+                      Double(chunk.count) / 16000.0,
+                      Double(decodeSamples.count) / 16000.0)
+            }
+
+            let rms = TranscriptionCoordinator.calculateRMS(decodeSamples)
+            NSLog("[MetaWhisp] Meeting %@ chunk %d/%d: %d→%d samples after trim+cut, RMS=%.4f",
+                  label, i + 1, chunks.count, rawChunk.count, decodeSamples.count, rms)
+
+            if decodeSamples.count < 8000 || rms < 0.0005 {
                 NSLog("[MetaWhisp] ⏭️  %@ chunk %d too quiet/short — skip", label, i + 1)
                 continue
             }
 
             do {
-                let lang = AppSettings.shared.transcriptionLanguage == "auto" ? nil : AppSettings.shared.transcriptionLanguage
-                let result = try await engine.transcribe(audioSamples: chunk, language: lang, promptWords: ["MetaWhisp"])
+                // ITER-060.3 — decode is ALWAYS auto when Settings say auto: a
+                // hard per-channel pin (reverted here) blocked live language
+                // switching mid-meeting (user decision 2026-08-08). Foreign
+                // junk is handled post-merge by the language-profile filter in
+                // MeetingTranscriptSanitizer instead.
+                let lang = TranscriptionLanguageResolver.resolveLanguage(AppSettings.shared.transcriptionLanguage)
+                // Brand glossary as prompt bias (BrandGlossary.canonicalNames).
+                // Forwarded to Whisper as initial_prompt and to Deepgram as
+                // keyterm (worker-side) — improves brand recognition (Brevo,
+                // Claude, ChatGPT, etc.) in meeting transcripts.
+                // Retry the transcribe up to 2× — a transient cloud/engine blip must
+                // NOT silently drop this chunk from the SAVED meeting. The live path
+                // could retry by not advancing its offset; this one-shot finalize pass
+                // has no such safety net, so it retries here. (Code-review 2026-05-31.)
+                let result: TranscriptionResult = try await { () async throws -> TranscriptionResult in
+                    var attempt = 0
+                    while true {
+                        attempt += 1
+                        do {
+                            // ITER-054 — bill the meeting ONCE. The caller meters
+                            // exactly one channel (mic normally; system only when
+                            // mic produced nothing — muted/listening-only calls),
+                            // so a dual-stream meeting costs 1× its length, not 2×.
+                            // Both channels still transcribe — only quota accounting
+                            // is single-channel.
+                            // ITER-073.2 — a replay must not be billed again:
+                            // the attempt that vanished may already have been
+                            // transcribed and metered server-side.
+                            return try await engine.transcribe(
+                                audioSamples: decodeSamples, language: lang,
+                                promptWords: TranscriptionLanguageResolver.enginePromptWords(language: lang),
+                                countUsage: MeetingChunkRetryPolicy.shouldMeter(
+                                    attempt: attempt, callerWantsMetering: countUsage))
+                        } catch {
+                            NSLog("[MetaWhisp] ❌ Meeting %@ chunk %d transcribe attempt %d/2 failed: %@",
+                                  label, i + 1, attempt, error.localizedDescription)
+                            if attempt >= 2 { throw error }
+                            try? await Task.sleep(for: .milliseconds(800))
+                        }
+                    }
+                }()
                 let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { continue }
 
-                if TranscriptionCoordinator.isAlwaysHallucination(text) {
-                    NSLog("[MetaWhisp] ⚠️  %@ chunk %d: filtered always-hallucination: '%@'", label, i + 1, String(text.prefix(60)))
+                // ITER-073.4 — strip the artifact, then judge what is left.
+                // These two checks used to run on the raw chunk text and
+                // `continue`, discarding a whole chunk of the call because an
+                // artifact was spliced into it. See `MeetingChunkTextGate`.
+                let decision = MeetingChunkTextGate.decide(text: text, rms: rms)
+                guard case .keep(let text) = decision else {
+                    guard case .drop(let reason) = decision else { continue }
+                    NSLog("[MetaWhisp] ⚠️  %@ chunk %d: dropped as %@ (RMS=%.4f): '%@'",
+                          label, i + 1, reason, rms, String(text.prefix(60)))
+                    SuspectTranscriptLog.append(text, reason: reason, context: "\(label) chunk \(i + 1)")  // TR-12
                     continue
                 }
-                if rms < 0.003, TranscriptionCoordinator.isHallucination(text) {
-                    NSLog("[MetaWhisp] ⚠️  %@ chunk %d: filtered hallucination (RMS=%.4f): '%@'", label, i + 1, rms, String(text.prefix(60)))
-                    continue
-                }
+
 
                 // ITER-026 — emit ONE StreamSegment per Whisper utterance, not
                 // per chunk. Previously we collapsed every chunk's text into a
@@ -1229,25 +2282,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 // Each Whisper segment becomes its own StreamSegment with
                 // absolute timing = chunkStartSec + whisperSeg.start so the
                 // merger interleaves at real-utterance grain.
+                //
+                // 2026-05-28: also strip mid-text hallucination artifacts
+                // (DimaTorzok / «Субтитры создавал …» / «Продолжение
+                // следует» / «Спасибо за просмотр») at the per-utterance
+                // grain. Meeting path used to skip strip entirely — 14×
+                // DimaTorzok in last 10 meetings traced to this gap.
+                // Regression-pinned by `HallucinationStripTests`.
                 let whisperSegments = result.segments
                 if whisperSegments.isEmpty {
                     // Fallback for engines that don't populate segments —
                     // emit one segment covering the chunk (old behaviour).
-                    segments.append(StreamSegment(text: text, startSec: chunkStartSec, endSec: chunkEndSec, speaker: speaker))
+                    // ITER-060: same stutter-loop collapse as the per-utterance path.
+                    let collapsed = MeetingTranscriptSanitizer.collapseRepetitionLoops(text)
+                    if collapsed != text {
+                        NSLog("[MetaWhisp] 🔁 %@ chunk %d: collapsed repetition loop (%d → %d chars)", label, i + 1, text.count, collapsed.count)
+                        SuspectTranscriptLog.append(text, reason: "repetition-collapsed", context: "\(label) chunk \(i + 1)")
+                    }
+                    let stripped = TranscriptionCoordinator.stripHallucinationTokens(collapsed)
+                    if stripped.isEmpty {
+                        NSLog("[MetaWhisp] 🧹 %@ chunk %d: emptied by strip (was %d chars)", label, i + 1, text.count)
+                        SuspectTranscriptLog.append(text, reason: "strip-emptied", context: "\(label) chunk \(i + 1)")  // TR-12
+                        continue
+                    }
+                    if stripped != text {
+                        NSLog("[MetaWhisp] 🧹 %@ chunk %d: stripped hallucination (was %d → %d chars)", label, i + 1, text.count, stripped.count)
+                    }
+                    // Brand-name auto-correct (Brevo for unambiguous
+                    // Cyrillic mangles). Conservative — see BrandGlossary
+                    // header for rationale.
+                    let cleanedText = BrandGlossary.applyCorrections(stripped)
+                    // TR-8: this whole-chunk fallback covers the TRIMMED audio, which
+                    // begins leadSec into the raw chunk — anchor it on the raw timeline
+                    // like the per-utterance path (was chunkStartSec…chunkEndSec).
+                    let fbStart = chunkStartSec + leadSec
+                    // ITER-060.4: the fallback covers the whole trimmed chunk —
+                    // its ORIGINAL duration, not the compressed decode length.
+                    let fbEnd = min(chunkEndSec, fbStart + cutResult.map.originalDuration)
+                    segments.append(StreamSegment(text: cleanedText, startSec: fbStart, endSec: fbEnd, speaker: speaker))
                 } else {
                     for w in whisperSegments {
-                        let utteranceText = w.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !utteranceText.isEmpty else { continue }
-                        let absStart = chunkStartSec + w.start
-                        let absEnd = chunkStartSec + w.end
+                        var rawUtterance = w.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !rawUtterance.isEmpty else { continue }
+                        // ITER-060: collapse decoder stutter-loops («как как как
+                        // как будет») BEFORE the gate, so real speech around a
+                        // loop survives and the gate's repetition branch only
+                        // fires on text that still loops after cleanup.
+                        let collapsed = MeetingTranscriptSanitizer.collapseRepetitionLoops(rawUtterance)
+                        if collapsed != rawUtterance {
+                            NSLog("[MetaWhisp] 🔁 %@ chunk %d utt: collapsed repetition loop (%d → %d chars)", label, i + 1, rawUtterance.count, collapsed.count)
+                            SuspectTranscriptLog.append(rawUtterance, reason: "repetition-collapsed", context: "\(label) chunk \(i + 1) utt")
+                            rawUtterance = collapsed
+                        }
+                        // TR-5: drop only THIS utterance if Whisper decoded it with
+                        // hallucination metrics (precision-first thresholds; the rest
+                        // of the chunk's real utterances are kept). Logged with text
+                        // so a meeting drop is at least recoverable from the log.
+                        if let reason = TranscriptionConfidenceGate.rejectionReason(TranscriptionConfidenceGate.metrics(for: w), text: rawUtterance) {
+                            NSLog("[MetaWhisp] 🎚️ %@ chunk %d utt: dropped (%@): '%@'", label, i + 1, reason, String(rawUtterance.prefix(80)))
+                            SuspectTranscriptLog.append(rawUtterance, reason: reason, context: "\(label) chunk \(i + 1) utt")  // TR-12
+                            continue
+                        }
+                        let stripped = TranscriptionCoordinator.stripHallucinationTokens(rawUtterance)
+                        if stripped.isEmpty {
+                            NSLog("[MetaWhisp] 🧹 %@ chunk %d utt: emptied by strip (was '%@')", label, i + 1, String(rawUtterance.prefix(80)))
+                            SuspectTranscriptLog.append(rawUtterance, reason: "strip-emptied", context: "\(label) chunk \(i + 1) utt")  // TR-12
+                            continue
+                        }
+                        if stripped != rawUtterance {
+                            NSLog("[MetaWhisp] 🧹 %@ chunk %d utt: stripped hallucination (was %d → %d chars)", label, i + 1, rawUtterance.count, stripped.count)
+                        }
+                        let utteranceText = BrandGlossary.applyCorrections(stripped)
+                        // TR-8: w.start/w.end are relative to the TRIMMED chunk;
+                        // ITER-060.4: they are ALSO on the compressed (silence-
+                        // cut) timeline — map back to raw chunk time first,
+                        // then add the trimmed-lead offset.
+                        let absStart = chunkStartSec + leadSec + cutResult.map.toOriginalSeconds(w.start)
+                        let absEnd = chunkStartSec + leadSec + cutResult.map.toOriginalSeconds(w.end)
                         segments.append(StreamSegment(text: utteranceText, startSec: absStart, endSec: absEnd, speaker: speaker))
                     }
                 }
             } catch {
-                NSLog("[MetaWhisp] ❌ Meeting %@ chunk %d failed: %@", label, i + 1, error.localizedDescription)
+                // AUD-002 — both retries failed; record the loss so it isn't hidden.
+                failedChunks += 1
+                // ITER-073.3 — and keep the audio. Dictation has written a
+                // Recovery WAV on failure for a long time; a meeting chunk just
+                // evaporated, so the only copy of that stretch of the call was
+                // gone the moment the second attempt failed. Save the raw chunk
+                // (pre-trim, pre-cut) so nothing is destroyed by a bad minute of
+                // network.
+                let recovered = TranscriptionCoordinator.saveSamplesAsWav(rawChunk)
+                NSLog("[MetaWhisp] ❌ Meeting %@ chunk %d failed (lost from transcript): %@ — audio recovery: %@",
+                      label, i + 1, error.localizedDescription,
+                      recovered?.path ?? "SAVE FAILED")
             }
         }
-        return segments
+        return (segments, failedChunks)
     }
 
     /// Decode a JSON `[String]` array stored on `Conversation`'s structured
@@ -1308,11 +2438,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Strip leading/trailing silence from a chunk. Defines silence as
     /// `RMS < 0.005` over a 100ms window. Keeps speech-only audio so Whisper
     /// has less material to hallucinate over.
-    static func trimSilenceEdges(samples: [Float]) -> [Float] {
+    /// TR-8 (ITER-046 E): also reports how many samples were cut from the FRONT.
+    /// Whisper's utterance timestamps are relative to the TRIMMED chunk, while
+    /// `chunkStartSec` is the RAW chunk position — without the lead offset every
+    /// utterance shifted earlier by the trimmed silence (tens of seconds in quiet
+    /// chunks) and DualStreamMerger interleaved Me/Them wrongly.
+    static func trimSilenceEdges(samples: [Float]) -> (samples: [Float], leadOffsetSamples: Int) {
         let sampleRate = 16000
         let win = sampleRate / 10  // 100ms
         let threshold: Float = 0.005
-        guard samples.count > win * 2 else { return samples }
+        guard samples.count > win * 2 else { return (samples, 0) }
 
         // Find first non-silent window.
         var start = 0
@@ -1329,8 +2464,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             end -= win
         }
         let trimmedEnd = min(samples.count, end + win)
-        guard trimmedEnd > start else { return samples }
-        return Array(samples[start..<trimmedEnd])
+        guard trimmedEnd > start else { return (samples, 0) }
+        return (Array(samples[start..<trimmedEnd]), start)
     }
 
     /// Reuse path: take the joined LiveAdvisor partials and append a single
@@ -1359,15 +2494,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         do {
             let lang = AppSettings.shared.transcriptionLanguage == "auto" ? nil : AppSettings.shared.transcriptionLanguage
-            let result = try await engine.transcribe(audioSamples: tailMixed, language: lang, promptWords: ["MetaWhisp"])
-            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // ITER-054 — this tail is part of the meeting (billed once by
+            // wall-clock at finalize); never meter it on its own.
+            let result = try await engine.transcribe(audioSamples: tailMixed, language: lang, promptWords: TranscriptionLanguageResolver.enginePromptWords(language: lang), countUsage: false)
+            let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             // Apply the same hallucination filter as the chunked path.
-            if !text.isEmpty,
-               !TranscriptionCoordinator.isAlwaysHallucination(text),
-               !(rms < 0.003 && TranscriptionCoordinator.isHallucination(text)) {
-                if !fullText.isEmpty { fullText += "\n\n" }
-                fullText += text
-                NSLog("[MetaWhisp] Meeting tail transcribed (%.1fs, %d chars)", Double(tailMixed.count) / 16000.0, text.count)
+            // 2026-05-28: also strip mid-text artifacts so the tail can't
+            // re-introduce DimaTorzok / «Продолжение следует» that the
+            // chunked path now removes.
+            if !rawText.isEmpty,
+               !TranscriptionCoordinator.isAlwaysHallucination(rawText),
+               !(rms < 0.003 && TranscriptionCoordinator.isHallucination(rawText)) {
+                let stripped = TranscriptionCoordinator.stripHallucinationTokens(rawText)
+                if stripped.isEmpty {
+                    NSLog("[MetaWhisp] meeting tail emptied by strip (was %d chars)", rawText.count)
+                } else {
+                    if stripped != rawText {
+                        NSLog("[MetaWhisp] 🧹 Meeting tail: stripped hallucination (was %d → %d chars)", rawText.count, stripped.count)
+                    }
+                    // Brand-name auto-correct (Brevo, etc.).
+                    let text = BrandGlossary.applyCorrections(stripped)
+                    if !fullText.isEmpty { fullText += "\n\n" }
+                    fullText += text
+                    NSLog("[MetaWhisp] Meeting tail transcribed (%.1fs, %d chars)", Double(tailMixed.count) / 16000.0, text.count)
+                }
             } else {
                 NSLog("[MetaWhisp] Meeting tail filtered (empty or hallucination)")
             }
@@ -1388,15 +2538,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             processingTime: elapsed,
             segments: []
         )
-        if let item = historyService.save(result) {
+        guard let item = historyService.save(result) else {
+            // The store refused it — a degraded (in-memory) session, or a save
+            // that threw. Both return nil, and this used to fall through to a
+            // "✅ Meeting transcribed" line (audit, P1). Write the transcript
+            // where the user can get it, and say so.
+            let stamp: String = {
+                let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+                return f.string(from: Date())
+            }()
+            var savedPath: String?
+            if MeetingShutdown.planForUnsavedTranscript(chars: fullText.count) == .writeOut,
+               let dir = TranscriptionCoordinator.recoveryDirectory() {
+                let url = dir.appendingPathComponent(MeetingShutdown.transcriptFileName(stamp: stamp))
+                do {
+                    try fullText.write(to: url, atomically: true, encoding: .utf8)
+                    savedPath = url.path
+                } catch {
+                    NSLog("[MetaWhisp] ❌ meeting transcript could not be written out either — %@",
+                          error.localizedDescription)
+                }
+            }
+            NSLog("[MetaWhisp] ❌ meeting transcript NOT stored (%d chars) — the library refused it; written out: %@",
+                  fullText.count, savedPath == nil ? "no" : "yes")
+            meetingRecorder.reportFinalization(
+                error: savedPath == nil
+                    ? "⚠️ The meeting could not be saved to your library, and the transcript could not be written out either"
+                    : "⚠️ The meeting could not be saved to your library — the transcript is in \(savedPath!)",
+                for: meetingRecorder.recordingGeneration)
+            if fullText.count >= 20 {
+                adviceService.triggerOnTranscription(text: fullText, source: "meeting")
+            }
+            return
+        }
             item.source = "meeting"
             item.modelName = AppSettings.shared.selectedModel
+            NSLog("[MetaWhisp] Meeting stored in Library: %d chars, %.0fs", fullText.count, duration)
             // Assign to Conversation (C1.1) — grouper creates a dedicated completed
             // conversation for the meeting and fires scheduleOnClose (structured gen +
             // memory + task extractors) automatically.
             // `currentMeetingCallContext` enables grouper's resume-window logic
             // so a lid-bounce/wake-from-sleep doesn't fragment one call into N rows.
             conversationGrouper.assign(historyItem: item, callContext: currentMeetingCallContext, meetingDurationSec: duration)
+            NSLog("[MetaWhisp] meeting transcript saved: %d chars, %.0fs audio, conversation=%@", fullText.count, duration, item.conversationId?.uuidString ?? "(none)")
 
             // ITER-012: per-meeting recap notification. Wait long enough for
             // StructuredGenerator (300ms delay → LLM ≈ 3-5s) and the per-transcript
@@ -1408,7 +2592,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.fireMeetingRecap(for: conversationId)
                 }
             }
-        }
 
         // AdviceService stays per-transcript (it's a real-time signal — user dictates,
         // advice surfaces immediately). Memory + Task extractors now run on conversation
@@ -1422,6 +2605,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationDidBecomeActive(_ notification: Notification) {
         // User may have changed permissions in System Settings — re-check everything
         PermissionsService.shared.refresh()
+
+#if DEBUG
+        startLayoutFixEventTapProbeIfRequested()
+#endif
+        _ = layoutSwitchController.start()
+        NSLog("[LayoutFix] Re-armed on activation: accessibility=%@, enabled=%@, auto=%@, doubleShift=%@", AXIsProcessTrusted() ? "yes" : "no", AppSettings.shared.layoutFixEnabled ? "on" : "off", AppSettings.shared.layoutFixAutoEnabled ? "on" : "off", AppSettings.shared.layoutFixDoubleShiftEnabled ? "on" : "off")
 
         // Re-start services that previously failed due to missing Screen Recording permission.
         // When user grants permission AFTER app launch and returns to the app, this catches that
@@ -1439,9 +2628,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// Quitting used to drop a meeting in progress: the mic and system buffers
+    /// live in RAM until `stop()` hands them on, so ⌘Q — or Sparkle's
+    /// Install-and-Relaunch — took the whole recording with it (audit,
+    /// 2026-09-06, P1). macOS is asked to wait while both channels are written
+    /// to the Recovery folder, and the wait is bounded so a stuck write cannot
+    /// turn a quit into a hang.
+    /// Audio in hand that cannot be transcribed goes to the Recovery folder
+    /// rather than out of scope. Returns the paths, if any were written, so
+    /// the caller can tell the user where the meeting went (audit, P1).
+    @discardableResult
+    func rescueMeetingAudio(mic: [Float], system: [Float], reason: String) -> (mic: URL?, system: URL?) {
+        guard case .rescue = MeetingShutdown.planForUntranscribable(micSamples: mic.count,
+                                                                    systemSamples: system.count) else {
+            NSLog("[MetaWhisp] %@ — nothing to rescue (%d mic, %d system samples)", reason, mic.count, system.count)
+            return (nil, nil)
+        }
+        let stamp: String = {
+            let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+            return f.string(from: Date())
+        }()
+        let names = MeetingShutdown.fileNames(stamp: stamp)
+        let micURL = TranscriptionCoordinator.saveSamplesAsWav(mic, named: names.mic)
+        let sysURL = TranscriptionCoordinator.saveSamplesAsWav(system, named: names.system)
+        NSLog("[MetaWhisp] %@ — audio rescued: me %@, them %@", reason,
+              micURL == nil ? "not written" : "written", sysURL == nil ? "not written" : "written")
+        return (micURL, sysURL)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let plan = MeetingShutdown.plan(
+            isRecording: meetingRecorder.isRecording,
+            isStarting: meetingRecorder.isStarting,
+            micSamples: meetingMic.currentSampleCount,
+            systemSamples: systemAudioCapture.currentSampleCount)
+        guard case let .rescue(micCount, sysCount) = plan else {
+            NSLog("[MetaWhisp] quit — no meeting to rescue")
+            return .terminateNow
+        }
+        NSLog("[MetaWhisp] quit during a meeting — rescuing %d mic + %d system samples to the Recovery folder",
+              micCount, sysCount)
+        let capture = meetingRecorder.stop()
+        let stamp: String = {
+            let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+            return f.string(from: Date())
+        }()
+        let names = MeetingShutdown.fileNames(stamp: stamp)
+        let deadline = DispatchTime.now() + MeetingShutdown.rescueDeadlineSeconds
+        DispatchQueue.global(qos: .userInitiated).async {
+            let mic = TranscriptionCoordinator.saveSamplesAsWav(capture.mic, named: names.mic)
+            let sys = TranscriptionCoordinator.saveSamplesAsWav(capture.system, named: names.system)
+            NSLog("[MetaWhisp] quit rescue done — me: %@, them: %@",
+                  mic == nil ? "not written" : "written", sys == nil ? "not written" : "written")
+            DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        // The wait ends either way: a write that hangs must not hold the quit.
+        DispatchQueue.main.asyncAfter(deadline: deadline) {
+            NSLog("[MetaWhisp] quit rescue deadline reached — quitting")
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        layoutSwitchController.stop()
+#if DEBUG
+        layoutFixEventTapProbe?.stop()
+#endif
         NSLog("[MetaWhisp] Terminating")
     }
+
+#if DEBUG
+    private func startLayoutFixEventTapProbeIfRequested() {
+        guard CommandLine.arguments.contains("--layout-fix-event-tap-probe") else { return }
+
+        let probe = layoutFixEventTapProbe ?? GlobalInputEventTapProbe()
+        let state = probe.start()
+        layoutFixEventTapProbe = probe
+        NSLog("[LayoutFixProbe] State: %@", state.rawValue)
+    }
+#endif
 
     /// Draw MW waveform logo programmatically for menu bar (template image).
     private static func createMWMenuBarIcon() -> NSImage {
@@ -1560,31 +2826,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     bundleID: bundleID, appName: appName, windowTitle: title
                 )
 
-                // Fullscreen check: window covers the screen's visibleFrame.
-                let isFullscreen = self.isFrontmostWindowFullscreen()
-
                 // Calendar STRONG signal: any non-allday event that has just
                 // started (within last 65s, not yet ended). Lets the gate
                 // bypass the 10-sec sustained fallback when calendar says
                 // "you have a meeting now". User explicit spec 2026-05-02:
                 // "Если митинг начинается в два, то ровно в два часа
                 // начинается запись".
-                var calendarEvent: (id: String, title: String)? = nil
-                if let ev = self.calendarReader.eventStartingNow(),
-                   let id = ev.eventIdentifier {
+                func named(_ ev: EKEvent) -> (id: String, title: String)? {
+                    guard let id = ev.eventIdentifier else { return nil }
                     let title = (ev.title?.trimmingCharacters(in: .whitespaces)).flatMap { $0.isEmpty ? nil : $0 } ?? "Meeting"
-                    calendarEvent = (id: id, title: title)
+                    return (id: id, title: title)
                 }
+                let calendarEvent = self.calendarReader.eventStartingNow().flatMap(named)
+                // …and the same event while it is STILL running, so an
+                // attempt that captured nothing can be made again (the gate
+                // bounds how often, see CalendarAutoStartRetry).
+                let calendarRunning = self.calendarReader.eventInProgress().flatMap(named)
 
-                // Audio: gate currently can't probe audio without a recorder
-                // running. Pass `false` — fallback path needs only window
-                // sustain. Post-countdown audio-sniff (after meeting starts)
-                // catches AFK / silent-room cases.
                 let decision = MeetingAutoStartGate.shared.evaluate(
                     callName: callName,
-                    isFullscreen: isFullscreen,
-                    audioActive: false,
-                    calendarEventNow: calendarEvent
+                    calendarEventNow: calendarEvent,
+                    calendarEventInProgress: calendarRunning,
+                    isRecording: self.meetingRecorder.isRecording || self.meetingRecorder.isStarting
                 )
 
                 // ITER-028.2 (2026-05-06) — back-to-back transition detection
@@ -1601,8 +2864,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         isManualMode: self.meetingRecorder.isManualMode
                     )
                     if case let .stopAndRestart(newEventID, newName) = bbDecision {
-                        NSLog("[CallDetect] back-to-back via eventID: newID=%@ ('%@') != recordedID=%@ → stop A, immediately fire B countdown",
-                              newEventID, newName,
+                        NSLog("[CallDetect] back-to-back via eventID: newID=%@ (title %d chars) != recordedID=%@ → stop A, immediately fire B countdown",
+                              newEventID, newName.count,
                               self.recordingCalendarEventID ?? "(nil)")
                         self.stopMeetingRecording(reason: "back-to-back-eventID:\(newEventID)")
                         // CC-14 fix: gate already consumed its single
@@ -1654,42 +2917,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return titleValue as? String
     }
 
-    /// Whether the frontmost window covers the entire visibleFrame of its
-    /// screen (no menu bar / dock visible).
-    private func isFrontmostWindowFullscreen() -> Bool {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return false }
-        let pid = frontApp.processIdentifier
-        let appRef = AXUIElementCreateApplication(pid)
-        var focusedWindow: CFTypeRef?
-        let r = AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow)
-        guard r == .success, let win = focusedWindow else { return false }
-        let axWin = win as! AXUIElement
-        // Use kAXFullScreenAttribute first — set by macOS native fullscreen.
-        var fsValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(axWin, "AXFullScreen" as CFString, &fsValue) == .success,
-           let isFS = fsValue as? Bool, isFS {
-            return true
-        }
-        // Fallback: window bounds match screen visibleFrame.
-        var posValue: CFTypeRef?
-        var sizeValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axWin, kAXPositionAttribute as CFString, &posValue) == .success,
-              AXUIElementCopyAttributeValue(axWin, kAXSizeAttribute as CFString, &sizeValue) == .success
-        else { return false }
-        var pos = CGPoint.zero
-        var size = CGSize.zero
-        AXValueGetValue(posValue as! AXValue, .cgPoint, &pos)
-        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
-        // Compare against screen frame containing the window — within 8pt slack.
-        guard let screen = NSScreen.screens.first(where: { NSPointInRect(pos, $0.frame) }) ?? NSScreen.main else { return false }
-        let f = screen.frame
-        let slack: CGFloat = 8
-        return abs(pos.x - f.origin.x) < slack
-            && abs(pos.y - f.origin.y) < slack
-            && abs(size.width - f.size.width) < slack
-            && abs(size.height - f.size.height) < slack
-    }
-
     /// Show the 5-sec countdown plashka, then start `meetingRecorder`. Three
     /// seconds into the recording, sample `audioLevel` — if silent, stop and
     /// don't persist (AFK / room actually empty). Otherwise normal flow.
@@ -1712,6 +2939,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let stillVisible = MWNotificationStack.shared.items.contains { $0.id == cancelToken }
             guard stillVisible else {
                 NSLog("[CallDetect] %@ countdown cancelled by user", name)
+                // Dismissing the countdown is a refusal too — the event must
+                // not come back on its own a minute later.
+                if let calendarEventID { MeetingAutoStartGate.shared.decline(eventID: calendarEventID) }
                 MeetingAutoStartGate.shared.reset()
                 return
             }
@@ -1751,21 +2981,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if durationSec <= 6 * 3600 {
                 self.armCalendarEndStopTask(eventID: eventID, eventEnd: endDate)
             } else {
-                NSLog("[CalendarEndStop] skip arming for '%@' (duration %.0fs > 6h, treated as all-day)",
-                      name, durationSec)
+                NSLog("[CalendarEndStop] skip arming (title %d chars, duration %.0fs > 6h, treated as all-day)",
+                      name.count, durationSec)
             }
         }
 
         // 3-sec post-start audio sniff. If meeting room is empty (AFK / no
         // one talking) we stop without saving so the user doesn't get a
         // "Quick note (empty)" Conversation row clogging Library.
-        try? await Task.sleep(for: .seconds(3))
-        if meetingRecorder.isRecording, meetingRecorder.audioLevel < 0.01 {
-            NSLog("[CallDetect] ⚠️ %@ post-start sniff — silence (audioLevel=%.4f), stopping discardly",
-                  name, meetingRecorder.audioLevel)
+        // ITER-060 units fix: compare RAW rms (boosted 0.01 = raw 8e-6, so the
+        // old 3-second check could never fire). Codex review 2026-08-07: a
+        // single 3s sample would discard a REAL meeting whose first seconds are
+        // join-silence (everyone muted, reading a slide). Observe the first 60s
+        // instead: any audible moment (raw ≥ 0.004 ≈ empty-room ambient
+        // ceiling) keeps the recording; discard only if the whole minute was
+        // dead quiet.
+        // Bound to THIS recording: a sniff that outlived its meeting used to
+        // judge — and could discard — the manual meeting started in its place.
+        // And it reads a latched PEAK, not the latest buffer: sampling one
+        // buffer every five seconds could miss every audible moment between
+        // polls and discard a real meeting (review round twelve).
+        let sniffGeneration = meetingRecorder.recordingGeneration
+        guard !meetingRecorder.isManualMode else { return }
+        meetingRecorder.markSniffStart()
+        var sniffHeardAudio = false
+        for _ in 0 ..< 12 {
+            try? await Task.sleep(for: .seconds(5))
+            guard meetingRecorder.isRecording,
+                  meetingRecorder.recordingGeneration == sniffGeneration else { return }
+            if meetingRecorder.sniffPeakRMS >= 0.004 {
+                sniffHeardAudio = true
+                break
+            }
+        }
+        guard meetingRecorder.recordingGeneration == sniffGeneration, !meetingRecorder.isManualMode else { return }
+        NSLog("[CallDetect] post-start sniff verdict: %@ (peak rawRMS=%.4f over the first 60s, still recording: %@)", sniffHeardAudio ? "audio heard — keeping" : "silent", meetingRecorder.sniffPeakRMS, meetingRecorder.isRecording ? "yes" : "no")
+        if meetingRecorder.isRecording, !sniffHeardAudio, meetingRecorder.micHasPermission,
+           meetingRecorder.micProducedThisRecording,
+           meetingRecorder.micHadOutage || meetingRecorder.micIsDownNow {
+            // RMS says nothing when the mic was, or is, being recovered: the
+            // user may have been talking the whole time. Keep the recording —
+            // discarding it here would lose the meeting silently. A mic that
+            // simply has no permission is not an outage and gets no such
+            // pass (review, 2026-09-03).
+            NSLog("[CallDetect] %@ post-start sniff inconclusive — mic had an outage, keeping the recording", name)
+        } else if meetingRecorder.isRecording, !sniffHeardAudio {
+            NSLog("[CallDetect] ⚠️ %@ post-start sniff — 60s of silence (rawRMS=%.4f), stopping discardly",
+                  name, meetingRecorder.rawRMSLevel)
             // Stop recorder — its onAutoStop won't fire (this isn't an auto-stop reason),
-            // we just stop and don't persist anything.
-            _ = meetingRecorder.stop()
+            // we just stop and don't persist anything. If the stop itself
+            // finds the mic had been down, the discard is still said out loud.
+            let discarded = meetingRecorder.stop()
+            reportMicOutageIfAny(discarded, discarded: true)
             didAutoStartRecording = false
             currentMeetingCallContext = nil
             calendarHardStopTask?.cancel()
@@ -1774,7 +3041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// ITER-034 — schedule calendar-end auto-stop. Re-schedules itself on
-    /// `notifyAndExtend` outcomes. Cancelled by `stopMeetingRecording`.
+    /// `notifyAndExtend` / `silentExtend` outcomes. Cancelled by `stopMeetingRecording`.
     private func armCalendarEndStopTask(eventID: String, eventEnd: Date) {
         calendarHardStopTask?.cancel()
         let attemptsAtSchedule = calendarEndNotifyAttempts
@@ -1782,7 +3049,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let grace = CalendarEndStopDecisionRules.defaultGraceSeconds
         // Fire at endDate + grace, OR right now if already past (e.g.
         // re-arm after a notifyAndExtend whose deadline already lapsed).
-        let fireAt = max(eventEnd.addingTimeInterval(grace), now.addingTimeInterval(1))
+        var fireAt = max(eventEnd.addingTimeInterval(grace), now.addingTimeInterval(1))
+
+        // ITER-035-followup (2026-05-12) — minimum-recording-time guard.
+        // Without this, if `eventEnd` is already in the past at start of
+        // recording (e.g. user joined a meeting that was scheduled hours ago),
+        // the first fire happens immediately and the user gets a «calendar
+        // ended, still recording?» card within the first ~60s of recording.
+        // Confusing UX. We push fire-time to at least
+        // `recordingStartedAt + minRecordingForOverrunCard` so users get
+        // 10 quiet minutes of recording before any overrun-card chatter.
+        if let recordingStart = meetingRecorder.recordingStartedAt {
+            let minRecordingForOverrunCard: TimeInterval = 10 * 60
+            let earliestFire = recordingStart.addingTimeInterval(minRecordingForOverrunCard)
+            if earliestFire > fireAt {
+                fireAt = earliestFire
+            }
+        }
         let delay = fireAt.timeIntervalSince(now)
         NSLog("[CalendarEndStop] armed for eventID=%@ end=%@ fireIn=%.0fs (attempt=%d)",
               eventID, "\(eventEnd)", delay, attemptsAtSchedule)
@@ -1795,17 +3078,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 NSLog("[CalendarEndStop] fire — but state moved on, skip")
                 return
             }
-            // Sample current audio level (max of mic + system, already
-            // aggregated by MeetingRecorder).
-            let rms = self.meetingRecorder.audioLevel
+            // ITER-034.1 (2026-05-11) — sliding-window guards. Instantaneous
+            // `audioLevel` was the original input but it dropped below the
+            // quiet threshold during the natural 200-500ms pauses between
+            // sentences → bug report «созвон закончился по календарю в
+            // середине обсуждения». We now feed the decider three signals:
+            //   • `rms` — instantaneous (kept for the fast-path quiet check
+            //     when EVERYTHING else also says "over")
+            //   • `recentAudioActive` — true iff `audioLevel` was NOT
+            //     continuously below threshold for the last 30s (sliding
+            //     window via MeetingRecorder's silence guard)
+            //   • `meetingAppVisible` — true iff a meeting app (Zoom /
+            //     Meet / Teams / FaceTime / etc) was foreground in the
+            //     recent screen-context window. User-requested signal
+            //     («если ещё созвон на экране — продолжай записывать»).
+            // Either sliding-window signal vetoes stopNow; the decider falls
+            // back to notifyAndExtend which surfaces the overrun card.
+            // ITER-060 units fix: the decider's quietRMSThreshold (0.005) is a
+            // RAW-rms calibration — feed it raw, not the boosted UI level.
+            let rms = self.meetingRecorder.rawRMSLevel
+            let recentAudioActive = !self.meetingRecorder.hasBeenContinuouslyQuiet(forAtLeast: 30)
+            let meetingAppVisible = self.isMeetingAppVisibleInRecentScreenContext()
             let decision = CalendarEndStopDecision.evaluate(
                 now: Date(),
                 eventEnd: eventEnd,
                 audioRMSLastNSec: rms,
-                notifyAttemptsSoFar: self.calendarEndNotifyAttempts
+                notifyAttemptsSoFar: self.calendarEndNotifyAttempts,
+                recentAudioActive: recentAudioActive,
+                meetingAppVisible: meetingAppVisible
             )
-            NSLog("[CalendarEndStop] fire eventID=%@ rms=%.4f attempts=%d decision=%@",
-                  eventID, rms, self.calendarEndNotifyAttempts, "\(decision)")
+            NSLog("[CalendarEndStop] fire eventID=%@ rms=%.4f recentAudio=%@ meetingApp=%@ attempts=%d decision=%@",
+                  eventID, rms,
+                  recentAudioActive ? "YES" : "NO",
+                  meetingAppVisible ? "YES" : "NO",
+                  self.calendarEndNotifyAttempts, "\(decision)")
             switch decision {
             case .keepRunning:
                 // Should not normally happen at fire time (we slept past
@@ -1813,12 +3119,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.armCalendarEndStopTask(eventID: eventID, eventEnd: eventEnd)
             case .stopNow:
                 self.stopMeetingRecording(reason: "calendar-end-grace:\(eventID)")
+            case let .silentExtend(newDeadline):
+                // Both audio + meeting app say ongoing → extend without bothering
+                // the user. No card, no notify-attempt counter bump. We only
+                // re-arm the next check at `newDeadline`.
+                let pseudoEnd = newDeadline.addingTimeInterval(-CalendarEndStopDecisionRules.defaultGraceSeconds)
+                self.armCalendarEndStopTask(eventID: eventID, eventEnd: pseudoEnd)
             case let .notifyAndExtend(newDeadline):
                 self.calendarEndNotifyAttempts += 1
+                // ITER-035-followup (2026-05-12) — use the new `recordingOverrun`
+                // kind so the title reads «STILL RECORDING» (truthful) instead
+                // of the old «RECORDING STOPPED» (misleading — the recorder is
+                // CONTINUING here, not stopping).
                 let card = MWNotification(
-                    kind: .recordingStopped,
-                    title: "Meeting overrunning",
-                    body: "Calendar event ended. Tap to stop now or it will re-check in 5 min.",
+                    kind: .recordingOverrun,
+                    title: "Calendar slot ended — still recording",
+                    body: "Audio activity detected, keeping the recording going. Tap to stop now, or it will re-check in 5 min.",
                     onTap: { [weak self] in
                         guard let self else { return }
                         self.stopMeetingRecording(reason: "calendar-end-overrun-card-tap:\(eventID)")
@@ -1832,6 +3148,156 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .hardStop:
                 self.stopMeetingRecording(reason: "calendar-end-hard-stop:\(eventID)")
             }
+        }
+    }
+
+    // MARK: - ITER-034.1 meeting-app visibility probe
+
+    /// True iff a recognized meeting app (Zoom / Google Meet / Teams /
+    /// FaceTime / Webex / Discord-voice / Slack-huddle) was foreground in
+    /// the last 60s of `ScreenContextService.recentContexts`. Fed into
+    /// `CalendarEndStopDecision.evaluate(meetingAppVisible:)` as a
+    /// "meeting is still ongoing" override — even if the room went quiet
+    /// for a moment, the meeting UI being on screen is strong evidence
+    /// not to terminate the recording.
+    ///
+    /// We re-use the same name/title patterns that
+    /// `SystemAudioCaptureService` uses for call detection so the two
+    /// places can't disagree about what counts as a meeting app. Pattern
+    /// set is intentionally narrow — no "Telegram" / "Mattermost"
+    /// general matches, since those apps are 90% chat and only
+    /// occasionally voice/video.
+    private func isMeetingAppVisibleInRecentScreenContext() -> Bool {
+        let lookbackSec: TimeInterval = 60
+        let cutoff = Date().addingTimeInterval(-lookbackSec)
+        let recent = screenContext.recentContexts.filter { $0.timestamp >= cutoff }
+        guard !recent.isEmpty else { return false }
+
+        // App-name matches (case-insensitive substring).
+        let meetingAppPrefixes = ["zoom", "microsoft teams", "teams", "facetime", "webex", "gotomeeting", "skype", "whereby"]
+        // Window-title matches — for browser-hosted calls (Meet / Zoom web).
+        let meetingTitleSubstrings = ["meet.google.com", "google meet", "zoom meeting", "teams - microsoft", "microsoft teams"]
+        // Discord/Slack voice — title-specific keywords; chat-only sessions don't match.
+        let voiceModeTitleSubstrings = ["huddle", "voice connected", "voice call"]
+        // Browsers that can host meetings. We DON'T treat browser-foreground
+        // alone as a meeting signal (user could be reading docs), but we
+        // pair it with the Meet room-code regex below.
+        let browserAppPrefixes = ["chrome", "arc", "safari", "firefox", "edge", "brave", "opera"]
+        // Google Meet room code: xxx-yyyy-zzz. Arc + some Chrome builds
+        // show ONLY the code as the window title, no «Google Meet» suffix.
+        // Mirrors `SystemAudioCaptureService.meetRoomCodeRegex` — same
+        // 3-letter / 3-4-letter / 3-letter pattern.
+        let meetRoomCodeRegex = try? NSRegularExpression(
+            pattern: "(^|\\s)[a-z]{3}-[a-z]{3,4}-[a-z]{3}($|\\s)",
+            options: [.caseInsensitive]
+        )
+
+        for ctx in recent {
+            let appLower = ctx.appName.lowercased()
+            if meetingAppPrefixes.contains(where: { appLower.contains($0) }) {
+                return true
+            }
+            let titleLower = ctx.windowTitle.lowercased()
+            if meetingTitleSubstrings.contains(where: { titleLower.contains($0) }) {
+                return true
+            }
+            if voiceModeTitleSubstrings.contains(where: { titleLower.contains($0) }) {
+                return true
+            }
+            // Browser foreground + Meet room-code in title → it's a Meet call.
+            // Closes the 2026-05-15 bug where Google Meet in Chrome wasn't
+            // detected → meetingAppVisible=NO → calendar-end-hardStop hit.
+            if let regex = meetRoomCodeRegex,
+               browserAppPrefixes.contains(where: { appLower.contains($0) }) {
+                let title = ctx.windowTitle
+                let range = NSRange(title.startIndex..., in: title)
+                if regex.firstMatch(in: title, range: range) != nil {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // MARK: - ITER-034.2 Recovery dir cleanup (2026-05-11)
+
+    /// Delete `.wav` files in `~/Library/Application Support/MetaWhisp/Recovery/`
+    /// older than 7 days. Idempotent: zero-op when nothing's old, deletes
+    /// whatever crossed the cutoff otherwise. No flag-gating — this is a
+    /// recurring janitor pass, not a one-time migration.
+    ///
+    /// Why 7 days: Recovery serves resurrected-after-crash transcription;
+    /// a wav still around after a week was never going to be picked up
+    /// (the user has moved on, the conversation isn't going to be salvaged).
+    /// Earlier audit (2026-05-11) surfaced 13 .wav files from May 7-8 totaling
+    /// 12 MB — accumulated over a year because the original code path that
+    /// wrote them never had a paired delete on success.
+    ///
+    /// Failure mode is silent — we log warnings but never throw or block
+    /// app startup. A dir-doesn't-exist case is fine; an unreadable file is
+    /// logged and skipped.
+    private func cleanupStaleRecoveryWavs() {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return
+        }
+        let recoveryDir = appSupport.appendingPathComponent("MetaWhisp/Recovery", isDirectory: true)
+        guard fm.fileExists(atPath: recoveryDir.path) else { return }
+
+        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
+        let resourceKeys: [URLResourceKey] = [.contentModificationDateKey, .nameKey]
+
+        guard let enumerator = fm.enumerator(
+            at: recoveryDir,
+            includingPropertiesForKeys: resourceKeys,
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        ) else { return }
+
+        var deleted = 0
+        var totalBytes: Int64 = 0
+        for case let url as URL in enumerator {
+            guard url.pathExtension.lowercased() == "wav" else { continue }
+            guard let vals = try? url.resourceValues(forKeys: Set(resourceKeys)),
+                  let mtime = vals.contentModificationDate else { continue }
+            guard mtime < cutoff else { continue }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            do {
+                try fm.removeItem(at: url)
+                deleted += 1
+                totalBytes += Int64(size)
+            } catch {
+                NSLog("[RecoveryCleanup] ⚠️ Failed to delete %@: %@",
+                      url.lastPathComponent, error.localizedDescription)
+            }
+        }
+        if deleted > 0 {
+            NSLog("[RecoveryCleanup] ✅ Pruned %d wav files (%.1f MB) older than 7d",
+                  deleted, Double(totalBytes) / 1_048_576.0)
+        }
+    }
+
+    // MARK: - ITER-053.1 screen-history retention
+
+    /// Janitor pass over the screen-intelligence store: raw OCR rows
+    /// (ScreenContext) and Rewind observations past their retention windows
+    /// are deleted. Runs at launch + every 12h; also callable from Settings.
+    /// Failure mode is a logged warning — never blocks startup.
+    func pruneScreenHistory() {
+        let settings = AppSettings.shared
+        let ctx = ModelContext(historyService.modelContainer)
+        do {
+            let deleted = try ScreenRetention.prune(
+                in: ctx,
+                rawDays: settings.screenRetentionDays,
+                observationDays: settings.observationRetentionDays
+            )
+            if deleted.contexts + deleted.observations > 0 {
+                NSLog("[ScreenRetention] ✅ Pruned %d OCR rows (>%dd) + %d observations (>%dd)",
+                      deleted.contexts, settings.screenRetentionDays,
+                      deleted.observations, settings.observationRetentionDays)
+            }
+        } catch {
+            NSLog("[ScreenRetention] ⚠️ prune failed: %@", error.localizedDescription)
         }
     }
 
@@ -1895,12 +3361,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        NSLog("[DeepLink] Received auth token: %@...", String(token.prefix(8)))
+        NSLog("[DeepLink] Received auth deep link")  // AUD-025: no token material in logs
         Task {
             await LicenseService.shared.activate(token: token)
-            // Show the main window so user sees their activated Pro status
-            NSApp.activate(ignoringOtherApps: true)
-            self.openMainWindow()
+            // Don't yank the user across Spaces/displays. After a web sign-in the
+            // browser is frontmost on its own Space; force-activating the app and
+            // opening the main window here threw the user onto the window's Space
+            // («кинуло на первый экран, хотя апка была на втором»). Surface the
+            // result as a banner instead — its canJoinAllSpaces panel shows
+            // wherever the user currently is, and tapping it opens the app.
+            let lic = LicenseService.shared
+            if let banner = SignInBannerDecision.resolve(
+                isPro: lic.isPro, lastError: lic.lastError, email: lic.email
+            ) {
+                NotificationService.shared.postSignInResult(title: banner.title, body: banner.body)
+            }
         }
     }
 }

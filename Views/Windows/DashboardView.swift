@@ -93,6 +93,7 @@ struct DashboardView: View {
 
             Button {
                 coordinator.toggle()
+                NSLog("[Dashboard] RECORD/STOP button tapped")
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: coordinator.stage == .recording ? "stop.fill" : "mic.fill")
@@ -111,7 +112,7 @@ struct DashboardView: View {
                 .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous).stroke(MW.border, lineWidth: 0.5))
             }
             .buttonStyle(.plain)
-            .disabled(coordinator.stage == .processing || coordinator.stage == .postProcessing)
+            .disabled(coordinator.stage == .idle ? !coordinator.canStartRecording : coordinator.stage != .recording)
         }
         .padding(.horizontal, MW.sp16).padding(.vertical, MW.sp12)
         .mwCard(radius: MW.rSmall, elevation: .flat)
@@ -122,7 +123,7 @@ struct DashboardView: View {
         case .recording: "Recording"
         case .processing: "Transcribing"
         case .postProcessing: coordinator.translateNext ? "Translating" : "Processing"
-        case .idle: "Ready"
+        case .idle: coordinator.idleStatusLabel
         }
     }
 }
@@ -149,27 +150,14 @@ private struct ScreenActivityCard: View {
         )
     }
 
-    /// Top-5 apps by on-screen seconds in the last 24h. User feedback (2026-04-26):
-    /// equal heights are now Grid-managed so 5 fits without breaking layout.
+    /// Top-5 apps by on-screen seconds in the last 24h — ITER-053.1: the math
+    /// lives in `ScreenTimeAggregator` (shared with DailySummary so the two
+    /// surfaces can't diverge). Percent is now of TOTAL screen time, not of the
+    /// top-5 subset (the old inline math overstated shares).
     private var topApps: [(appName: String, seconds: Double, percent: Int)] {
-        guard contexts.count >= 2 else { return [] }
-        let maxGap: TimeInterval = 300
-        var byApp: [String: Double] = [:]
-        for i in 0..<(contexts.count - 1) {
-            let c = contexts[i]
-            let next = contexts[i + 1]
-            let gap = min(next.timestamp.timeIntervalSince(c.timestamp), maxGap)
-            guard gap > 0 else { continue }
-            byApp[c.appName, default: 0] += gap
-        }
-        let sorted = byApp.map { ($0.key, $0.value) }
-            .sorted { $0.1 > $1.1 }
-            .prefix(5)
-        let total = sorted.reduce(0.0) { $0 + $1.1 }
-        guard total > 0 else { return [] }
-        return sorted.map { item in
-            (appName: item.0, seconds: item.1, percent: Int((item.1 / total * 100).rounded()))
-        }
+        ScreenTimeAggregator.topApps(
+            samples: contexts.map { (appName: $0.appName, timestamp: $0.timestamp) }
+        ).map { (appName: $0.appName, seconds: $0.seconds, percent: $0.percent) }
     }
 
     var body: some View {
@@ -466,7 +454,7 @@ private struct TodayStatsCard: View {
     private var liveConvs: [Conversation]
 
     /// Live memories — non-dismissed only.
-    @Query(filter: #Predicate<UserMemory> { !$0.isDismissed })
+    @Query(filter: #Predicate<UserMemory> { !$0.isDismissed && !$0.needsReview })
     private var liveMemories: [UserMemory]
 
     /// Live completed tasks (any time). Filtered to "completed today" via
@@ -731,10 +719,12 @@ private struct TodayTomorrowSection: View {
 
 /// Today's LLM recap with single ‹ / › arrows for past-day navigation.
 /// Replaces the 14-day picker carousel — user navigates one day at a time
-/// while a `DailySummary` row exists for the destination day. The forward
-/// arrow is hidden at offset 0 (today) so the user can't slide into the
-/// future. Body re-uses the same render shape DetailCard had: title +
-/// LEARNED / DECIDED / SHIPPED / energy.
+/// while a `DailySummary` row exists for the destination day. The card opens
+/// on the newest recap there is — before the scheduled hour that is
+/// yesterday's — and the forward arrow is bounded by today, not by where the
+/// card opened, so today's placeholder and its GENERATE stay reachable. Body
+/// re-uses the same render shape DetailCard had: title + LEARNED / DECIDED /
+/// SHIPPED / energy.
 private struct TodayCard: View {
     /// True → split sections into 2 columns (LEARNED+SHIPPED | DECIDED).
     /// False → keep dense single-column layout. Driven by window width.
@@ -751,8 +741,11 @@ private struct TodayCard: View {
     @State private var calendarEvents: [TodayCalendarRow] = []
 
     private var cal: Calendar { Calendar.current }
+    /// Stands on the newest recap before the scheduled hour, not on an empty
+    /// "today" (review, 2026-09-01). ‹ › move relative to that.
     private var selectedDate: Date {
-        cal.date(byAdding: .day, value: dayOffset, to: cal.startOfDay(for: Date())) ?? Date()
+        let anchor = DayRecapStrip.anchorDay(newestRecapDate: summaries.first?.date, now: Date())
+        return cal.date(byAdding: .day, value: dayOffset, to: anchor) ?? anchor
     }
 
     private var todaysSummary: DailySummary? {
@@ -769,7 +762,10 @@ private struct TodayCard: View {
         return cal.startOfDay(for: oldest) < selectedDate
     }
 
-    private var canGoForward: Bool { dayOffset < 0 }
+    /// Bounded by today, not by the anchor: with the card opening on
+    /// yesterday, `dayOffset < 0` made today unreachable for the whole day
+    /// before the scheduled hour (review, 2026-09-01).
+    private var canGoForward: Bool { selectedDate < cal.startOfDay(for: Date()) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: MW.sp16) {
@@ -787,7 +783,10 @@ private struct TodayCard: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .mwCard(radius: MW.rMedium, elevation: .raised)
         .task { await loadCalendarEvents() }
-        .onChange(of: dayOffset) { _, _ in
+        // Keyed on the day shown, not the offset: the anchor moves under a
+        // fixed offset when the 22:00 recap lands, and the calendar section
+        // used to stay on the previous day beneath the new recap.
+        .onChange(of: selectedDate) { _, _ in
             Task { await loadCalendarEvents() }
         }
         .onChange(of: settings.calendarReaderEnabled) { _, _ in
@@ -938,6 +937,7 @@ private struct TodayCard: View {
         }
 
         await MainActor.run { calendarEvents = mapped }
+        NSLog("[Dashboard] calendar section: %d events on selected day, %d linked to conversations", mapped.count, mapped.filter { $0.conversationId != nil }.count)
     }
 
     private var header: some View {
@@ -1000,7 +1000,16 @@ private struct TodayCard: View {
     @ViewBuilder
     private var content: some View {
         if let s = todaysSummary {
+            // Shown is read — and "shown" is asked of AppKit, because
+            // `onAppear` fires for a hidden or miniaturised window too, and
+            // a recap landing behind another app would have marked itself
+            // read unseen. `initial: true` covers the first render; the
+            // key-window notification covers a recap that arrived while the
+            // window was hidden and is only now in front of someone.
             summaryRender(for: s)
+                .onChange(of: s.id, initial: true) { _, id in markReadIfShowing(id) }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSWindow.didBecomeKeyNotification)) { _ in markReadIfShowing(s.id) }
         } else {
             emptyPlaceholder
         }
@@ -1093,6 +1102,11 @@ private struct TodayCard: View {
             .padding(.vertical, 16)
     }
 
+    private func markReadIfShowing(_ id: UUID) {
+        guard AppDelegate.shared?.mainWindow.isShowing == true else { return }
+        AppDelegate.shared?.dailySummaryService.markRead(id: id)
+    }
+
     private var dayLabel: String {
         if cal.isDateInToday(selectedDate) { return "TODAY" }
         if cal.isDateInYesterday(selectedDate) { return "YESTERDAY" }
@@ -1115,6 +1129,7 @@ private struct TodayCard: View {
         let target = selectedDate
         Task { @MainActor in
             let result = await AppDelegate.shared?.dailySummaryService.generateForDate(target)
+            NSLog("[Dashboard] Recap GENERATE day=%@ → %@", target.description, result == nil ? "no summary" : "shown")
             localSummary = result
             isGenerating = false
         }
@@ -1500,10 +1515,11 @@ private struct TomorrowCard: View {
             return
         }
 
-        // 3. notDetermined (or unknown) → request. Activate first so dialog
-        //    shows on top of the foreground window (menu-bar app quirk).
-        NSApp.activate(ignoringOtherApps: true)
-
+        // 3. notDetermined (or unknown) → request. NO NSApp.activate here:
+        //    the aggressive (ignoringOtherApps:) form yanks the user to the
+        //    main window's bound Space/display (see MainWindowController's
+        //    documented rule). The TCC permission dialog is system-presented
+        //    regardless of app activation.
         Task { @MainActor in
             let store = EKEventStore()
             let granted: Bool

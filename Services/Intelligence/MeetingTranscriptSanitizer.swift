@@ -1,0 +1,273 @@
+import Foundation
+import NaturalLanguage
+
+/// Pure text-level cleanup for the finalize meeting-transcript path (ITER-060
+/// Phase 1). Три измеренных класса мусора на 114 реальных транскриптах
+/// (2026-08-07 аудит): 863 кросс-канальных эхо-дубля, 410 повторных петель,
+/// 2-5 иноязычных обрывков на митинг. Каждый шаг возвращает выброшенное с
+/// причиной — владелец (AppDelegate) пишет это в SuspectTranscriptLog, ничего
+/// не удаляется молча.
+enum MeetingTranscriptSanitizer {
+
+    struct SanitizeResult: Equatable {
+        var kept: [StreamSegment]
+        var dropped: [Drop]
+    }
+
+    struct Drop: Equatable {
+        let segment: StreamSegment
+        let reason: String
+    }
+
+    // MARK: - Repetition-loop collapse (per utterance)
+
+    /// Collapse a decoder stutter-loop — the same n-gram repeated CONSECUTIVELY
+    /// — down to its first instance. «как как как как будет» → «как будет»;
+    /// «я думаю что я думаю что я думаю что» → «я думаю что».
+    ///
+    /// Thresholds (Codex review 2026-08-07): single words need 4+ repeats —
+    /// «нет нет нет» / «да да да» are live emphatic speech, while decoder word
+    /// loops run 4+ (log: «как» ×7, «Окей.» ×5). Phrase grams (2-4 words) need
+    /// 3+ — humans don't repeat a whole phrase thrice back-to-back. Comparison
+    /// is case/punctuation-insensitive; the FIRST instance's formatting survives.
+    static func collapseRepetitionLoops(_ text: String) -> String {
+        let tokens = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard tokens.count >= 3 else { return text }
+        func norm(_ s: String) -> String {
+            s.lowercased().trimmingCharacters(in: .punctuationCharacters)
+        }
+        let normed = tokens.map(norm)
+        var out: [String] = []
+        var i = 0
+        var collapsed = false
+        while i < tokens.count {
+            var advanced = false
+            // Longest gram first so a phrase loop wins over its inner word loop.
+            for gram in stride(from: 4, through: 1, by: -1) {
+                let minRuns = gram == 1 ? 4 : 3
+                guard i + gram * minRuns <= tokens.count else { continue }
+                let pattern = Array(normed[i ..< i + gram])
+                // A pattern that is pure punctuation after normalization can't loop.
+                guard pattern.contains(where: { !$0.isEmpty }) else { continue }
+                var runs = 1
+                var j = i + gram
+                while j + gram <= tokens.count, Array(normed[j ..< j + gram]) == pattern {
+                    runs += 1
+                    j += gram
+                }
+                if runs >= minRuns {
+                    out.append(contentsOf: tokens[i ..< i + gram]) // keep first instance
+                    i += gram * runs
+                    collapsed = true
+                    advanced = true
+                    break
+                }
+            }
+            if !advanced {
+                out.append(tokens[i])
+                i += 1
+            }
+        }
+        return collapsed ? out.joined(separator: " ") : text
+    }
+
+    // MARK: - Full sanitize pipeline (merged segments)
+
+    /// Run all cross-segment cleanups in order: consecutive-identical dedup →
+    /// cross-channel echo dedup → language-profile foreign-fragment filter.
+    static func sanitize(_ merged: [StreamSegment]) -> SanitizeResult {
+        var dropped: [Drop] = []
+        var kept = dedupeConsecutiveIdentical(merged, dropped: &dropped)
+        kept = dedupeCrossChannelEcho(kept, dropped: &dropped)
+        kept = filterForeignFragments(kept, dropped: &dropped)
+        return SanitizeResult(kept: kept, dropped: dropped)
+    }
+
+    // MARK: - Consecutive identical utterances («Окей.» ×5 as separate segments)
+
+    /// Collapse runs of the SAME normalized text from the SAME speaker within a
+    /// short window (decoder loop across utterance boundaries). Keeps the first.
+    /// A legitimate repeat minutes later survives via the 30s gap guard.
+    private static let consecutiveDedupMaxGapSec: Double = 30
+
+    static func dedupeConsecutiveIdentical(_ segments: [StreamSegment], dropped: inout [Drop]) -> [StreamSegment] {
+        var kept: [StreamSegment] = []
+        for seg in segments {
+            if let prev = kept.last,
+               prev.speaker == seg.speaker,
+               seg.startSec - prev.startSec <= consecutiveDedupMaxGapSec {
+                let a = normalizedTokens(prev.text)
+                let b = normalizedTokens(seg.text)
+                if !a.isEmpty, a == b {
+                    dropped.append(Drop(segment: seg, reason: "consecutive-duplicate"))
+                    continue
+                }
+            }
+            kept.append(seg)
+        }
+        return kept
+    }
+
+    // MARK: - Cross-channel echo dedup (speakers → mic bleed)
+
+    /// The мик слышит динамики: собеседник's speech shows up a second time as a
+    /// garbled «Me:» copy. Решение юзера (2026-08-07): при совпадении удаляется
+    /// ВСЕГДА Me-копия — системный канал чистый цифровой сигнал, микрофонная
+    /// версия — искажённое эхо.
+    ///
+    /// Guards (corner cases согласованы):
+    /// - ≥4 слов — «Да»/«Окей» оба говорят рядом, короткое не дедупим;
+    /// - similarity ≥0.8 по нормализованным токенам — эхо распознаётся с
+    ///   искажениями, точное равенство не поймало бы;
+    /// - Me-копия НЕ заметно длиннее Them (×1.5) — иначе это может быть
+    ///   обратное эхо (мой голос вернулся через канал собеседника), удалять
+    ///   Me значило бы терять мою реальную речь;
+    /// - окно startSec: Me в [themStart − 2, themStart + 4] — эхо приходит
+    ///   почти мгновенно (плюс рассинхрон эпох каналов); осознанный повтор
+    ///   фразы приходит позже и выживает;
+    /// - ≥2 НОВЫХ слов у Me-копии (нет в Them-фразе) → это не эхо, а речь
+    ///   с добавленным содержанием («…, правильно я понимаю?») — оставляем.
+    ///   Одно новое слово допускаем: bleed регулярно коверкает один токен
+    ///   («задеплоим» → «задиплоят»). (Codex review 2026-08-07.)
+    private static let echoWindowBeforeSec: Double = 2
+    private static let echoWindowAfterSec: Double = 4
+    private static let echoMinWords = 4
+    private static let echoSimilarityThreshold: Double = 0.8
+    private static let echoMaxLengthRatio: Double = 1.5
+    private static let echoMaxNewWords = 1
+
+    static func dedupeCrossChannelEcho(_ segments: [StreamSegment], dropped: inout [Drop]) -> [StreamSegment] {
+        let themSegments = segments.filter { $0.speaker == .them }
+        guard !themSegments.isEmpty else { return segments }
+
+        var kept: [StreamSegment] = []
+        for seg in segments {
+            guard seg.speaker == .me else {
+                kept.append(seg)
+                continue
+            }
+            let meTokens = normalizedTokens(seg.text)
+            guard meTokens.count >= echoMinWords else {
+                kept.append(seg)
+                continue
+            }
+            let isEcho = themSegments.contains { them in
+                let delta = seg.startSec - them.startSec
+                guard delta >= -echoWindowBeforeSec, delta <= echoWindowAfterSec else { return false }
+                let themTokens = normalizedTokens(them.text)
+                guard !themTokens.isEmpty,
+                      Double(meTokens.count) <= Double(themTokens.count) * echoMaxLengthRatio,
+                      newWordCount(in: meTokens, versus: themTokens) <= echoMaxNewWords
+                else { return false }
+                return tokenSimilarity(meTokens, themTokens) >= echoSimilarityThreshold
+            }
+            if isEcho {
+                dropped.append(Drop(segment: seg, reason: "cross-channel-echo"))
+            } else {
+                kept.append(seg)
+            }
+        }
+        return kept
+    }
+
+    // MARK: - Foreign-fragment filter (language-agnostic)
+
+    /// ITER-060.3 — language-PROFILE foreign-fragment filter (two-pass, runs
+    /// post-merge over the WHOLE meeting, both channels). НИКАКИХ зашитых
+    /// языков: «свои» языки — любые, на которых в митинге прозвучала хоть
+    /// одна содержательная (≥5 слов) фраза, в любой момент и любым каналом.
+    /// Юзер свободно переключается RU↔EN↔что угодно — все его языки входят
+    /// в профиль и не трогаются.
+    ///
+    /// Дроп только когда ВСЁ сразу: язык фразы вне профиля + 3-5 слов +
+    /// уверенность распознавателя ≥0.9 + в митинге ≥20 надёжных фраз. Это
+    /// сигнатура дрейфа декодера (случайные испанские/польские вспышки).
+    /// Two-pass (Codex 2026-08-08): профиль считается по ВСЕМУ митингу до
+    /// любых суждений, поэтому ранняя короткая EN-фраза не гибнет, если EN
+    /// звучит содержательно ПОЗЖЕ. Осознанный residual (задокументирован):
+    /// единственная за весь митинг короткая фраза на языке, который больше
+    /// нигде не звучал, будет удалена — она неотличима от мусора; попадает
+    /// в suspect-log, откуда восстановима.
+    private static let foreignMinMeetingUtterances = 20
+    /// Strictly ABOVE `foreignMaxWords`: a fragment inside the droppable 3-5
+    /// word range must never self-legitimize its own language into the profile
+    /// (a 5-word «Gracias por ver el video» did exactly that when this was 5).
+    private static let foreignSubstantialWords = 6
+    private static let foreignMinWords = 3
+    private static let foreignMaxWords = 5
+    private static let foreignMinConfidence = 0.9
+
+    static func filterForeignFragments(_ segments: [StreamSegment], dropped: inout [Drop]) -> [StreamSegment] {
+        let detections: [(index: Int, lang: String, confidence: Double, words: Int)] = segments.enumerated().compactMap { i, seg in
+            guard let d = detectLanguage(seg.text) else { return nil }
+            return (i, d.lang, d.confidence, normalizedTokens(seg.text).count)
+        }
+        let confident = detections.filter { $0.confidence >= 0.5 }
+        guard confident.count >= foreignMinMeetingUtterances else { return segments }
+
+        // Pass 1 — the meeting's language profile: full-meeting view first.
+        let profile = Set(confident.filter { $0.words >= foreignSubstantialWords }.map { $0.lang })
+        guard !profile.isEmpty else { return segments }
+
+        // Pass 2 — judge fragments against the completed profile.
+        let byIndex = Dictionary(uniqueKeysWithValues: detections.map { ($0.index, $0) })
+        var kept: [StreamSegment] = []
+        for (i, seg) in segments.enumerated() {
+            if let d = byIndex[i],
+               d.confidence >= foreignMinConfidence,
+               !profile.contains(d.lang),
+               (foreignMinWords ... foreignMaxWords).contains(d.words) {
+                dropped.append(Drop(segment: seg, reason: "foreign-language-fragment (\(d.lang))"))
+            } else {
+                kept.append(seg)
+            }
+        }
+        return kept
+    }
+
+    /// Dominant language of a text via the OS recognizer, or nil when it has
+    /// no hypothesis. Language-agnostic by construction.
+    static func detectLanguage(_ text: String) -> (lang: String, confidence: Double)? {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        guard let (lang, prob) = recognizer.languageHypotheses(withMaximum: 1).first else { return nil }
+        return (lang.rawValue, prob)
+    }
+
+    // MARK: - Shared helpers
+
+    private static func normalizedTokens(_ text: String) -> [String] {
+        text.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// How many tokens of `a` are absent from `b` (multiset semantics).
+    static func newWordCount(in a: [String], versus b: [String]) -> Int {
+        var counts: [String: Int] = [:]
+        for t in b { counts[t, default: 0] += 1 }
+        var new = 0
+        for t in a {
+            if (counts[t] ?? 0) > 0 {
+                counts[t]! -= 1
+            } else {
+                new += 1
+            }
+        }
+        return new
+    }
+
+    /// Dice coefficient over token multisets: 2·|common| / (|a| + |b|).
+    static func tokenSimilarity(_ a: [String], _ b: [String]) -> Double {
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        var counts: [String: Int] = [:]
+        for t in a { counts[t, default: 0] += 1 }
+        var common = 0
+        for t in b where (counts[t] ?? 0) > 0 {
+            counts[t]! -= 1
+            common += 1
+        }
+        return Double(2 * common) / Double(a.count + b.count)
+    }
+}

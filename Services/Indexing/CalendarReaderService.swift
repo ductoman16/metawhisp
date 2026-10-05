@@ -59,6 +59,29 @@ final class CalendarReaderService: ObservableObject {
     /// event begins. `lookback` defaults to 65 sec so the 1-sec poll loop
     /// catches every event boundary even if a tick was skipped, but events
     /// older than that are not returned (no stale-event re-firing on launch).
+    /// A non-allday event that is running RIGHT NOW, whether or not it just
+    /// started. `eventStartingNow` only sees the first 65 seconds of an event,
+    /// so an auto-start that captured nothing had no way to be tried again
+    /// while the meeting itself was still going (2026-09-17 08:30).
+    func eventInProgress(maxDuration: TimeInterval = 4 * 3600) -> EKEvent? {
+        let status = EKEventStore.authorizationStatus(for: .event)
+        guard status == .fullAccess || status == .authorized else { return nil }
+        let now = Date()
+        let predicate = store.predicateForEvents(withStart: now.addingTimeInterval(-maxDuration),
+                                                 end: now.addingTimeInterval(60),
+                                                 calendars: nil)
+        let candidates = store.events(matching: predicate).filter { ev in
+            if ev.isAllDay { return false }
+            if ev.status == .canceled { return false }
+            if let me = ev.attendees?.first(where: { $0.isCurrentUser }),
+               me.participantStatus == .declined { return false }
+            return ev.startDate <= now && ev.endDate > now
+        }
+        // Overlapping calendars: the one that started most recently is the one
+        // the user is in.
+        return candidates.sorted { $0.startDate > $1.startDate }.first
+    }
+
     func eventStartingNow(lookback: TimeInterval = 65) -> EKEvent? {
         let status = EKEventStore.authorizationStatus(for: .event)
         guard status == .fullAccess || status == .authorized else { return nil }
@@ -210,9 +233,9 @@ final class CalendarReaderService: ObservableObject {
         conv.calendarAttendeesJSON = (try? String(data: JSONEncoder().encode(attendeeNames), encoding: .utf8)) ?? "[]"
         conv.updatedAt = Date()
         try? ctx.save()
-        NSLog("[Calendar] ✅ linked conv %@ → event '%@' (score %.2f)",
+        NSLog("[Calendar] ✅ linked conv %@ → event %@ (title %d chars, score %.2f)",
               convId.uuidString.prefix(8) as CVarArg,
-              matched.title ?? "(untitled)", score)
+              matched.eventIdentifier ?? "(no id)", (matched.title ?? "").count, score)
     }
 
     /// Backfill: walk completed conversations missing a calendar link, attempt to
@@ -305,11 +328,13 @@ final class CalendarReaderService: ObservableObject {
     /// Main scan: creates tasks from upcoming events + memories from patterns.
     func scanNow() async {
         guard !isRunning else { return }
+        if !settings.calendarReaderEnabled || !hasLLMAccess { NSLog("[Calendar] scan skipped: calendarEnabled=%@ llmAccess=%@ (no API key, not Pro, local model not loaded)", settings.calendarReaderEnabled ? "yes" : "no", hasLLMAccess ? "yes" : "no") }
         guard settings.calendarReaderEnabled else { return }
         guard hasLLMAccess else { return }
         guard let container = modelContainer else { return }
 
         isRunning = true
+        NSLog("[Calendar] scan start: window -%dd..+%dd, max %d events to LLM", daysBack, daysForward, maxEventsForLLM)
         defer {
             isRunning = false
             lastRun = Date()
@@ -358,10 +383,17 @@ final class CalendarReaderService: ObservableObject {
     private func extractMemoriesFromEvents(_ events: [EKEvent], in ctx: ModelContext) async -> Int {
         let existingContents = fetchRecentMemoryContents(in: ctx, limit: 150)
         let prompt = buildMemoryPrompt(events: events, existing: existingContents)
+        NSLog("[Calendar] memory extraction: %d events, %d existing memories in prompt, prompt %d chars", events.count, existingContents.count, prompt.count)
 
         do {
             let response: String
-            if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
+            // ITER-051 F1.3 — local model first (free + private), same priority
+            // order as MemoryExtractor. Falls to cloud paths when not loaded.
+            if LocalLLMService.shared.isReady {
+                response = try await LocalLLMService.shared.completeBlocking(
+                    system: Self.memorySystemPrompt, user: prompt,
+                    maxUserChars: 6000, maxTokens: 384)
+            } else if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
                 response = try await callProProxy(system: Self.memorySystemPrompt, user: prompt, licenseKey: licenseKey)
             } else {
                 let apiKey = settings.activeAPIKey
@@ -376,6 +408,7 @@ final class CalendarReaderService: ObservableObject {
             }
 
             let mems = parseMemories(response)
+            NSLog("[Calendar] LLM returned %d memories (%d chars response)", mems.count, response.count)
             var added = 0
             for m in mems where m.confidence >= minConfidence {
                 let trimmed = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -539,6 +572,10 @@ final class CalendarReaderService: ObservableObject {
     }
 
     private var hasLLMAccess: Bool {
+        // ITER-051 F1.3 — the local model is a first-class access path, same
+        // as MemoryExtractor/TaskExtractor (the Memories screen already told
+        // local-only users these readers work).
         !settings.activeAPIKey.isEmpty || LicenseService.shared.isPro
+            || LocalLLMService.shared.isReady
     }
 }

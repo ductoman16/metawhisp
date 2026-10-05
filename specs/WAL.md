@@ -1,3 +1,698 @@
+## Personal fork startup readiness — 2026-10-01 (verification correction)
+
+The previous entry verified engine tests and bundle integrity, not a launched
+app. The user's screenshot revealed that idle was shown as READY during a
+171.53s first preparation, and dictation was accepted then discarded. Added a
+red-first coordinator regression for all four entry points, engine lifecycle
+publication, capture readiness guard, and reactive menu/dashboard status.
+An unavailable engine after capture now writes recovery audio instead of
+silently losing it. Existing prepared models remain usable during replacement.
+
+Full regression gate PASS: 1483 tests, zero failures, 69 critical suites and
+layout corpus. Eight focused release tests PASS including real Turbo: Auto
+2.555/2.437/2.422s for 5.282s audio; English 1.015/0.970/0.970s for 1.554s audio.
+The positive coordinator test enables recording only after real preparation.
+
+Added an explicit fork-only packaged fixture smoke check, with no clipboard or
+history writes. The rebuilt app launched at 16:11 and prepared Turbo in 3.16s;
+two correct Auto fixture transcriptions took 1.283/1.223s for 1.554s audio. Both
+logged `[ForkSmoke] PASS` with coordinator Ready. Final full gate passed again.
+Native UI inspection still times out. This launch reports Accessibility trusted,
+but live automatic paste remains unverified. Details and rollback artifact:
+`specs/fork-local-transcription/PROGRESS.md`. Never infer visual verification or
+auto-paste success from engine benchmarks.
+
+## Personal fork latency fix — 2026-10-01 (verified local build)
+
+Completed the on-device fix: Neural Engine encoder + decoder, no local glossary
+prompt, bounded silence inference before model-ready publication. Auto, pinned
+languages, cloud prompts, output corrections, retries/VAD/confidence preserved.
+Real-engine first / repeated timings: short English 1.02 / 0.97s; 5.28s Auto
+dictation 2.63 / 2.44s. First compilation 147s, subsequent load + warm-up 2.87s.
+
+Full gate PASS: 1477 tests, zero failures, 69 critical suites and layout corpus.
+Previously failing layout tests now take real installed layouts explicitly;
+production remains enabled-only, and host preferences are not changed.
+Fork updater policy tested; packaged app never starts upstream Sparkle updates.
+Build script signs/verifies a separate `dist/MetaWhisp-Fork.app` and never installs
+or launches it. Hub tokenizer resources use a small checked-in dependency patch
+for the standard signed Resources directory; dependency lockfile unchanged.
+Strict bundle verification PASS; original installed app and data remain intact.
+See `FORK.md` and `specs/fork-local-transcription/PROGRESS.md` for commands/details.
+
+## Personal fork latency work — 2026-09-29 (historical diagnosis)
+
+Local large-v3-turbo reproduction: real WhisperKitEngine, exact built-in glossary,
+1.554-second synthetic English fixture, warm latency 14.055/14.112 seconds.
+Removing local prompt tokens and using the Neural Engine decoder gives
+1.520/1.510 seconds; output and three decoder configuration tests pass.
+Cloud prompts and post-transcription corrections remain unchanged. Active
+upstream Auto already gates off the English glossary (earlier tag-based
+Auto-plus-prompt replay did not represent the coordinator).
+
+Full regression gate is BLOCKED: build passes; 1474 tests, 8 skips, 68 failures
+in five unchanged keyboard-layout suites. Host has US only; those tests depend
+on live Russian/US mapping and some punctuation assumptions. No gate weakened,
+no keyboard settings changed, no app installed, no verified release claimed.
+See `specs/fork-local-transcription/PROGRESS.md` for logs and remaining work.
+
+## Released v1.3.8 — 2026-05-29 (meeting cleanup + LLM cost routing + MetaChat hardening)
+
+**Status: SHIPPED (download) via:**
+- ✅ Commit `69d7f01` on `architecture-phase-1-3`, pushed.
+- ✅ GitHub Release [v1.3.8](https://github.com/metawhisp/metawhisp/releases/tag/v1.3.8)
+  — DMG 16,615,689 bytes, notarized + stapled (Apple: Accepted), smoke-test passed.
+  Sparkle edSig `CDxRrnu/wsFHVa36UnuRAE4RdQfiTnjhQIGCe6rP69VjbEUJ3KaYozj5DewwJEJmQDbDPVJrscRvvU6QGLoFDA==`.
+- ✅ Download path verified: `metawhisp.com/downloads/MetaWhisp.dmg` → 302 →
+  `releases/latest/download` → serves 16,615,689 bytes (= v1.3.8). New users +
+  website button get 1.3.8 with ZERO site edits (Cloudflare Page Rule).
+- ✅ Release invariants all passed (metallib present, bundle integrity,
+  codesign --deep --strict, smoke test).
+- ✅ Pre-commit identifying-names audit clean (Swift/specs/scripts/WAL diff/
+  ChatService prompt).
+
+**Content:** v1.3.8 bundles the three 2026-05-28/29 workstreams — meeting
+hallucination strip + BrandGlossary, ITER-041 LLM tier routing + 2-stage
+gate, MetaChat empty-bubble + prompt-injection fix, RealtimeReactor
+rate-limit fix. 341 tests green.
+
+**⚠️ Sparkle auto-update (appcast) — NOT deployed (decision pending):**
+- Live `metawhisp.com/appcast.xml` still advertises **1.3.7**. Existing
+  users won't auto-update to 1.3.8 until the appcast gains the 1.3.8 item.
+- appcast.xml lives on the website (NOT in repo — GitHub-raw pivot still
+  not done), so updating it requires a website deploy — the exact
+  "touch site during release" action banned after the 2026-05-09 incident.
+  Left for the user to do as a deliberate, careful step.
+- Ready-to-paste 1.3.8 `<item>` saved at `/tmp/appcast-1.3.8-item.xml`
+  (correct edSignature + length + URL). Insert at top of the `<channel>`
+  items, then deploy website ONLY (no blog/src churn).
+
+## Session 2026-05-28 night — MetaChat + Tasks QA (50 corner cases + empty-bubble fix)
+
+User: «метачат вообще какая-то хуета и tasks тоже. давай 50 юзер стори и 50
+корнер кейсов.» Investigated with FACTS first (no guessing).
+
+### Findings (from real data, not assumptions)
+
+- Logs showed ChatService + TaskExtractor NOT crashing (✅ Got response,
+  ✅ Extracted N tasks). DB tasks looked reasonable quality. So the issue
+  is **quality / empty turns**, not errors.
+- **Chat history (ZCHATMESSAGE) showed empty AI bubbles**: "что нового"
+  → empty; "удали все эти старые задачи" → empty (no bulk-delete tool).
+- **ZERO functional tests** existed for ChatService / ChatToolExecutor /
+  TaskExtractionFilters / TaskExtractor — only tier declarations.
+
+### Bug 1 [fixed] — empty AI bubble on initial chat turn
+
+Root cause: `ChatService.send` initial path created the assistant
+`ChatMessage` with whatever `aiText` the agentic loop returned — including
+empty string — when there was no pending tool. The
+`continueAfterToolExecution` follow-up path already guarded against this
+(line ~599) but the initial path did not.
+
+Fix: guard before creating `aiMsg` — if text is empty AND no pending tool/
+preview, substitute `ChatService.emptyResponseFallback(for:)`. New pure
+function: Cyrillic input → RU fallback, else EN; never empty. Unit-tested.
+
+### Bug 2 [documented] — validateTaskTitle vagueVerb is dead code
+
+`TaskExtractionFilters.validateTaskTitle`: the `vagueVerb` rejection
+requires `wordCount <= 3`, but `wordCount < 4` already returns `.tooShort`
+earlier → the vagueVerb branch is UNREACHABLE. A 4+ word title led by a
+banned solo verb ("Check the auth logs now") passes as valid. Pinned by
+`test_validateTitle_vagueVerbBranch_isDeadCode_currentlyPasses`. FIX
+options noted (remove dead code OR re-target the guard to 4+ word titles).
+Not changed yet — tightening could reject valid tasks; needs a decision.
+
+### Tests added (50 corner cases)
+
+- `TaskExtractionFiltersTests` (32): isGenericNoise, validateTaskTitle
+  (EN+RU, word counts, dead-code pin), isTaskBlacklisted (apps/bundles/
+  case), isNearDuplicate (fuzzy/stopwords/threshold/empty), constants.
+- `ChatToolParsingTests` (18): emptyResponseFallback (RU/EN/empty/mixed),
+  stripToolCallXML (canonical/drift/plain/empty), parseToolCall
+  (canonical/drift/malformed/numeric-coercion/code-fences),
+  parseNativeToolCall (valid/nil/empty).
+
+### User-story harness (20 stories)
+
+`scripts/test-chat-userstories.sh` — hits live /api/pro/chat-with-tools
+across Q&A, task/memory mutations, edge inputs (empty/emoji/gibberish/
+injection), RU+EN+mixed. Asserts the critical invariant: NEVER an empty
+assistant turn (no text AND no tool). Runs with MW_LICENSE_KEY. NOTE: tests
+the worker layer (no real user context); client guard verified by unit test
++ in-app use.
+
+### Tests
+
+Before: 291. After: 341 (+50 QA corner cases). All green.
+
+### Files touched
+
+- `Services/Intelligence/ChatService.swift` — empty-bubble guard +
+  `emptyResponseFallback` pure fn
+- `Tests/.../TaskExtractionFiltersTests.swift` (NEW, 32)
+- `Tests/.../ChatToolParsingTests.swift` (NEW, 18)
+- `scripts/test-chat-userstories.sh` (NEW)
+
+### NOT done / honest gaps
+
+- 20 live user stories NOT executed by me (need user's MW_LICENSE_KEY +
+  cost money per call). Harness is runnable; user triggers it.
+- ChatToolExecutor.validate (DB-dependent) corner cases NOT written —
+  needs in-memory ModelContainer harness; deferred.
+- "удали все задачи" still has no bulk-delete tool — now returns graceful
+  fallback instead of empty, but bulk delete as a feature is unbuilt.
+- vagueVerb dead-code: documented, not removed (needs product decision).
+
+## Session 2026-05-28 evening — ITER-041 LLM tier routing (Phase A-D shipped)
+
+### Problem
+
+Production Groq spend $30.93 over 30 days (verified via dashboard
+2026-05-28). All 11 background LLM services hard-coded to one model
+(`llama-3.3-70b-versatile`), even structured-extraction work that fits an
+8B model. No relevance gating — every event fires the heavy LLM.
+
+Reference adaptation: the upstream project we follow uses a 3-tier client
+catalog (mini for gates/extraction, medium for user-facing generation,
+high for hard reasoning) plus a 2-stage cheap-gate flow that filters out
+~80% of contexts before any expensive call. We had zero of that.
+
+### Spec
+
+`specs/iterations/ITER-041-llm-tier-routing.md` — 3 tiers mapped to Groq
+primary / Cerebras fallback:
+
+| Tier | Groq | $/1M in/out |
+|---|---|---|
+| mini | `llama-3.1-8b-instant` | $0.05/$0.08 |
+| medium | `openai/gpt-oss-20b` | $0.075/$0.30 |
+| heavy | `llama-3.3-70b-versatile` | $0.59/$0.79 |
+
+### Implementation — all 4 phases shipped in one session
+
+**Phase A — Worker tier-routing (additive, 0 risk):**
+
+- `metawhisp-api/index.js`: `TIER_MODELS` const + `resolveTierModel`
+- `runChatCompletion(env, body)` accepts `body.tier` (optional) and
+  overrides `body.model` from the TIER_MODELS table; both Groq and
+  Cerebras fallback get their per-tier model id
+- Response envelope enriched with `tier_used` + `model_used`
+- Per-call telemetry log (JSON line to CF observability) includes
+  `service_id`, `tier_requested`, `tier_used`, `model_used`, `provider`,
+  `fallback_used`, `prompt_tokens`, `completion_tokens`, `duration_ms`
+- All 3 LLM handlers (`handleProProcess`, `handleProAdvice`,
+  `handleProChatWithTools`) accept `tier` + `service_id` from request
+- Missing `tier` → default `heavy` (back-compat preserved)
+- Deployed via CF API multipart upload, smoke-tested
+
+**Phase B — Client per-service tier (LOW risk):**
+
+- New `Services/LLM/LLMTier.swift` — enum + `LLMRequestBody.proAdviceBody`
+  helper (pure func)
+- 9 unit tests in `LLMTierTests` pinning enum raw values, body builder
+  edge cases, JSON serialization round-trip
+- 11 services declare `static let llmTier` + `llmServiceId`:
+  - mini: `MemoryExtractor`, `TaskExtractor`, `StructuredGenerator`,
+    `ScreenExtractor`
+  - medium: `AdviceService`, `InsightAssistantService`,
+    `RealtimeScreenReactor`, `WeeklyPatternDetector`, `DailySummaryService`
+  - heavy: `MeetingCoachService`, `ChatService`
+- Each `callProProxy`-style call site updated to forward
+  `tier: Self.llmTier, serviceId: Self.llmServiceId` through the body
+- Per-service tier tests pinned in `LLMTierTests` (11 more) — including a
+  regression guard that no extraction service may claim heavy
+
+**Phase C — Cheap relevance gate + 2-stage flow (MEDIUM risk):**
+
+- Worker: new route `POST /api/pro/gate` — always runs on tier=mini.
+  Returns `{is_relevant, score: Double, reasoning, tier_used, model_used}`.
+  Prompt: omi-style "default to is_relevant=false unless concrete signal";
+  scoring guide 0.90+ critical, 0.65-0.89 useful, <0.40 do-not-fire.
+  Markdown-fence stripping for robustness. Fail-open on parse error.
+- New `Services/LLM/GateClient.swift` — pure functions (buildRequest,
+  shouldFire) + thin HTTP wrapper. Fail-open on network/parse errors so a
+  gate outage doesn't silently drop signals.
+- 12 unit tests in `GateClientTests`: purpose enum raw values, body
+  builder, threshold edge cases (boundary=0.65 fires, 0.64 skips, 0.0
+  skips, 1.0 fires, NaN fail-open), custom threshold tuning, response
+  decoding, default threshold matches spec.
+- 3 client services rewired to 2-stage:
+  - `InsightAssistantService.evaluate` — gate ProactiveContextService OCR
+    before expensive insight LLM
+  - `AdviceService.generateAdvice` — gate user advice notification on Pro
+    path
+  - `RealtimeScreenReactor` — gate task-extraction LLM on Pro path
+
+**Phase D — LiveMeetingAdvisor gate before heavy MeetingCoach (MEDIUM risk):**
+
+- `LiveMeetingAdvisor.runChunk` — gate the `MeetingCoachService.shared.process`
+  call. When the partial text doesn't contain a coachable moment, skip the
+  30s heavy tick. AdviceService trigger remains (it has its own Phase C
+  gate).
+
+### Tests
+
+- Before: 260 tests (from previous session)
+- After: 290 tests (+9 LLMTier + 12 GateClient + 9 per-service declarations)
+- All green throughout
+
+### Verification — gate fires in production telemetry
+
+After hot-swap (PID 53369), CF logs and `~/Library/Logs/MetaWhisp.log`
+show real gate skips within 30 seconds:
+
+```
+[Gate] reactor score=0.00 → SKIP (threshold=0.65) — no specific signal
+[RealtimeReactor] gate-skipped on UserNotificationCenter
+[Gate] proactive score=0.00 → SKIP
+[Insight] gate-skipped score=0.00
+```
+
+Mini-gate cost ~$0.0001 per call; heavy LLM avoided ~$0.005. Savings
+ratio: ~50× per gate-skipped event.
+
+### Quick win (parallel) — `proactiveCooldownMinutes` reverted
+
+User had set this to 1 (default 5). `defaults write` brought it back to
+default. Single-action -$15/mo before any code change took effect.
+
+### Files touched
+
+- `metawhisp-api/index.js` (worker, not in repo) — TIER_MODELS, handler
+  pass-through, new `/api/pro/gate` route, telemetry log
+- `specs/iterations/ITER-041-llm-tier-routing.md` (NEW)
+- `Services/LLM/LLMTier.swift` (NEW)
+- `Services/LLM/GateClient.swift` (NEW)
+- `Services/Intelligence/MemoryExtractor.swift` — tier mini + body via LLMRequestBody
+- `Services/Intelligence/TaskExtractor.swift` — same
+- `Services/Intelligence/StructuredGenerator.swift` — same
+- `Services/Intelligence/ScreenExtractor.swift` — tier mini + body
+- `Services/Intelligence/AdviceService.swift` — tier medium + 2-stage gate
+- `Services/Intelligence/InsightAssistantService.swift` — tier medium + gate
+- `Services/Intelligence/RealtimeScreenReactor.swift` — tier medium + gate
+- `Services/Intelligence/WeeklyPatternDetector.swift` — tier medium
+- `Services/Intelligence/DailySummaryService.swift` — tier medium
+- `Services/Intelligence/MeetingCoachService.swift` — tier heavy + body via helper
+- `Services/Intelligence/LiveMeetingAdvisor.swift` — Phase D gate before MeetingCoach
+- `Services/Intelligence/ChatService.swift` — tier heavy + body via helper (both routes)
+- `Tests/MetaWhispTests/Services/LLM/LLMTierTests.swift` (NEW, 20 tests)
+- `Tests/MetaWhispTests/Services/LLM/GateClientTests.swift` (NEW, 12 tests)
+
+### Cost projection
+
+Baseline: $30.93/mo.
+
+Projected after this session (without yet enabling local LLM):
+- Extraction services (4) on mini = ~90% cheaper per call
+- Medium services (5) using gpt-oss-20b = ~85% cheaper per call
+- Heavy services (2) unchanged
+- Gate filters ~80% of background events before any medium/heavy call
+
+Conservative projection: **$30 → $8-12/month (~67% reduction).**
+
+### Follow-ups deferred to next iteration
+
+- A/B verification on 20 historical conversations (mini vs heavy
+  extraction JSON diff)
+- ITER-NEXT: Apple Intelligence (Foundation Models) bridge — once Tahoe
+  adoption >5%
+- Phi-4 local — once init-crash root cause fixed and stability verified
+- AppSettings UI for gate threshold tuning (currently hardcoded 0.65)
+
+### ITER-041 production verification — 4 bugs found + fixed same session
+
+Hot-swap PID 53369 + 55174 + 58304 (three rounds). Production telemetry
+caught what unit tests couldn't.
+
+**Bug 1 — Mini tier truncates complex JSON schemas.**
+- Symptom: `[StructuredGenerator] ⚠️ Parse failed`, `[MemoryExtractor] ⚠️
+  JSON parse failed: {"memories": [` (cutoff)
+- Root cause: 8B-instant emits incomplete JSON on complex schemas
+  (Memory 4 fields, StructuredGen 7, ScreenExtractor 3-array)
+- Fix: `MemoryExtractor`, `StructuredGenerator`, `ScreenExtractor` →
+  medium tier. Only `TaskExtractor` kept on mini (simple `{tasks: []}`
+  schema, verified working).
+
+**Bug 2 — gpt-oss-20b returns empty content for StructuredGenerator.**
+- Symptom: `[StructuredGenerator] ❌ Failed: LLM error: Structured proxy
+  HTTP 500`. CF telemetry: `service_id=StructuredGenerator
+  tier_used=medium model_used=openai/gpt-oss-20b provider=groq` with
+  empty content.
+- Root cause: gpt-oss-20b model returns "" for the 7-field extraction
+  prompt. Worker correctly returns 500 with "Empty response from LLM".
+- Fix: Worker `TIER_MODELS.medium.groq` → `openai/gpt-oss-120b`. Still
+  ~4× cheaper than the historical heavy default ($0.15/$0.60 vs
+  $0.59/$0.79). Verified working: 1 successful InsightAssistant call on
+  medium gpt-oss-120b at 17:36 → `Insight ✅ surfacing: Create a daily
+  Claude Routine to auto‑run SEO audit prompts (conf=0.78)`.
+
+**Bug 3 — Deepgram via CF AI binding does NOT support keyterm.**
+- Symptom: `[Transcribe] Deepgram failed: AiError: Bad Request: The
+  selected Nova-3 model does not support keyterm prompting. Model UUID:
+  e8345677-…`
+- Root cause: previous session (BrandGlossary work) added `params.keyterm
+  = terms` to the Deepgram call. The Cloudflare-AI binding routes to a
+  specific Nova-3 model UUID that doesn't accept this param. Every
+  transcription was falling through Deepgram (free) → Groq (also failing,
+  see Bug 4) → OpenAI Whisper ($0.006/min — paid). **Silent money leak
+  from the previous session.**
+- Fix: removed `params.keyterm` line from worker `transcribeDeepgram`.
+  Glossary biasing remains on the Groq/OpenAI fallback prompts.
+
+**Bug 4 — Groq Whisper rejects prompts >896 chars.**
+- Symptom: `[Transcribe] Groq failed: prompt length must be 896
+  characters or fewer, but provided prompt contains 900 characters`
+- Root cause: BrandGlossary.promptHint joined with user
+  CorrectionDictionary values exceeds Groq's hard limit.
+- Fix: Worker `transcribeGroq` truncates `prompt` to 896 chars before
+  multipart upload.
+
+**Worker re-deployed** with all 4 fixes at 2026-05-28T15:35Z. Pre-deploy
+errors (15:33:18Z and earlier) are stale; post-deploy verification
+ongoing via CF observability monitor.
+
+### Tests post-fix
+
+291 tests, all green. `LLMTierTests` updated to assert MemoryExtractor +
+StructuredGenerator + ScreenExtractor are at-least-medium tier (regression
+guard via `test_complexSchemaExtractors_areAtLeastMedium`).
+
+## Session 2026-05-28 — Meeting hallucinations RCA + strip wire-up + brand glossary
+
+### Problem (Confirmed by SwiftData query on production transcripts)
+
+User report: «много галлюцинаций именно с митингов». Direct query on
+`ZHISTORYITEM WHERE ZSOURCE='meeting'` for last 10 long meetings:
+
+- **14× `DimaTorzok`** in final dual-stream transcripts
+- `Субтитры сделал DimaTorzok`, `Субтитры создавал DimaTorzok`
+- `Продолжение следует...` at chunk boundaries
+- Brand mangle: «Бриво» (Brevo), «молчим» (MailChimp), «клот»/«Клод» (Claude),
+  «ОЛМ»/«LN » (LLM), «чат gpt» (ChatGPT), plus user-portfolio brands
+
+### Root cause (Confirmed by grep of strip call-sites)
+
+`TranscriptionCoordinator.stripHallucinationTokens` was called only from:
+- ✅ Dictation path (`TranscriptionCoordinator.transcribe`)
+- ✅ MeetingCoach live coach (`MeetingCoachService.process`)
+- ❌ Meeting chunked path (`AppDelegate.transcribeStreamChunked`) — gap
+- ❌ Meeting tail (`AppDelegate.assembleMeetingTranscriptFromLive`) — gap
+- ❌ Live partials going into final transcript (`LiveMeetingAdvisor.runChunk`) — gap
+
+`isAlwaysHallucination` returned `false` for chunks > 200 chars containing
+toxic tokens (DimaTorzok et al.), expecting the caller to call `strip`.
+Caller (meeting path) didn't.
+
+Additionally, `stripHallucinationTokens` regex covered only `subtitles by/от
+DimaTorzok` — Whisper actually emits Russian verb forms «сделал/создавал/
+делал/подогнал/писал/предоставил». And `Продолжение следует` lived only in
+`isHallucination` exact-match patterns (RMS<0.003 path).
+
+### Fix shipped
+
+1. **`HallucinationStripTests`** (NEW, 16 tests) — RED→GREEN coverage for
+   all verb-attribution variants + standalone YouTube boilerplate +
+   regression guards for real Russian words.
+2. **`TranscriptionCoordinator.stripHallucinationTokens` regex extended:**
+   - Verb-attribution forms (`сделал`/`создавал`/`делал`/`подогнал`/`писал`/
+     `предоставил`/`корректировал`/`написал`)
+   - Standalone `Продолжение следует` / `to be continued`
+   - YouTube boilerplate: `Подписывайтесь на канал` / `Please like and
+     subscribe` / `Спасибо за просмотр` / `Thanks for watching`
+3. **Strip wired into 3 meeting call-sites:**
+   - `AppDelegate.transcribeStreamChunked` — per-utterance + per-chunk fallback
+   - `AppDelegate.assembleMeetingTranscriptFromLive` — tail pass
+   - `LiveMeetingAdvisor.runChunk` — BEFORE storing in `collectedPartials`
+4. **`BrandGlossary.swift` (NEW)** — pure func with 32 public-brand /
+   acronym terms (Claude, ChatGPT, Anthropic, OpenAI, Gemini, Deepgram,
+   Groq, Cerebras, MailChimp, Mailerlite, Brevo, Klaviyo, Ahrefs, Semrush,
+   LLM, RAG, SEO, SERP, MCP, …). Two surfaces:
+   - `canonicalNames()` / `promptHint()` — biases ASR via initial_prompt
+     / keyterm
+   - `applyCorrections(_:)` — conservative post-replace for ONLY unambiguous
+     Cyrillic-mangle-of-Latin-brand cases (e.g. Бриво→Brevo). Real Russian
+     words («молчим», «клод») deliberately NOT auto-corrected. Per-user
+     portfolio names belong in `CorrectionDictionary` via Settings, not in
+     shipped source (open-source repo policy).
+5. **`BrandGlossaryTests`** (NEW, 10 tests).
+6. **Glossary wired into 4 transcribe sites** as `promptWords`:
+   `TranscriptionCoordinator.transcribe`, `AppDelegate.transcribeStreamChunked`,
+   `AppDelegate.assembleMeetingTranscriptFromLive`, `LiveMeetingAdvisor.runChunk`.
+7. **`applyCorrections` wired into 4 post-strip points.**
+8. **CF Worker `metawhisp-api` patched + redeployed:**
+   - `transcribeDeepgram(audioData, language, prompt, env)` — signature extended
+   - When `prompt` query param present, splits on `,`, dedupes, caps at 50
+     terms, forwards to Deepgram Nova-3 as `params.keyterm` array
+   - Backward-compat: missing `prompt` = no change
+   - Smoke test: 401 with proper JSON envelope on bad license
+   - Bindings preserved via `inherit` pattern for 7 secret_text bindings
+   - `__name` esbuild helper prepended (was missing in returned bundle)
+9. **Hot-swapped twice** — initial PID 22867 then re-hot-swap PID 24170 after
+   sanitizing comments per «no identifying names in code» policy.
+
+### Tests
+
+- Before: 244. After: 260 (+16 HallucinationStrip, +10 BrandGlossary). All green.
+
+### Files touched
+
+- `Services/System/TranscriptionCoordinator.swift` — regex extended; brand
+  glossary applied before user-dict correction
+- `Services/Processing/BrandGlossary.swift` — NEW
+- `Services/Intelligence/LiveMeetingAdvisor.swift` — strip + glossary wired
+- `App/AppDelegate.swift` — strip + glossary wired in 2 meeting paths
+- `Tests/MetaWhispTests/Services/System/HallucinationStripTests.swift` — NEW
+- `Tests/MetaWhispTests/Services/Processing/BrandGlossaryTests.swift` — NEW
+- CF Worker `metawhisp-api/index.js` (not in repo) — Deepgram keyterm forward
+
+### Follow-ups (chip spawned)
+
+- `Services/Export/ObsidianPath.swift` has 3 pre-existing docstring examples
+  using real portfolio names. Per CLAUDE.md «no identifying names» policy
+  these should be replaced with generic placeholders. Separate task to
+  handle without bloating the current change.
+
+### Verification path for user
+
+Hot-swap deployed (PID 24170). Worker re-deployed. Next real meeting
+should show:
+- 0 DimaTorzok / «Субтитры *» / «Продолжение следует» in final transcript
+- Better brand recognition for public brands (Brevo, MailChimp, Claude)
+  via Deepgram keyterm boost
+- Personal-portfolio brand mangles (own clients / colleagues) — these need
+  user to add their own Cyrillic-mangle → canonical mappings to their
+  CorrectionDictionary in Settings → Snippets (per «no identifying names
+  in shipped source» rule)
+
+### NOT done in this session (intentionally deferred)
+
+- `language=multi` on Deepgram is already default in worker (verified)
+- `diarize=true` server-side — separate concern, doesn't fix hallucinations
+- Pivot LiveMeetingAdvisor's mixed-audio chunk path to dual-stream — was a
+  hypothesis that turned out NOT to be the root cause; final dual-stream
+  path was already correct, just missing strip
+
+## Session 2026-05-20 night — Transcription 502 RCA + OpenAI fallback (ITER-043 unblocker)
+
+**Symptom:** user reported `PRO ❌ HTTP 502: {"error":"Transcription failed on all providers"}` on every Cmd-tap recording. Two patches over the day (60s timeout, then bindings sanity) didn't move the needle.
+
+### Root cause (verified via debug endpoint on the live worker)
+
+Both transcription providers in the Cloudflare proxy are dead at the **billing layer**, not the code layer:
+
+- **Deepgram Nova-3 (`@cf/deepgram/nova-3`)** → HTTP 429 from CF AI:
+  `"you have used up your daily free allocation of 10,000 neurons, please upgrade to Cloudflare's Workers Paid plan"`
+- **Groq `whisper-large-v3-turbo`** → HTTP 400 from Groq:
+  `"Organization has blocked API access because a spend alert threshold was met"`
+
+Worker did `try { Deepgram } catch { try { Groq } }` — both `catch` triggered → 502 in ~537 ms (not a timeout). The 12s/15s `setTimeout` I patched earlier was the wrong layer.
+
+### Fix shipped (worker, deployment `5cc62d3609b04b17a275737f0adafc50`)
+
+1. **Third fallback: OpenAI `whisper-1`** (key already in `env.OPENAI_API_KEY`). Order: Deepgram → Groq → OpenAI. Verified with a 12.3s recovery WAV — Russian text returned correctly.
+2. **Detailed 502 envelope** — `{"error": "...", "details": {"deepgram": "...", "groq": "...", "openai": "..."}}`. Future debugging no longer needs a separate route.
+3. **Per-provider gating** — fallback skipped if its env var is missing (`env.GROQ_API_KEY`, `env.OPENAI_API_KEY`).
+4. **Observability `head_sampling_rate: 1`** enabled on the worker.
+
+### Test scaffolding added
+
+- `scripts/test-transcribe-proxy.sh` — POSTs a WAV to `/api/pro/transcribe` with `MW_LICENSE_KEY` env var, asserts non-empty `text`. Exits 0/1/2/3/4 with distinct meanings. Default WAV = newest file in `~/Library/Application Support/MetaWhisp/Recovery/`. Failing-test-first proved the 502; same script will re-verify after billing fixes.
+
+### Action items for user (NOT code, billing)
+
+- **Cloudflare Workers Paid plan** ($5/mo) — unlocks Workers AI past 10k neurons/day, restores Deepgram as primary.
+- **Groq billing** (https://console.groq.com/settings/billing) — clear/raise the spend alert. Without this, Insight + RealtimeReactor (which call Groq via the same proxy) keep returning HTTP 400.
+
+### Files touched
+
+- Cloudflare worker `metawhisp-api` (not in repo) — `index.js` reuploaded twice via CF API; clean state in `/tmp/index.js` (~51 kB).
+- `scripts/test-transcribe-proxy.sh` (new, executable).
+- `specs/WAL.md` (this entry).
+
+### TODO
+
+- Wait for user to clear Groq alert and/or upgrade CF Workers — re-run `scripts/test-transcribe-proxy.sh` to confirm Deepgram returns first (faster + cheaper than OpenAI).
+- Consider rate-of-fallback alerting: if `provider !== "deepgram"` for >N requests in a row, surface a warning in the app.
+
+### Follow-up same session — LLM proxy fallback (Insight/Reactor unblocker)
+
+After the transcription fix landed, `[Insight]` and `[RealtimeReactor]` kept
+hitting Groq directly (3 LLM routes: `/api/pro/process`, `/api/pro/advice`,
+`/api/pro/chat-with-tools`) and returning `HTTP 400` because of the same Groq
+spend alert. Mirrored the transcription pattern:
+
+- Extracted `runChatCompletion(env, body)` helper — Groq primary, Cerebras
+  fallback (`env.CEREBRAS_API_KEY` already bound). Model name normalised:
+  `llama-3.3-70b-versatile` → `llama-3.3-70b` for Cerebras.
+- Replaced the 3 inline Groq fetches with helper calls.
+- Same 502+`details` envelope for all-fail.
+- Deployment `a260127074db4147894e19222952a26b`. Verified live: at 23:41:22 a
+  Cerebras-served Insight surfaced (`✅ surfacing: Set usage alert below $30 (conf=0.85)`).
+
+Documented the chain in `specs/PROVIDERS.md` (new). Rule for future edits:
+do not swap or remove providers without updating the doc and rerunning
+`scripts/test-transcribe-proxy.sh`.
+
+---
+
+## Session 2026-05-13 evening (ITER-039 Phase 4 inference — crash debug in progress)
+
+**Resume in morning with:** read `~/Library/Logs/MetaWhisp.log` — last `[ITER-039 trace]` line shows latest crash point. Phi-4 Mini downloaded at `~/Documents/huggingface/models/mlx-community/Phi-4-mini-instruct-4bit/` (~2.1 GB on disk).
+
+### Diagnosed today (verified working)
+
+- **Window-Space throw bug** — fixed by restoring `[.moveToActiveSpace, .fullScreenAuxiliary]` on `MainWindowController.windowBehavior` + same on `RecordingOverlay`. User confirmed «не перекидывает». Memory note added to `~/.claude/projects/-Users-android-Code-MetaWhisp/memory/feedback_window_space_throw_bug.md`.
+- **Snippets UX** — click-to-copy on tags + `LOAD DEFAULTS` button for Snippets tab seeds 17 RU+EN preset triggers (моя почта · мой LinkedIn · my email · my phone …) as empty templates. Tap an empty preset → pre-fills Add form. Filled snippets copy expansion to clipboard with «✓ copied» flash. `apply(...)` skips empty values so unfilled presets don't clobber transcription.
+- **Trimmed AI Models catalog** to 2 cards (Phi-4 Mini + Apple Foundation Models). Other 3 deferred to v1.4+ — `Services/LLM/ModelRegistry.swift` has the entries in a comment block for restore.
+- **Routing indicator** — always-visible banner at top of AI Models section: `● CLOUD Cerebras Qwen 3 235B via Pro proxy` (current state) / `● LOCAL Phi-4 Mini on M4 Max` (once activated) / `● LOADING warming up...` / `● INACTIVE`.
+- **Download path** complete (Hub-based, disk + RAM precheck, retry-with-backoff, Cancel/Delete buttons, background-safe). User successfully downloaded Phi-4 Mini.
+
+### BLOCKER for tomorrow — Phi3Model init crash
+
+User reports «крашится при включении локальной модели». Repro:
+1. Settings → AI Models → Phi-4 Mini → press **Make active**
+2. App SIGKILLs ~1-3 seconds later
+3. macOS auto-relaunches; previous attempts looped (now mitigated — auto-load on launch is disabled, see `App/AppDelegate.swift:201`)
+
+**Pinpoint:** added `[ITER-039 trace]` NSLogs at every stage. Last successful trace before crash:
+```
+[ITER-039 trace] step 0 — entered performHeavyLoad on thread background ✓
+[ITER-039 trace] step 1 — config decoded (vocab=200064, layers=32, heads=24/8, headDim=128, ropeDim=96, isQuantized=yes)
+[ITER-039 trace] step 2a — building Phi3Model
+```
+No `step 2b — Phi3Model built` log. **Crash is INSIDE `Phi3Model(phiConfig)` init**, NOT inside `quantize()` / `update()` / `eval()`.
+
+**Suspected cause (current fix, untested overnight):** the vendored `SuScaledRotaryEmbedding` in `Services/LLM/Vendored/MLXSupport.swift` extends `Module` and stores `invFreq: MLXArray` as a non-`@ModuleInfo` property. mlx-swift's Module-introspection at init time may mis-classify it as a learnable parameter and fail. **Workaround applied 2026-05-13 02:08:** in `Services/LLM/Vendored/Phi3.swift`, ignore `ropeScaling.type == "longrope"` and always fall back to MLXNN's stock `RoPE`. Trade-off: long-context (>4k tokens) quality degrades; short prompts work identically. Build + hot-swap pending verification.
+
+### If fallback doesn't fix the crash (morning checklist)
+
+In order of cost:
+1. Read `~/Library/Logs/MetaWhisp.log` for fresh trace lines — narrows down which property of Phi3Model is crashing.
+2. Try `bash audit-daily.sh` first per the daily-audit memory rule.
+3. If still crashing at `Phi3Model(phiConfig)`: pare down further — instantiate just 1 layer instead of 32, see if it lives.
+4. If init succeeds but `eval(model)` crashes: weight name mismatch — print mismatched keys via `model.parameters()` vs the `weights: [String: MLXArray]` we loaded.
+5. If all stages succeed but generation produces garbage: check tokenizer chat template vs Phi-4's `<|im_start|>user\n...<|im_end|>` framing (it's NOT Phi-3's `<|user|>...<|end|>`).
+6. Nuclear option: ditch Phi-4-mini-instruct-4bit and ship `mlx-community/Phi-3-mini-4k-instruct-4bit` instead — simpler config (no longrope, no GQA), proven to work with vendored Phi3.swift.
+
+### Files in flux (uncommitted)
+
+- `Package.swift` (mlx-swift + swift-transformers explicit + MLXFast)
+- `App/AppDelegate.swift` (auto-load disabled comment)
+- `Services/LLM/LocalLLMService.swift` (real loadModel/generate + Task.detached + trace logs)
+- `Services/LLM/MLXModelManager.swift` (full download infra)
+- `Services/LLM/ModelRegistry.swift` (2-card catalog + macOSName helper)
+- `Services/LLM/Vendored/Phi3.swift` (MIT, longrope→RoPE fallback applied)
+- `Services/LLM/Vendored/MLXSupport.swift` (KVCache + RoPE helpers + LLMModel/LoRA stubs — likely buggy, under investigation)
+- `Services/Intelligence/StructuredGenerator.swift` (Local→Pro→BYOK priority order, `callLocalLLM` helper)
+- `Services/Processing/CorrectionDictionary.swift` (defaultSnippetPresets + loadDefaultSnippets + allow empty values)
+- `Services/System/SystemSpecs.swift` (chip/RAM/macOS snapshot)
+- `Views/Windows/MainSettingsView.swift` (collapsable AI Models + 2-col cards + routing indicator + Cancel/Delete + click-to-copy + tap-to-fill)
+- `Views/Windows/MainWindowController.swift` (windowBehavior restored to `.moveToActiveSpace + .fullScreenAuxiliary`)
+- `Views/Windows/MainWindowView.swift` (`@ObservedObject` for LocalLLMService + 6-state footer pip)
+- `Views/Components/RecordingOverlay.swift` (+`.fullScreenAuxiliary`)
+
+## Session 2026-05-13 (ITER-039 local-LLM — Phase 1 UI + Phase 2 download infrastructure)
+
+**Branch:** `architecture-phase-1-3` (uncommitted; build + hot-swap green; v1.3.5 not yet cut).
+
+### Done this session
+
+- ✅ **Audit:** full state-of-the-feature pass (see agent report transcript). Verdict: download path complete, inference + service wire-up not started.
+- ✅ **Phase 1 UI redesign** (per user feedback): collapsable `aiModelsSection` (toggle OFF → only summary line; toggle ON → expands), 2-column compact cards, removed RU-language emphasis, macOS Tahoe naming clarified in Foundation Models error. Hot-swapped + user-verified visually.
+- ✅ **Package.swift deps:** bare `mlx-swift` (tensor framework only, no transformers dep) + explicit `swift-transformers` at 1.1.6 (matches WhisperKit's transitive resolution at 1.1.9 → no conflict). Earlier attempt with `mlx-swift-examples main` failed: WhisperKit 0.16.0 needs `swift-transformers 1.1.x`, every `mlx-swift-examples` tag pins 0.1.x / 1.0.x / 1.3.x — never overlaps. Diagnosed + reverted, current resolution clean.
+- ✅ **MLXModelManager** (full Hub-based download path):
+  - Disk-space precheck (2× download size headroom) — throws `insufficientDiskSpace` with human-readable GB message
+  - Compatibility-verdict precheck — `incompatibleHost` if `ModelCompatibility.verdict` returns `.incompatible`
+  - Retry-with-backoff: 3 attempts at 2s/4s/8s on network failure; `retryAttempt` published for UI ("Retry 2/3")
+  - `cancelActiveDownload()` — kills in-flight Task; partial shards stay on disk (Hub resumes via ETag)
+  - `remove(_:)` — deletes weight directory; clears `downloadedIDs`
+  - Background-safe: download Task owned by singleton, survives Settings window close (app is menu-bar resident)
+- ✅ **MainSettingsView download UX:**
+  - Live `Download · 2.1 GB` button for Phi-4 Mini only (other MLX cards stay disabled with v1.4.0 tooltip)
+  - During download: progress label `53% · 1.2 MB`, `xmark.circle.fill` cancel button, "Retry N/3" sub-label when retrying
+  - After download: `Make active` button + trash icon (calls `removeDownloadedModel`)
+  - `lastError[spec.id]` surfaced inline below the Download button when present
+- ✅ **AppDelegate auto-load:** on `applicationDidFinishLaunching`, if `settings.localLLMEnabled && !settings.localLLMActiveModelID.isEmpty`, fires `LocalLLMService.shared.loadModel(id:)`. Currently no-ops because LocalLLMService is a stub (Phase 4) — but the hook is in place.
+- ✅ **LocalLLMService stub:** `isReady`, `currentModelID`, `loadModel(id:)`, `unloadModel()`, `generate(prompt:)` API surface defined. Placeholder `private final class ModelContainer {}` so file compiles standalone. All `throw .modelNotDownloaded` until Phase 4 lands the real Phi-3 architecture.
+
+### NOT DONE — open scope for next session(s)
+
+1. **Phase 4 — real inference (~3-4 hrs focused):** vendor `Phi3.swift` + needed `MLXLMCommon` helpers (`KVCache.swift`, `AttentionUtils.swift`, `SuScaledRotaryEmbedding`, `RopeScalingWithFactorArrays`) from `mlx-swift-examples 2.29.1` into `Services/LLM/Vendored/` (MIT-attributed). Implement `LocalLLMService.loadModel` (safetensors→MLX, tokenizer init) and `generate(prompt:) -> AsyncStream<String>` (real token loop). **Risk:** vendored Transformer code can produce garbage if tensor shapes / RoPE / attention-mask are off — needs careful smoke test against known prompt.
+
+2. **Phase 5 — service wire-up (~1 hr):** 11+ services with `hasLLMAccess` getters need third clause `|| LocalLLMService.shared.isReady`. Confirmed sites: `AdviceService.swift:43`, `MemoryExtractor.swift:503`, `DailySummaryService.swift:907`, plus `ChatService`, `StructuredGenerator`, `MeetingCoachService`, `LiveMeetingAdvisor`, indexing services. For each: also need to route the actual prompt through `LocalLLMService.generate` when no API key / no Pro is available.
+
+3. **Phase 5a — Foundation Models adapter (~1 hr):** `#if canImport(FoundationModels)` gated bridge over Apple's macOS 26+ `LanguageModelSession` API. Currently `loadModel("apple-foundation-models")` throws `.notSupportedYet`. User runs Sequoia so won't hit this path; ship the adapter for Tahoe users.
+
+4. **Phase 5b — footer pip (~15 min):** `MainWindowView.processingModeLabel` already has the `"local"` / `"on-device+local"` / `"on-device+local+cloud"` cases, but they fire from `settings.localLLMEnabled && !settings.localLLMActiveModelID.isEmpty`. Should also gate on `LocalLLMService.shared.isReady` so the pip reflects whether the model is actually loaded (not just configured).
+
+5. **Phase 6 — smoke test + commit + v1.3.5 release:** real prompt → real output via Phi-4 Mini; then build.sh + notarize + DMG + GitHub Release + `website/src/appcast.xml` update + appcast pivot to GitHub raw (per `memory/state_appcast_stale_since_1_3_3.md`).
+
+### Pending fixes from prior sessions (still on branch, separate from ITER-039)
+
+The 9 fixes from earlier rounds — shadow envelopes (4 floating views), meeting overrun cards, call-detection cooldown, SF Symbol fix, hallucination strip, StructuredGen backfill cost-control, project picker, etc. — all on this same `architecture-phase-1-3` branch and ship with v1.3.5. Need to verify nothing regressed during today's `MainSettingsView` edits before tagging.
+
+### Files touched today
+
+- `Package.swift` (mlx-swift + swift-transformers deps)
+- `Models/AppSettings.swift` (already had `localLLMEnabled_iter039` + `localLLMActiveModelID_iter039`)
+- `Services/System/SystemSpecs.swift` (chip / RAM / macOS snapshot)
+- `Services/LLM/ModelRegistry.swift` (5 model catalog + `CompatibilityVerdict` + `macOSName` helper)
+- `Services/LLM/LocalLLMService.swift` (stub w/ placeholder `ModelContainer`)
+- `Services/LLM/MLXModelManager.swift` (full Hub-based download with retry/precheck/cancel/remove)
+- `Views/Windows/MainWindowView.swift` (6-state footer pip — doesn't yet gate on isReady)
+- `Views/Windows/MainSettingsView.swift` (collapsable section, 2-col cards, live Phi-4 Download)
+- `App/AppDelegate.swift` (auto-load on launch hook)
+
+### Resume next session with
+
+Open `specs/iterations/ITER-039-local-llm.md`, jump to Step 4 (Phase 4 — real inference). Vendor `Phi3.swift` + helpers from `mlx-swift-examples 2.29.1`. Add `Services/LLM/Vendored/` directory with MIT attribution headers. Then wire `LocalLLMService.loadModel` to call `LLMModelFactory.shared.loadContainer(directory: MLXModelManager.shared.localPath(for: spec))`. First smoke test target: `mlx-community/Phi-4-mini-instruct-4bit` from a clean download.
+
+## Released v1.3.3 — 2026-05-10 (proactive insights + privacy + history scrub)
+
+**Status: SHIPPED via:**
+- ✅ GitHub Release [v1.3.3](https://github.com/metawhisp/metawhisp/releases/tag/v1.3.3) (DMG `MetaWhisp.dmg`, 9890157 bytes, edSig `Z1/sraXPAh3ncaB8VG35c81yhL4XR4fedAg1ubPYvCI1h6lkpS3jXcXwzfDdXbID5hw475/yha6PZroPaJGlCQ==`)
+- ✅ Cloudflare Page Rule still routes `metawhisp.com/downloads/MetaWhisp.dmg` → `releases/latest/download/MetaWhisp.dmg` → v1.3.3 ✅
+- ✅ Repo visibility flipped public (was accidentally private — broke download chain until 2026-05-09 23:20)
+- ✅ Old broken releases v1.3.1 + v1.3.2 deleted (their tags pointed to dead SHAs after filter-repo)
+- ✅ Source committed + force-pushed to `metawhisp/metawhisp` main, all author lines = `MetaWhisp Maintainer <maintainer@metawhisp.com>` after `git filter-repo --replace-text + --mailmap` rewrite
+- ✅ Public github.com search returns 0 hits for previously-leaking author / project / org identifiers and Stripe `sk_live` keys that were in old WAL.md commits
+- ✅ Marketing site rolled back to deployment `199df86e` (recovers 13 blog posts)
+
+**Build pipeline fix (this session):**
+- `build.sh` SIGN_IDENTITY now resolves cert by SHA-1 hash via team ID `6D6948Z4MW` (privacy-safe — keychain cert legal name doesn't leak into committed source)
+
+**KNOWN BROKEN — existing 1.3.x users (Sparkle auto-update):**
+- Live `metawhisp.com/appcast.xml` advertises v1.3.2 with edSignature for the OLD (now-deleted) v1.3.2 DMG → Sparkle either no-prompts (because installed >= advertised) or sig-mismatches on download → silent failure
+- New users via website Download button get clean v1.3.3. Existing 1.3.x users stuck on whatever they have.
+- **MUST FIX at next release** (1.3.4): pivot appcast off Cloudflare Pages onto GitHub raw via Page Rule `metawhisp.com/appcast.xml` → `raw.githubusercontent.com/metawhisp/metawhisp/main/appcast.xml`. Then every future release just updates the committed `appcast.xml`. Detail in `memory/state_appcast_stale_since_1_3_3.md`.
+
+**ITER-027 v1 shipped in this build:**
+- Replaced cosine-retrieval `ProactiveContextService` (which surfaced lists of fake-titled meetings) with `InsightAssistantService` LLM extraction — one specific insight per tick or nothing.
+- New pure functions + RED-then-GREEN tests: `InsightPrompts`, `InsightOutputParser`, `InsightDedupChecker`, `WindowTitleNormalizer`, `ActivitySummaryBuilder`, `InsightStorage`, `BackToBackTransition`, `ConversationTitleResolver`, `Levenshtein`, etc. Full suite green 155/155.
+- Confidence threshold default 0.75, cooldown unchanged. Pro-only feature; no-op for free tier.
+- Future ITER-027.6: vision call + 2-phase SQL tool loop = full reference parity. Backlogged.
 
 ## Released v1.3.2 — 2026-05-09 02:30 GMT+3
 
@@ -94,14 +789,14 @@ User report 2026-05-08: dictations + meetings hit the 1800-min cumulative cap on
 
 ### Why a follow-up: HallucinatedName regression
 
-Auto-merge from morning ITER-032 ship absorbed `ExampleProject.ai`, `ExampleProject`, `Example Project` under `HallucinatedName` (LLM hallucination from a single past session). Lev distance between `atomicbata` ↔ `atomicbot` is 2 with shared length ≥ 5, so the rule fired — but the WINNER was the garbage variant because winner-pick was by `aliases.count`, not conversation count or "name quality". Same risk would exist for every shipped user. User explicitly: «HallucinatedName — такого проекта нет, ты почему контекст не читаешь». Right call.
+Auto-merge from morning ITER-032 ship absorbed `ExampleProject.ai`, `ExampleProject`, `Example Project` under `HallucinatedName` (LLM hallucination from a single past session). Lev distance between `acmebata` ↔ `acmebot` is 2 with shared length ≥ 5, so the rule fired — but the WINNER was the garbage variant because winner-pick was by `aliases.count`, not conversation count or "name quality". Same risk would exist for every shipped user. User explicitly: «HallucinatedName — такого проекта нет, ты почему контекст не читаешь». Right call.
 
 ### ITER-032.1 fix
 
 - **`Services/Intelligence/ProjectClusterDecision.swift`** — Lev branch removed. Auto-merge now ONLY collapses canonical-equality (case fold + translit + emoji + punctuation + whitespace differences). Typo merges (`Island Expand` ↔ `Island Expend`) are NOT auto-decided — they go through user-approval UI. `Levenshtein.swift` retained (file + tests) for future LLM-curated cleanup pass / second-brain validation, but no longer wired into `canMerge`.
 - **Tests updated** in `Tests/MetaWhispTests/Services/Intelligence/ProjectClusterDecisionTests.swift`:
   - `test_singleTypo_isNotAutoMerged` — regression guard pinning typos to user-approval path
-  - `test_atomicBataNotMergedWithExampleProject` — explicit guard against the production false positive
+  - `test_hallucinatedAliasNotMergedWithExampleProject` — explicit guard against the production false positive
   - `test_punctuationOnly_merges` — uses `ChatApp.` ↔ `ChatApp,` (both canonicalize to `chatapp`)
 - **`Services/Intelligence/ExistingProjectCatalog.swift` (NEW, pure func, ~50 LOC)** — `promptHint(from:minCount:maxRows:)`. Builds an "EXISTING PROJECTS (use these EXACT names if conversation matches; do NOT invent variants like 'HallucinatedName' when 'Example Project' already exists)" block listing canonical names + conv counts, sorted desc, capped at 30 rows. Singletons excluded by default (convCount ≥ 2). 5 RED→GREEN tests in `ExistingProjectCatalogTests.swift`.
 - **`Services/Intelligence/StructuredGenerator.swift`** — `buildPrompt(transcript:startedAt:)` now also fetches established canonicals via `projectAggregator?.listProjects(includeSingletons: false)` and embeds the catalog hint into the user prompt. Empty-string fallback when no projectAggregator wired or no qualifying projects. ~15 LOC. Effect: LLM sees user's real project list with conv counts → reuses exact names instead of inventing variants. Stops the bleed for future conversations.
@@ -121,7 +816,7 @@ Auto-merge from morning ITER-032 ship absorbed `ExampleProject.ai`, `ExampleProj
 
 ### ITER-032 — Projects auto-merge on creation + curative pass + display threshold
 
-User report 2026-05-08: «у меня в проектах какая-то грязь — ~52 alias rows, реально проектов десяток. Голосок/VoiceSnack дублируется, Island/Island Expand/Island Expend (typo), Atomic-zoo. Нужно чтобы он сам анализировал и адаптировал — мы же делаем второй мозг.» Pre-fix `ProjectAggregator.resolveCanonical` did `localizedCaseInsensitiveCompare` only — no transliteration, no typo tolerance, no length/digit guards. Every LLM-hallucinated variant became a new alias row.
+User report 2026-05-08: «у меня в проектах какая-то грязь — ~52 alias rows, реально проектов десяток. Голосок/VoiceSnack дублируется, Island/Island Expand/Island Expend (typo), Acme-zoo. Нужно чтобы он сам анализировал и адаптировал — мы же делаем второй мозг.» Pre-fix `ProjectAggregator.resolveCanonical` did `localizedCaseInsensitiveCompare` only — no transliteration, no typo tolerance, no length/digit guards. Every LLM-hallucinated variant became a new alias row.
 
 - **`Services/Intelligence/ProjectAliasNormalizer.swift` (NEW, ~30 LOC)** — pure func `canonicalize(_:) -> String`. Pipeline: Apple's `.toLatin` ICU transliteration (`Голосок → Golosok`, `й → j`, `ц → c`) → lowercase → strip non-alphanumeric except space → collapse whitespace → trim. Original variant preserved unchanged in `ProjectAlias.aliasesJSON`; canonical is comparison-only.
 - **`Services/Intelligence/Levenshtein.swift` (NEW, ~35 LOC)** — Wagner-Fischer minimum edit distance, single-row DP (O(m·n) time, O(n) space). Symmetric. Used for typo tolerance in cluster decision.
@@ -518,7 +1213,7 @@ PIDs walked: 27515 → 29604 → 32180 → 36834 → 37195 → 39404 → **47365
 ### Open / next session
 - DailySummaryService.tasksCompleted always returns 0 — not picking up `TaskItem.completedAt`. Separate root-cause hunt.
 - ScreenContext call detection latency — currently 30s polling tick. Enhancement: subscribe to `NSWorkspace.didActivateApplicationNotification` for instant detect on app focus change.
-- ProjectAggregator clutter — 52 alias rows of which 46 are 1-conv noise (Голосок/VoiceSnack dup, Island/Island Expand/Island Expend typos, Atomic-zoo). Plan: threshold ≥2 conv before showing in Projects view + delete-button per row.
+- ProjectAggregator clutter — 52 alias rows of which 46 are 1-conv noise (Голосок/VoiceSnack dup, Island/Island Expand/Island Expend typos, Acme-zoo). Plan: threshold ≥2 conv before showing in Projects view + delete-button per row.
 - Phase B chunk overlap (35s with 5s overlap, dedupe at merge boundary) — original Phase B plan, deprioritized while addressing user's bigger pain points. Revisit.
 - Phase C Deepgram streaming WebSocket — still budget-pending.
 
@@ -917,7 +1612,7 @@ Items addressed from 7-point reference-parity gap:
   - **Files touched:** `Views/Windows/TasksView.swift` (single function rewrite).
   - **Build:** clean. App rebuilt + signed + relaunched.
 - ITER-021.1 — Project deletion (2026-04-25):
-  - **Trigger:** user-reported «есть проекты которые не нужны и их не существует но я не могу поправить — надо добавить возможность удалять» on the Projects view (14 clusters including noise like "Microsoft Clarity", "Atomic", "DRUGENERATOR").
+  - **Trigger:** user-reported «есть проекты которые не нужны и их не существует но я не могу поправить — надо добавить возможность удалять» on the Projects view (14 clusters including noise like "Microsoft Clarity", "Acme", "ProjectGamma").
   - **Diagnosis (Karpathy):** owner-layer = `ProjectAlias` row + raw `Conversation.primaryProject`. Two states must change atomically — alias gone AND linked conversations unlinked. Conversation rows themselves stay (transcript = user data, deleting a project ≠ deleting recordings).
   - **`Services/Intelligence/ProjectAggregator.swift`:** new `deleteProject(canonicalName:) -> Int` method:
     1. Find `ProjectAlias` by canonical name (returns 0 if already gone — idempotent).
@@ -1326,7 +2021,7 @@ Items addressed from 7-point reference-parity gap:
 - [meeting-timer-fix]: заменил `Timer.publish` на `TimelineView` — не ресетится от re-render из-за audioLevel updates
 - [permission-ux-fix]: убрал авто-открытие System Settings при permission denial — steals focus и закрывает popover. Теперь error banner кликабельный → пользователь сам открывает Settings. Логи: `[SystemAudio] No Screen Recording permission — requesting...` → `[Permissions] ScreenCaptureKit: The user declined TCCs...` → раньше popover закрывался молча. Теперь остаётся открытым с красным бэннером.
 - [appdelegate-shared-fix]: EXTRACT NOW / GENERATE NOW падали с "SwiftUI context issue" — `NSApp.delegate as? AppDelegate` runtime-cast failed (SwiftUI @NSApplicationDelegateAdaptor бриджит через Obj-C protocol, dynamic cast не проходит). Fix: `AppDelegate.shared` weak static, устанавливается в `applicationDidFinishLaunching`. MemoriesView + InsightsView теперь берут ссылку через него. Лог подтверждения в `~/Library/Logs/MetaWhisp.log`: `[InsightsView] ❌ AppDelegate cast failed. NSApp.delegate class = Optional<NSApplicationDelegate>` (до fix).
-- [developer-id-signing]: `build.sh` теперь подписывает всё под `Developer ID Application: Alex Dyuzhov (6D6948Z4MW)` вместо ad-hoc. Sparkle nested binaries (XPCServices, Autoupdate, Updater.app, Sparkle) подписываются снизу вверх с `--preserve-metadata=identifier,entitlements,flags` чтобы сохранить `org.sparkle-project.*` identifier. Hardened runtime (`--options runtime`) включён. Fallback на ad-hoc если cert отсутствует (CI). **Эффект:** TeamIdentifier стабилен (6D6948Z4MW) между rebuild'ами → TCC больше не сбрасывается, weekly-reprompt больше не триггерится. **Одноразовая боль:** при переходе с ad-hoc на Developer ID system-wide TCC помнит старый "deny" для Screen Recording → dialog не появляется. Решение один раз: System Settings → Privacy → Screen Recording → добавить через `+`. После этого grant прилип к Developer ID sig, rebuild не сбрасывает.
+- [developer-id-signing]: `build.sh` теперь подписывает всё под `Developer ID Application: <name> (6D6948Z4MW)` вместо ad-hoc. Sparkle nested binaries (XPCServices, Autoupdate, Updater.app, Sparkle) подписываются снизу вверх с `--preserve-metadata=identifier,entitlements,flags` чтобы сохранить `org.sparkle-project.*` identifier. Hardened runtime (`--options runtime`) включён. Fallback на ad-hoc если cert отсутствует (CI). **Эффект:** TeamIdentifier стабилен (6D6948Z4MW) между rebuild'ами → TCC больше не сбрасывается, weekly-reprompt больше не триггерится. **Одноразовая боль:** при переходе с ad-hoc на Developer ID system-wide TCC помнит старый "deny" для Screen Recording → dialog не появляется. Решение один раз: System Settings → Privacy → Screen Recording → добавить через `+`. После этого grant прилип к Developer ID sig, rebuild не сбрасывает.
 - [b1-tasks-parity]: Advice→Tasks implemented . Новый `TaskItem` model + `TaskExtractor` service копирует `extract_action_items` (`backend/utils/llm/conversation_processing.py:301`). Trigger: voice transcription ≥20 chars (mirror memory trigger). Prompt: copied verbatim 345-540, удалены sections про Speaker 0/1/2 и CalendarMeetingContext (single-user adaptation). 2-day dedup window, future-only due_at parsing. UI: Insights → Tasks section с checkbox + due badges (TODAY/TOMORROW/OVERDUE). `AdviceService.startPeriodicAdvice` полностью отключён. `AdviceItem` records остаются в БД (138 шт) но скрыты от UI. Build green. Awaiting user verification scenarios (see BACKLOG#B1).
 - [ITER-003§screen-aware-intelligence]: дал intelligence-сервисам доступ к screen OCR. **Проблема:** `ScreenContext` пишется каждые 30с (778+ строк) но `ChatService` не читал вообще, `MemoryExtractor`/`TaskExtractor` читали только metadata (appName/windowTitle), не OCR — надиктовал "купи это" → task без контекста. **Изменения:** (1) `ChatService` — `+weak var screenContext`, `+fetchScreenContextLast24h(limit:30, maxCharsPerSnippet:200)` → новый блок `<recent_screen_activity>` в промпте после `<pending_tasks>` (cap ~6KB). System prompt обновлён: "consult <recent_screen_activity>… do NOT invent details OCR doesn't contain". (2) `MemoryExtractor` + `TaskExtractor` — в `buildPrompt` splice `<on_screen_right_now app="" window="">` (≤500 chars, latest snapshot only). Prompts обновлены: "USE ONLY to resolve ambiguous references (this/that). DO NOT extract from screen alone — voice is source of truth". Пример: voice "remind me to order this" + OCR "iPhone 15 Pro Max" → task "Order iPhone 15 Pro Max". (3) `AppDelegate.setupServices` — `chatService.screenContext = screenContext` after configure. (4) `DashboardView` — new `ScreenActivityCard` subview (`@Query<ScreenObservation>` last 24h → group by appName → sum durations → top-5 tiles с durationLabel "3h 12m"). Empty state "No screen activity yet. Enable Screen Context in Settings." **Cost guard:** 30×200=6KB в chat prompt (в пределах 24KB cap); 500 chars в memory/task — почти бесплатно. Privacy: blacklist (Passwords/1Password) уже enforced в `ScreenContextService` → в промпты не попадёт. **Не сделано (отдельные треки):** realtime per-window-change extraction (гэп #3), embeddings (гэп #4), retention (#5), video chunks (#6). **Файлы:** `Services/Intelligence/ChatService.swift`, `Services/Intelligence/MemoryExtractor.swift`, `Services/Intelligence/TaskExtractor.swift`, `App/AppDelegate.swift`, `Views/Windows/DashboardView.swift`. Build green (2.81s). Spec: `specs/iterations/ITER-003-screen-aware-intelligence.md`. Awaiting live verify.
 - [ITER-002§arc-meet-fix]: **Baseline ITER-002 shipped to source, user reported "не записываются звонки".** Diagnostic показал 2 RC: (RC1 primary) user запускал старый бинарь Apr 19 22:32 до ITER-002 — нужен `./build.sh`. (RC2) логи раскрыли Arc edge case — Arc window title для Google Meet = **только room code** ("gpq-mmkq-iaz"), без строки "Google Meet" → keyword lookup fails. Reference тоже этот case не ловит. **Fix:** добавил `meetRoomCodeRegex` (`^[a-z]{3}-[a-z]{3,4}-[a-z]{3}$`) как fallback в `SystemAudioCaptureService.detectCallContext` когда app is browser и keyword-match fail. Formato room code стабильный (Google Meet всегда 3-{3,4}-3 lowercase). Build green. Awaiting rebuild + test.
@@ -1406,3 +2101,272 @@ User предпочитает продуктовые фичи > infrastructure p
 - НЕ ЛОМАЙ существующий обычный pipeline (Right ⌘ → mic → clipboard) — основной flow пользователя
 - НЕ ДОБАВЛЯЙ sudo в build scripts — блокирует rebuild из-за root-owned файлов
 - НЕ городи архитектуру на будущее (Karpathy Simplicity First) — только то что нужно для текущей задачи
+
+---
+
+## v1.3.4 SHIP (2026-05-12)
+
+**Released:** https://github.com/metawhisp/metawhisp/releases/tag/v1.3.4 + live appcast at https://metawhisp.com/appcast.xml
+
+### Client fixes (10)
+
+- **Composing whitelist removed** (`ProactiveContextService`): LLM + blacklist are the content filter. Daily insight surfacing went from ~1/14 days → 32+/day measured on user data.
+- **InsightOutputParser markdown strip**: ```json wrappers now removed before JSONSerialization. 99% of pipeline outputs previously parse-errored silently.
+- **CalendarEndStopDecision** ITER-034.1: sliding-window guards (`recentAudioActive` 30s + `meetingAppVisible` 60s for Zoom/Meet/Teams/FaceTime/Webex/Discord/Slack-huddle). Meetings no longer auto-stop mid-discussion at calendar boundary.
+- **MeetingRecorder**: exposed `hasBeenContinuouslyQuiet(forAtLeast:)` for the new guards.
+- **MainWindowController**: hide-on-close via `windowShouldClose → orderOut` + `NSWindowDelegate`. Eliminates Space-flicker. Window unbinds from Space when hidden, reopens on user's current Space cleanly.
+- **MainWindowView**: live status pips (on-device / cloud / on-device+cloud + free/pro) driven by @ObservedObject settings + license.
+- **AppDelegate** ITER-034.3: auto-promote `processingMode "raw" → "structured"` on first launch for Pro users (was hidden in Settings → users didn't know to flip it).
+- **AppDelegate** ITER-034.2: `cleanupStaleRecoveryWavs()` prunes Recovery/*.wav older than 7 days at launch.
+- **AppSettings**: `didAutoPromoteProcessingMode` flag for ITER-034.3.
+- **DictionaryView**: dropped hardcoded `.colorScheme(.dark)` on TextField — now follows system theme.
+
+### Tests
+- +3 InsightOutputParserTests for markdown-wrapper stripping.
+- +4 CalendarEndStopDecisionTests for sliding-window + meeting-app visibility guards.
+- 162 total, all green.
+
+### Tooling
+- `audit-daily.sh`: DB activity / log markers / insight pipeline / recovery / crashes / RSS. Run at session start to catch regressions.
+
+### Server-side
+- `metawhisp-api` Worker (`handleProProcess`): hardened MANDATORY bullet rule for sequence markers («первое/во-первых», «secondly», etc), replaced em-dash examples with `•` for consistency. Llama-3.3-70b was rendering lists inline due to em-dash confusion.
+
+### Infrastructure
+- **CF Pages site repo** (`metawhisp/MetaWhisp.com`): added `eleventyConfig.addPassthroughCopy("src/appcast.xml")` to `.eleventy.js`. Appcast was in git since Mar 2026 but never reached `_site/` → Sparkle auto-update never worked. **First time auto-update actually functions.**
+- New CF API token: keychain `metawhisp-cf` (Edit Workers scope). Memory note saved.
+- New memory: `routine_daily_audit_session_start.md` + `reference_cloudflare_worker.md`.
+
+### Verification
+- ✓ `swift test` 162 green
+- ✓ DMG notarized, stapled, validated
+- ✓ Sparkle EdDSA signature verified
+- ✓ GitHub Release asset uploaded
+- ✓ `curl https://metawhisp.com/appcast.xml` returns valid Sparkle 2 XML with v1.3.4 entry
+
+### Known issues deferred to v1.3.5
+- ScreenExtractor parse errors ~10/day (different from InsightOutputParser fix, separate root cause).
+- Hardcoded color audit on `MainSettingsView` + `DictionaryView` Add button (Color.black on MW.idle / MW.elevated).
+- ITER-027.6 vision + 2-phase SQL pipeline (separate session, large scope).
+- Settings UI: make active mode pill more visually obvious (3 pills look identical, user mistook Raw for Structured).
+
+---
+
+## End-of-session marker (2026-05-12 ~01:15 local)
+
+**Today shipped:**
+- v1.3.4 live release (GitHub Release + DMG + appcast + Sparkle EdDSA sig)
+- Sparkle auto-update **впервые actually работает** since Mar 2026 site migration (Eleventy passthrough fix в `metawhisp.com` repo)
+- Worker `metawhisp-api` bullets prompt fix deployed
+- Auto-promote `processingMode → structured` для Pro юзеров
+- Window hide-on-close pattern (still has Space-binding artifact — see below)
+
+**Open bug for next session:**
+- **Window Space-switching artifact**: после моего `windowShouldClose → orderOut` reuse pattern, при subsequent open NSWindow может переключать Space (preferred Space binding не разрывается через orderOut). Юзер reported 2026-05-12 ~01:00. **Не починили в этой сессии — нужен fresh-window pattern (close = release, open = new NSWindow)**. v1.3.4.1 hotfix candidate.
+
+**Tomorrow's planned start — three new tracks, full specs ready:**
+
+1. **ITER-035 — Obsidian Vault Sync** — see `specs/iterations/ITER-035-obsidian-vault-sync.md`. 12-step checklist inside.
+2. **ITER-036 — RAG Lifetime Chat** — see `specs/iterations/ITER-036-rag-lifetime-chat.md`. 14-step checklist inside.
+3. **ITER-037 — MCP Server** — see `specs/iterations/ITER-037-mcp-server.md`. Option A first (≈zero coding, just docs after #1). Option B native MCP deferred.
+
+**Order:** 035 → 037 (Option A) → 036 — но Karpathy pick-one applies, juзер скажет утром с какого старт.
+
+**Open questions for user at start of tomorrow's session:**
+1. Window-bug fix v1.3.4.1 — сначала, или живём с багом пока пилим новые фичи?
+2. ITER-035: existing Obsidian vault или новый создаём? Path?
+3. ITER-035: file naming convention — timestamp-based `2026-05-12-21h05.md` или slug-based `first-5-words.md`? **Default в spec — гибрид: `YYYY-MM-DD--slug.md`**
+4. ITER-035: single file per entity vs daily-notes pattern? **Default в spec — per-entity (Obsidian convention)**
+
+**Session start protocol для завтра:**
+1. `bash audit-daily.sh` (per memory rule)
+2. Read this WAL section + 3 ITER specs
+3. Surface open questions above to user
+4. Wait for picks → start coding on chosen iteration
+
+
+---
+
+## End-of-session marker (2026-05-12 ~13:00 local)
+
+**ITER-035 v2 shipped** (commit dabe580 yesterday) — Obsidian vault sync with date-first / project-first layout. Live, hooks wired in 5 services + TasksView, settings UI bulk-export button.
+
+**ITER-037 Option A shipped** (commit 4a43923) — three integration setup docs (Claude Desktop / Cursor / ChatGPT) in `specs/integrations/` + Settings UI link buttons.
+
+**Today's UX + cost fix sweep (9 commits on `architecture-phase-1-3`):**
+- `5933bca` shadow envelope systematic fix (4 floating views)
+- `48323a2` meeting overrun card → `recordingOverrun` kind + silentExtend + 10-min guard
+- `101578a` CALL DETECTED 30-min per-app cooldown
+- `95629e9` SF Symbol detection via AppKit
+- `914afbf` recap header drops emoji icon + StructuredGen anti-hallucination prompt
+- `05d41fd` StructuredGen backfill cost-control (was burning $1+/day on infinite retry loop)
+- `86d0a6d` ConversationDetailView project picker (Menu w/ existing + new + clear)
+- `ab6d6ff` then `b6a3130` — hallucination filter: surgical strip of toxic tokens (DimaTorzok etc) instead of whole-text reject; lower bound 200 chars for «mention vs hallucination» split.
+
+**v1.3.4 still in GitHub Releases** — these 9 fixes are debug-only (user PID 49274). Next release = v1.3.5 with all of these. Appcast pivot already done — when v1.3.5 ships, `appcast.xml` gets a new entry and Sparkle picks it up automatically.
+
+**Audit cost picture (post-fix expected):**
+- llama-3.3-70b: $0.10-0.30/day (was $0.40-1.60 because backfill loop)
+- Whisper: <$0.05/day at user's usage volume
+
+**Open at end of session:**
+- ITER-036 RAG lifetime chat (entity index + temporal queries) — 3 days, untouched
+- Loosen Free/Pro gates (text-style, daily summary BYOK) — 30 min, optional
+- `build.sh` bundle `specs/integrations/*.md` into Resources/ so release-build setup-buttons resolve correctly — 15 min, optional
+- ITER-027.6 vision + 2-phase SQL for insights — multi-day, deferred
+- Backup bundle 4.9 MB cleanup — 1 min, housekeeping
+
+**User-facing smoke checklist** (next time user dictates / records meeting):
+- Project picker chip → click → menu opens with existing projects + «+ New» + «Clear»
+- Long dictation with Whisper hallucinated «DimaTorzok» mid-stream → token stripped, sentence intact, processed normally
+- Meeting overrun → first 10 min no card EVER; after that silentExtend if both audio+app active, notifyAndExtend otherwise
+- Screen recap card → no SF Symbol icon left of title, just title + meta
+- Stack-of-notifications shadows → no straight cut at edges
+
+**Session ends here.** No new background tasks armed. No memory notes added (existing `routine_daily_audit_session_start.md` + `reference_cloudflare_worker.md` still relevant).
+
+
+## Next session start: ITER-039 + v1.3.5 release
+
+User committed 2026-05-12 ~13:10: «давай для free-моделей добавим опцию
+скачать с huggingface супер-быструю модель» — local LLM для Free tier
+без Pro / без BYOK ключа. Then v1.3.5 release with all today's fixes
+shipped through Sparkle to existing users.
+
+### Plan
+
+1. **ITER-039 — Local LLM for Free tier** (~4-5 days)
+   - Tech: MLX Swift + `mlx-community/` models on HuggingFace
+   - Default model: Phi-4-mini-instruct AWQ-4bit MLX (2GB, 135 tok/s on M-series) — 2026 frontier replacement for Llama-3.2-3B
+   - Smaller alt for weak Macs: Gemma 4 E2B 4bit MLX (~1GB, 158 tok/s)
+   - Higher quality alt: Qwen 3 7B 4bit MLX (~4GB, 50 tok/s, best HumanEval under 8B)
+   - Phase 1: integrate MLX, model download UI, LocalLLMService, wire
+     into TextProcessor (Structured mode)
+   - Phase 2: wire into MemoryExtractor, TaskExtractor, ChatService
+   - Phase 3 (optional): macOS 26+ Foundation Models bypass — 0 MB,
+     built-in. Skip download entirely.
+
+2. **v1.3.5 release** (~30 min)
+   - Bump Info.plist 1.3.4 → 1.3.5
+   - `bash build.sh` → notarize → DMG
+   - `gh release create v1.3.5` + upload DMG
+   - Update src/appcast.xml in metawhisp/MetaWhisp.com repo
+   - Verify Sparkle auto-update to existing v1.3.4 users
+
+   Bundle 9 UX+cost fixes from today + ITER-035 v2 + ITER-037 Option A
+   + ITER-039 local LLM into the same release. Major version-worthy
+   bump but holding the minor («.5») because semver isn't user-facing
+   here.
+
+### Defaults set by Claude (user can override at start)
+
+- MLX model: Llama-3.2-3B-Instruct-4bit (vs Qwen2.5-3B alternative)
+- Phase order: Structured → Memory/Task/Chat → Foundation Models
+- Foundation Models bypass deferred to Phase 3, not blocking Phase 1+2
+
+### What to check before coding
+
+- `bash audit-daily.sh` (per session-start memory)
+- Confirm Groq spend over the past 24h has dropped → validates backfill
+  cost-control fix is working in production
+- Quick smoke of the 5-item checklist from prior WAL entry
+- Ask user if defaults above are OK before starting Phase 1
+
+### Open dependencies
+
+- `mlx-swift` Swift Package on https://github.com/ml-explore/mlx-swift
+  — add as dependency in Package.swift
+- Models download URLs from HuggingFace `mlx-community/Llama-3.2-3B-
+  Instruct-4bit` — need stable URL pattern for resume-on-fail downloads
+
+## 2026-frontier model picks (research update, 2026-05-12 ~13:25)
+
+Replaces prior Llama-3.2 recommendation after WebSearch on actual SOTA.
+
+| Tier | Model | DL | Speed | Quality | When |
+|------|-------|----|----|----|---------|
+| Default | Phi-4-mini-instruct AWQ-4bit | 2 GB | 135 tok/s | Excellent (Microsoft SOTA <4B) | M1+, 8 GB+ RAM |
+| Lightweight | Gemma 4 E2B 4bit | 1 GB | 158 tok/s | Good | Weak Macs / 8 GB |
+| Power | Qwen 3 7B 4bit | 4 GB | 50 tok/s | HumanEval 76.0, best <8B | 16 GB+ RAM |
+| Built-in | Apple Foundation Models | 0 GB | native | ~3B equivalent | macOS 26+ only |
+
+**Framework:** MLX. WWDC 2025 confirmed Apple's preferred LLM stack; Ollama
+switched to MLX on 2026-03-30. MLX gives 10-25% faster inference than
+llama.cpp on Apple Silicon for models < 14B. llama.cpp deprioritized.
+
+**Quantization:** AWQ-4bit (95% FP16 quality retention, +3pp vs GPTQ on MMLU).
+GGUF Q6_K acceptable but llama.cpp-tied. NVFP4 not Apple-relevant.
+
+**Russian-language priority:** Phi-4-mini + Qwen3 family beat Llama 3.x
+on Cyrillic. Important because user dictates in Russian.
+
+Sources verified May 12, 2026.
+
+
+## ITER-039 multi-model catalog (user request 2026-05-12 ~13:30)
+
+User wants: «давай предложим юзеру для скачивания несколько вариантов»
+— offer 4-5 models, user downloads multiple, evaluates side-by-side,
+picks favorite via Active switcher.
+
+### Real HF model IDs verified on huggingface.co/mlx-community
+
+```
+1. mlx-community/Phi-4-mini-instruct-4bit          (default)
+   3.8B • AWQ-4bit • ~2.2 GB DL • 3 GB RAM • 135 tok/s on M1
+   Microsoft SOTA <4B, multilingual incl. Russian
+
+2. mlx-community/gemma-4-e2b-it-4bit               (lightweight)
+   E2B effective • TurboQuant-MLX • ~1.5 GB DL • 5 GB RAM • 158 tok/s
+   Speed-priority, edge/mobile-class
+
+3. mlx-community/Qwen3-4B-Instruct-2507-4bit        (multilingual)
+   4B • AWQ-4bit • ~2.3 GB DL • 3 GB RAM • 80 tok/s
+   Best Russian via Alibaba multilingual training
+
+4. mlx-community/Qwen3-7B-Instruct-2507-4bit        (quality)
+   7B • AWQ-4bit • ~4.2 GB DL • 6 GB RAM • 50 tok/s
+   HumanEval 76.0 — best under 8B
+
+5. Apple Foundation Models                          (built-in)
+   ~3B equivalent • 0 MB • native • macOS 26+ only
+   Auto-selected when available, no download needed
+```
+
+### UX requirements for the Settings catalog
+
+- Per-card characteristics: params, size, RAM, speed, quality stars,
+  language support, recommended Mac/RAM tier, best-for tag.
+- Multi-download — user can download all 4 if they want, parallel
+  progress bars.
+- Single Active at a time — visible chip on the card («Active»).
+- Switch any time — model swap in-place, no app restart.
+- Delete — free disk space, keep other downloaded models.
+- **Test prompt button** — fixed input («во-первых купить молоко...»),
+  shows output + time, so user can side-by-side compare.
+
+### Architecture (re-confirmation)
+
+- `Services/LLM/ModelRegistry.swift` — static catalog with HF IDs +
+  characteristics struct.
+- `Services/LLM/MLXModelManager.swift` — download via URLSession +
+  resumable, store in `~/Library/Application Support/MetaWhisp/LocalLLM/<id>/`.
+- `Services/LLM/LocalLLMService.swift` — wrapper exposing `complete(...)`,
+  loads current Active model at startup, supports hot-swap on
+  `settings.localLLMActiveModelID` change.
+- `Models/AppSettings.swift` — `localLLMActiveModelID: String`,
+  `localLLMDownloadedModels: [String]` (or derived from filesystem).
+- `Views/Windows/MainSettingsView` — new AI MODELS section, card list.
+
+### TurboQuant note
+
+User mentioned «turbo quantum lx» — wasn't a thing I knew, but verified
+real: TurboQuant is a quantization method in MLX-vlm that delivers same
+accuracy as uncompressed baseline with ~4× less active memory + faster
+end-to-end. Applied to Gemma 4 E2B currently. Watch for spread to other
+mlx-community models.
+
+Sources verified May 12, 2026:
+- mlx-community on HF
+- Gemma 4 announcement / unsloth docs
+- localaimaster small-model 2026 guide

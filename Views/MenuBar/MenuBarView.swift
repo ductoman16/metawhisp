@@ -5,6 +5,7 @@ struct MenuBarView: View {
     @ObservedObject var recorder: AudioRecordingService
     @ObservedObject var meetingRecorder: MeetingRecorder
     @ObservedObject var screenContext: ScreenContextService
+    @ObservedObject var dailySummary: DailySummaryService
     @ObservedObject private var settings = AppSettings.shared
     var closePopover: () -> Void = {}
     var openMainWindow: () -> Void = {}
@@ -78,7 +79,7 @@ struct MenuBarView: View {
     private var statusDot: some View {
         switch coordinator.stage {
         case .idle:
-            PulsingDot(color: MW.idle, size: 7, period: 1.6)
+            PulsingDot(color: coordinator.canStartRecording ? MW.idle : MW.textMuted, size: 7, period: 1.6)
         case .recording:
             PulsingDot(color: MW.live, size: 7, period: 1.0)
         case .processing:
@@ -176,35 +177,57 @@ struct MenuBarView: View {
                 }
 
                 // Surface permission / setup errors so user knows why recording didn't start.
-                // Clickable — opens System Settings when error is about permissions.
+                // Clickable ONLY when the error names a pane to open.
                 if let err = meetingRecorder.lastError {
-                    Button {
-                        // If the error is about screen recording, open that pane directly.
-                        // Keyword match is crude but works for our known error strings.
-                        if err.lowercased().contains("screen recording") || err.contains("🎥") {
-                            PermissionsService.shared.openScreenRecordingSettings()
-                        } else if err.lowercased().contains("microphone") || err.contains("🎤") {
-                            PermissionsService.shared.openMicrophoneSettings()
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(err)
-                                .font(MW.monoSm).foregroundStyle(.red)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                    // Where this message goes when clicked, if anywhere. 🎤
+                    // marks a microphone-permission message and nothing else
+                    // (`MicOutageReport`, pinned by its tests); the bare word
+                    // "microphone" used to qualify, which sent a dead device
+                    // and a recovered outage to the Privacy pane
+                    // (independent review, v20). A message that goes nowhere
+                    // is plain text: an arrow that does nothing is a lie
+                    // (v21).
+                    let pane = errorSettingsPane(err)
+                    let row = HStack(spacing: 4) {
+                        Text(err)
+                            .font(MW.monoSm).foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if pane != nil {
                             Image(systemName: "arrow.up.right.square")
                                 .font(.system(size: 9))
                                 .foregroundStyle(.red.opacity(0.7))
                         }
-                        .padding(.horizontal, MW.sp16).padding(.vertical, 4)
-                        .background(Color.red.opacity(0.08))
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, MW.sp16).padding(.vertical, 4)
+                    .background(Color.red.opacity(0.08))
+                    if let pane {
+                        Button {
+                            switch pane {
+                            case .screenRecording: PermissionsService.shared.openScreenRecordingSettings()
+                            case .microphone: PermissionsService.shared.openMicrophoneSettings()
+                            }
+                        } label: {
+                            row.contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        row
+                    }
                 }
 
                 // Warn if mic didn't join (user's voice won't be captured)
                 if meetingRecorder.isRecording && meetingRecorder.micOnlyMode {
                     Text("⚠️ Mic unavailable — only other participants will be captured")
+                        .font(MW.monoSm).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, MW.sp16).padding(.vertical, 4)
+                        .background(Color.orange.opacity(0.08))
+                }
+
+                // The mirror: recording went ahead without the other side
+                // rather than being thrown away.
+                if meetingRecorder.isRecording && meetingRecorder.systemAudioDown {
+                    Text("⚠️ Other participants' audio unavailable — recording your mic only")
                         .font(MW.monoSm).foregroundStyle(.orange)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, MW.sp16).padding(.vertical, 4)
@@ -321,6 +344,7 @@ struct MenuBarView: View {
                 Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(result.text, forType: .string)
+                    NSLog("[MetaWhisp] menu bar — copy pressed on last output (%d chars, %.1fs processing)", result.text.count, result.processingTime)
                     showCopied = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { showCopied = false }
                 } label: {
@@ -370,6 +394,7 @@ struct MenuBarView: View {
         HStack(spacing: 0) {
             Button {
                 coordinator.toggle()
+                NSLog("[MenuBar] RECORD/STOP button tapped")
             } label: {
                 controlBtn(
                     icon: coordinator.stage == .recording ? "stop.fill" : "mic.fill",
@@ -379,12 +404,13 @@ struct MenuBarView: View {
                 )
             }
             .buttonStyle(HoverButtonStyle())
-            .disabled(coordinator.stage == .processing || coordinator.stage == .postProcessing)
+            .disabled(coordinator.stage == .idle ? !coordinator.canStartRecording : coordinator.stage != .recording)
 
             Rectangle().fill(MW.border).frame(width: 0.5)
 
             Button {
                 coordinator.toggleWithTranslation()
+                NSLog("[MenuBar] TRANSLATE button tapped")
             } label: {
                 controlBtn(
                     icon: "globe",
@@ -394,7 +420,7 @@ struct MenuBarView: View {
                 )
             }
             .buttonStyle(HoverButtonStyle())
-            .disabled(coordinator.stage == .processing || coordinator.stage == .postProcessing)
+            .disabled(coordinator.stage == .idle ? !coordinator.canStartRecording : coordinator.stage != .recording)
         }
         .frame(height: 44)
         .overlay(Rectangle().fill(MW.border).frame(height: MW.hairline), alignment: .bottom)
@@ -426,6 +452,13 @@ struct MenuBarView: View {
 
     private var footer: some View {
         HStack(spacing: 4) {
+            // An INBOX button lived here for two days. It was added to solve
+            // "the popup never takes focus, so the Inbox has no keyboard
+            // route" — a real problem, answered in the wrong place and without
+            // being asked for. ⌘⌥O is the keyboard route now, the unread count
+            // beside the menu bar icon says when there is something to open,
+            // and the main window has always had the pane. Three ways in did
+            // not need a fourth crowding this footer.
             Button { openMainWindow() } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "gearshape").font(.system(size: 10, weight: .regular))
@@ -458,11 +491,21 @@ struct MenuBarView: View {
 
     private var statusLabel: String {
         switch coordinator.stage {
-        case .idle: "Ready"
+        case .idle: coordinator.idleStatusLabel
         case .recording: "Recording"
         case .processing: "Transcribing"
         case .postProcessing: coordinator.translateNext ? "Translating" : "Processing"
         }
+    }
+    /// The Settings pane an error message points at, or nil when it points
+    /// nowhere. Keyword matching stays crude on purpose — these are our own
+    /// strings — but the keywords are the ones the producers guarantee:
+    /// 🎥 / "screen recording" and 🎤.
+    private enum SettingsPane { case screenRecording, microphone }
+    private func errorSettingsPane(_ err: String) -> SettingsPane? {
+        if err.lowercased().contains("screen recording") || err.contains("🎥") { return .screenRecording }
+        if err.contains("🎤") { return .microphone }
+        return nil
     }
 }
 
@@ -744,4 +787,5 @@ struct AudioLevelBar: View {
         .background(Color.white.opacity(0.1))
         .cornerRadius(MW.spaceXs)
     }
+
 }

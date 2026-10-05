@@ -12,20 +12,32 @@ import SwiftData
 /// spec://BACKLOG#B1
 @MainActor
 final class TaskExtractor: ObservableObject {
+    /// ITER-041 — structured JSON action-item extraction on the cheapest tier.
+    // 2026-05-31 — bumped mini→medium. The 8B mini model ignored the nuanced
+    // EXCLUDE rules (esp. "work commands dictated to an AI/dev" — the #1 noise
+    // source) and over-extracted ~100 garbage tasks/day. medium follows the
+    // selective criteria far better, matching the other extractors already on it.
+    static let llmTier: LLMTier = .medium
+    static let llmServiceId: String = "TaskExtractor"
+
     @Published var isRunning = false
     @Published var lastRun: Date?
     @Published var lastError: String?
 
     private let llm = OpenAIService()
     private let settings = AppSettings.shared
-    private weak var screenContext: ScreenContextService?
     private var modelContainer: ModelContainer?
+
+    /// SB-1 — durable queue of conversations awaiting extraction. Replaces the
+    /// silent `guard !isRunning` drop and survives relaunch (startup backfill).
+    private let queue = ExtractionQueueStore(filename: "task-extraction-queue.json")
 
     /// 2-day dedup window for action items.
     private let dedupWindowDays: Int = 2
 
-    func configure(screenContext: ScreenContextService, modelContainer: ModelContainer) {
-        self.screenContext = screenContext
+    // ITER-053.1 — the `screenContext` dependency was dead wiring (stored,
+    // never read: extraction runs on transcripts/DB, not the live screen).
+    func configure(modelContainer: ModelContainer) {
         self.modelContainer = modelContainer
     }
 
@@ -33,9 +45,34 @@ final class TaskExtractor: ObservableObject {
     /// after a conversation closes (dictation gap timeout or meeting stop).
     func triggerOnConversationClose(conversationId: UUID) {
         guard settings.tasksEnabled else { return }
-        Task { [weak self] in
-            await self?.extractFromConversation(conversationId: conversationId)
-        }
+        queue.enqueue(conversationId)
+        NSLog("[TaskExtractor] Conversation closed → extraction queued (convo %@, %d pending)", conversationId.uuidString.prefix(8) as CVarArg, queue.pending().count)
+        Task { [weak self] in await self?.drainQueue() }
+    }
+
+    /// SB-1 — startup backfill: process conversations left queued by a previous
+    /// session (app quit/crash before extraction finished). Call once after
+    /// `configure(...)`.
+    func backfillPending() {
+        guard settings.tasksEnabled, !queue.pending().isEmpty else { return }
+        NSLog("[TaskExtractor] Backfilling %d pending conversation(s)", queue.pending().count)
+        Task { [weak self] in await self?.drainQueue() }
+    }
+
+    /// SB-1 — serial drain of the durable queue. `isRunning` guards re-entrancy
+    /// (a second conversation closing while we work just enqueues; this pass
+    /// picks it up — see `ExtractionQueueStore.drain`) and drives the UI status.
+    private func drainQueue() async {
+        guard !isRunning else { return }
+        // ITER-049 A2 — never drain the durable queue against a degraded (empty
+        // in-memory) store: it would mark queued conversations .completed and
+        // rewrite the queue file, permanently dropping work whose real data is
+        // safe in the preserved on-disk store. Stays queued for the next launch.
+        guard StoreHealthSignal.shared.isHealthy else { return }
+        isRunning = true
+        defer { isRunning = false; lastRun = Date() }
+        await queue.drain { id in await self.extractFromConversation(conversationId: id) }
+        NSLog("[TaskExtractor] Drain finished — %d conversation(s) still pending", queue.pending().count)
     }
 
     /// Manual EXTRACT TASKS NOW button. Picks the most recent HistoryItem's conversation
@@ -56,37 +93,33 @@ final class TaskExtractor: ObservableObject {
             NSLog("[TaskExtractor] No recent conversation — skipping")
             return
         }
-        await extractFromConversation(conversationId: convId)
+        queue.enqueue(convId)
+        NSLog("[TaskExtractor] Manual EXTRACT NOW (button) → convo %@ queued, %d pending", convId.uuidString.prefix(8) as CVarArg, queue.pending().count)
+        await drainQueue()
     }
 
     /// Core extraction — collect all transcripts for the conversation, send as one block.
-    private func extractFromConversation(conversationId: UUID) async {
-        guard !isRunning else { return }
-        guard hasLLMAccess else { return }
+    private func extractFromConversation(conversationId: UUID) async -> ExtractionOutcome {
+        guard hasLLMAccess else { return .retryLater }
 
-        guard let container = modelContainer else { return }
+        guard let container = modelContainer else { return .retryLater }
         let ctx = ModelContext(container)
 
-        // Fetch all HistoryItems belonging to this conversation, oldest first.
-        var desc = FetchDescriptor<HistoryItem>(
-            predicate: #Predicate { $0.conversationId == conversationId },
-            sortBy: [SortDescriptor(\.createdAt, order: .forward)]
-        )
-        desc.fetchLimit = 100
-        let items = (try? ctx.fetch(desc)) ?? []
+        // AUD-035 — fetch the WHOLE conversation (uncapped, oldest first) via the
+        // shared, AUD-016-tested helper. The old inline 100-row cap silently
+        // dropped late fragments — exactly where reversals/completions live — so
+        // extraction ran on a prefix while the doc above promised full context.
+        // (Cloud paths get the full block; the local route still caps at the
+        // model's input budget — see the completeBlocking call below.)
+        let items = StructuredGenerator.fetchHistoryItems(conversationId: conversationId, in: ctx)
         let fragments = items
             .map { $0.displayText.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+            if fragments.isEmpty || fragments.reduce(0, { $0 + $1.count }) < 20 { NSLog("[TaskExtractor] Skipping convo %@ — %d non-empty fragments, below the 20-char floor", conversationId.uuidString.prefix(8) as CVarArg, fragments.count) }
 
-        guard !fragments.isEmpty else { return }
+        guard !fragments.isEmpty else { return .completed }
         let totalChars = fragments.reduce(0) { $0 + $1.count }
-        guard totalChars >= 20 else { return }
-
-        isRunning = true
-        defer {
-            isRunning = false
-            lastRun = Date()
-        }
+        guard totalChars >= 20 else { return .completed }
 
         let existing = fetchExistingTasks(sinceDays: dedupWindowDays)
         // ITER-025 — REFERENCE_TIME requires the conversation start so the LLM
@@ -99,19 +132,30 @@ final class TaskExtractor: ObservableObject {
         // transcript so the LLM can name people correctly in extracted tasks
         // ("Send draft to Maya" instead of "Send draft to him").
         let calendarContext = fetchCalendarContext(conversationId: conversationId, in: ctx)
+        let useLocal = LocalLLMService.shared.isReady
         let prompt = buildPrompt(
             fragments: fragments,
             existing: existing,
             startedAt: startedAt,
-            calendarContext: calendarContext
+            calendarContext: calendarContext,
+            localBudget: useLocal ? 6000 : nil
         )
 
         // Use the last fragment's source app if available (proxy for what app user was in most).
         let sourceApp = items.last.flatMap { $0.source } ?? "conversation"
+        NSLog("[TaskExtractor] Start: convo %@, %d fragments, %d transcript chars, %d prompt chars, %d dedup refs, calendar=%@, route=%@", conversationId.uuidString.prefix(8) as CVarArg, fragments.count, totalChars, prompt.count, existing.count, calendarContext == nil ? "no" : "yes", useLocal ? "local" : ((LicenseService.shared.isPro && LicenseService.shared.licenseKey?.isEmpty == false) ? "pro" : "byok"))
 
         do {
             let response: String
-            if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
+            // ITER-039 — local LLM takes priority when loaded.
+            if LocalLLMService.shared.isReady {
+                NSLog("[TaskExtractor] Extracting via local Phi (convo %@, %d fragments)",
+                      conversationId.uuidString.prefix(8) as CVarArg, fragments.count)
+                response = try await LocalLLMService.shared.completeBlocking(
+                    system: Self.systemPrompt, user: prompt,
+                    maxUserChars: 6000, maxTokens: 384   // F1.2 — was default 2000: transcript got cut after dedup context
+                )
+            } else if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
                 NSLog("[TaskExtractor] Extracting via Pro proxy (convo %@, %d fragments, %d chars)",
                       conversationId.uuidString.prefix(8) as CVarArg, fragments.count, totalChars)
                 response = try await callProProxy(system: Self.systemPrompt, user: prompt, licenseKey: licenseKey)
@@ -119,7 +163,7 @@ final class TaskExtractor: ObservableObject {
                 let apiKey = settings.activeAPIKey
                 guard !apiKey.isEmpty else {
                     NSLog("[TaskExtractor] No API key — skipping")
-                    return
+                    return .retryLater
                 }
                 let provider = LLMProvider(rawValue: settings.llmProvider) ?? .openai
                 response = try await llm.complete(
@@ -130,19 +174,29 @@ final class TaskExtractor: ObservableObject {
                 )
             }
 
-            let tasks = parseResponse(response,
-                                      sourceTranscriptId: items.last?.id,
-                                      sourceApp: sourceApp,
-                                      conversationId: conversationId)
+            // F1.7 — nil = garbage/truncated JSON (routine for local models):
+            // keep the conversation queued instead of dequeuing it forever.
+            guard let tasks = parseResponse(response,
+                                            sourceTranscriptId: items.last?.id,
+                                            sourceApp: sourceApp,
+                                            conversationId: conversationId) else {
+                lastError = "LLM returned unparseable JSON — will retry"
+                NSLog("[TaskExtractor] ⚠️ Unparseable response for convo %@ (%d chars) — counted as failed attempt", conversationId.uuidString.prefix(8) as CVarArg, response.count)
+                return .failedAttempt   // counted — capped at maxFailedAttempts
+            }
             guard !tasks.isEmpty else {
                 NSLog("[TaskExtractor] No new tasks from conversation %@", conversationId.uuidString.prefix(8) as CVarArg)
-                return
+                return .completed
             }
 
             for task in tasks {
                 ctx.insert(task)
             }
-            try? ctx.save()
+            // SB-1: a swallowed save (try?) would return .completed and let the
+            // queue drop the conversation though nothing persisted — the exact
+            // silent loss this iteration fixes. `try` → throw → catch → .retryLater.
+            try ctx.save()
+            NSLog("[TaskExtractor] Response %d chars → %d task(s) saved, %d with due date, %d delegated", response.count, tasks.count, tasks.filter { $0.dueAt != nil }.count, tasks.filter { !$0.isMyTask }.count)
             NSLog("[TaskExtractor] ✅ Extracted %d tasks from conversation %@",
                   tasks.count, conversationId.uuidString.prefix(8) as CVarArg)
 
@@ -152,9 +206,21 @@ final class TaskExtractor: ObservableObject {
 
             // Fire-and-forget embedding for semantic RAG (ITER-008).
             AppDelegate.shared?.embeddingService.embedTasksInBackground(tasks, in: ctx)
+
+            // ITER-035 v2 — export each new task as markdown in the user's vault.
+            if let exporter = AppDelegate.shared?.obsidianExporter {
+                let ids = tasks.map { $0.id }
+                Task { @MainActor in
+                    for id in ids {
+                        await exporter.exportTask(id)
+                    }
+                }
+            }
+            return .completed
         } catch {
             lastError = error.localizedDescription
             NSLog("[TaskExtractor] ❌ Failed: %@", error.localizedDescription)
+            return .failedAttempt   // counted — a conversation that always throws gets dropped after N tries
         }
     }
 
@@ -304,6 +370,19 @@ final class TaskExtractor: ObservableObject {
     - Back-and-forth clarification or decision-making about something happening right now
     - Requests and responses between people who are together and handling the matter on the spot
     - If the entire conversation is a brief in-person exchange that will be resolved within minutes, extract 0 items
+    - **WORK COMMANDS DICTATED TO AN AI / DEVELOPER / TOOL — the #1 noise source, SKIP ALL.**
+      This user dictates to DIRECT an AI assistant or developer to build / fix / change / check /
+      improve / review software, websites, designs, code, or content. Those imperative commands are
+      work being EXECUTED right now by the AI or tool — they are NOT the user's personal to-do list.
+      SKIP every such command. Examples to SKIP:
+        "make the text larger", "check the website metadata", "read claude.md", "find more tools",
+        "fix the layout", "create a plan and show the architecture", "increase the card size",
+        "write CLAUDE instead of OPUS", "review and improve the website", "structure the text",
+        "make elements more neutral", "transcribe the videos".
+      Heuristic: if the action is about producing/modifying software, a website, a design, content,
+      or code, and the user is plainly instructing it to be done now, it is a COMMAND, not a task → SKIP.
+      Extract one of these ONLY if the user EXPLICITLY frames it as their own reminder/task
+      ("remind me", "add task", "don't forget", "напомни", "запиши задачу", "не забудь").
 
     FORMAT REQUIREMENTS:
     - ≤15 words per description (strict)
@@ -343,7 +422,8 @@ final class TaskExtractor: ObservableObject {
         fragments: [String],
         existing: [TaskItem],
         startedAt: Date,
-        calendarContext: CalendarMeetingContext?
+        calendarContext: CalendarMeetingContext?,
+        localBudget: Int? = nil
     ) -> String {
         var parts: [String] = []
 
@@ -383,19 +463,46 @@ final class TaskExtractor: ObservableObject {
         if !existing.isEmpty {
             parts.append("EXISTING ACTION ITEMS FROM PAST \(dedupWindowDays) DAYS (do NOT duplicate):")
             let df = ISO8601DateFormatter()
-            for t in existing {
-                let dueStr = t.dueAt.map { df.string(from: $0) } ?? "no due"
-                let status = t.completed ? "completed" : "pending"
-                parts.append("- \(t.taskDescription) (due: \(dueStr)) [\(status)]")
+            // ITER-051 review fix — see MemoryExtractor.buildPrompt: with the
+            // local model, dedup context is capped so it can't starve the
+            // transcript out of the prefix-kept budget.
+            if let budget = localBudget {
+                var used = 0, shown = 0
+                for t in existing {
+                    let dueStr = t.dueAt.map { df.string(from: $0) } ?? "no due"
+                    let status = t.completed ? "completed" : "pending"
+                    let line = "- \(t.taskDescription) (due: \(dueStr)) [\(status)]"
+                    if used + line.count > budget * 3 / 10 { break }
+                    parts.append(line); used += line.count; shown += 1
+                }
+                if shown < existing.count { parts.append("(+\(existing.count - shown) more omitted)") }
+            } else {
+                for t in existing {
+                    let dueStr = t.dueAt.map { df.string(from: $0) } ?? "no due"
+                    let status = t.completed ? "completed" : "pending"
+                    parts.append("- \(t.taskDescription) (due: \(dueStr)) [\(status)]")
+                }
             }
             parts.append("")
         }
 
         parts.append("Conversation fragments to analyze (ordered by time, all from the same user):")
+        var fragLines: [String] = []
         for (i, frag) in fragments.enumerated() {
-            parts.append("--- fragment \(i + 1) ---")
-            parts.append(frag)
+            fragLines.append("--- fragment \(i + 1) ---")
+            fragLines.append(frag)
         }
+        var fragText = fragLines.joined(separator: "\n")
+        if let budget = localBudget {
+            let headerChars = parts.joined(separator: "\n").count + 64
+            let fragBudget = max(1000, budget - headerChars)
+            if fragText.count > fragBudget {
+                fragText = String(fragText.prefix(fragBudget * 7 / 10))
+                    + "\n[…middle omitted…]\n"
+                    + String(fragText.suffix(fragBudget * 3 / 10))
+            }
+        }
+        parts.append(fragText)
 
         let combined = parts.joined(separator: "\n")
         if combined.count > 20000 { return String(combined.prefix(20000)) }
@@ -456,12 +563,15 @@ final class TaskExtractor: ObservableObject {
         let tasks: [TaskJSON]
     }
 
-    private func parseResponse(_ response: String, sourceTranscriptId: UUID?, sourceApp: String, conversationId: UUID?) -> [TaskItem] {
+    /// ITER-051 F1.7 — `nil` = unparseable LLM output (the caller keeps the
+    /// conversation queued); `[]` = valid JSON with nothing to extract.
+    /// Internal (not private) so `ExtractorParseOutcomeTests` pins the contract.
+    func parseResponse(_ response: String, sourceTranscriptId: UUID?, sourceApp: String, conversationId: UUID?) -> [TaskItem]? {
         let extracted = extractJSONObject(from: response)
-        guard let data = extracted.data(using: .utf8) else { return [] }
+        guard let data = extracted.data(using: .utf8) else { return nil }
         guard let parsed = try? JSONDecoder().decode(ExtractionResult.self, from: data) else {
-            NSLog("[TaskExtractor] ⚠️ JSON parse failed: %@", String(extracted.prefix(200)))
-            return []
+            NSLog("[TaskExtractor] ⚠️ JSON parse failed — %d chars, starts with %@", extracted.count, extracted.first.map { String($0) } ?? "(empty)")
+            return nil
         }
 
         let df = ISO8601DateFormatter()
@@ -472,7 +582,7 @@ final class TaskExtractor: ObservableObject {
         return parsed.tasks.compactMap { json -> TaskItem? in
             let wordCount = json.description.split(separator: " ").count
             guard wordCount <= 15 else {
-                NSLog("[TaskExtractor] ⚠️ Rejected task (>15 words): %@", json.description)
+                NSLog("[TaskExtractor] ⚠️ rejected task (>15 words, %d chars)", json.description.count)
                 return nil
             }
             var due: Date? = nil
@@ -540,7 +650,10 @@ final class TaskExtractor: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
 
-        let body: [String: Any] = ["system": system, "user": user]
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user,
+            tier: Self.llmTier, serviceId: Self.llmServiceId
+        )
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -555,6 +668,8 @@ final class TaskExtractor: ObservableObject {
     // MARK: - Access check
 
     private var hasLLMAccess: Bool {
-        !settings.activeAPIKey.isEmpty || LicenseService.shared.isPro
+        !settings.activeAPIKey.isEmpty
+            || LicenseService.shared.isPro
+            || LocalLLMService.shared.isReady
     }
 }

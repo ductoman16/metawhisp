@@ -60,4 +60,51 @@ final class DualStreamMergerTests: XCTestCase {
         let rendered = DualStreamMerger.renderTranscript(segs)
         XCTAssertEqual(rendered, "Me: hello world\nThem: hi")
     }
+
+    func test_render_empty_isEmptyString() {
+        XCTAssertEqual(DualStreamMerger.renderTranscript([]), "")
+    }
+
+    func test_render_single() {
+        let segs = [StreamSegment(text: "solo", startSec: 0, endSec: 1, speaker: .them)]
+        XCTAssertEqual(DualStreamMerger.renderTranscript(segs), "Them: solo")
+    }
+
+    /// The user's real daily pattern: the facilitator (Me) announces a name,
+    /// then the named person (Them) reports. The "Me announces → Them reports"
+    /// ORDER must survive merge+render — it's the foundation for later
+    /// attributing the report's tasks to the announced person (2026-05-31).
+    func test_render_dailyHandoff_preservesOrder() {
+        let merged = DualStreamMerger.mergeStreams(
+            mic: [StreamSegment(text: "Катя, твои задачи?", startSec: 0, endSec: 2, speaker: .me)],
+            system: [StreamSegment(text: "Я закончила лендинг, сегодня API", startSec: 3, endSec: 6, speaker: .them)]
+        )
+        XCTAssertEqual(
+            DualStreamMerger.renderTranscript(merged),
+            "Me: Катя, твои задачи?\nThem: Я закончила лендинг, сегодня API"
+        )
+    }
+
+    // MARK: - AUD-002 — markIncomplete (failed meeting chunks must not be hidden)
+
+    func test_markIncomplete_noFailures_returnsTranscriptUnchanged() {
+        XCTAssertEqual(
+            DualStreamMerger.markIncomplete("Me: hi\nThem: hey", failedChunks: 0),
+            "Me: hi\nThem: hey"
+        )
+    }
+
+    func test_markIncomplete_withFailures_appendsWarningWithCount() {
+        let out = DualStreamMerger.markIncomplete("Me: hi", failedChunks: 3)
+        XCTAssertTrue(out.hasPrefix("Me: hi"), "original transcript must be preserved")
+        XCTAssertTrue(out.contains("3"), "must state how many segments were lost")
+        XCTAssertNotEqual(out, "Me: hi", "must add an incomplete marker")
+    }
+
+    func test_markIncomplete_emptyTranscript_returnsBareNote() {
+        let out = DualStreamMerger.markIncomplete("", failedChunks: 1)
+        XCTAssertFalse(out.isEmpty)
+        XCTAssertFalse(out.hasPrefix("\n"), "no leading blank lines when the transcript was empty")
+        XCTAssertTrue(out.contains("1"))
+    }
 }

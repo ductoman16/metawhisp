@@ -13,8 +13,24 @@ struct MeetingCoachView: View {
     /// Closure to fire when the user clicks the STOP pill in the header.
     /// Wired by the window controller to `AppDelegate.toggleMeetingRecording`.
     var onStop: (() -> Void)?
-
     var body: some View {
+        // Just the card, sized to its content. The drop shadow + envelope live
+        // in a separate pass-through shadow window so THIS card window can be
+        // sized exactly to the card (only the card is clickable/draggable; the
+        // halo + empty space click through). Sizing is measured on the AppKit
+        // side by SelfSizingHostingView — see MeetingCoachWindowController.
+        //
+        // The pill is wrapped in a ZStack so it is NOT the NSHostingView root
+        // (NSHostingView stretches its root to the window bounds, ignoring
+        // `.fixedSize`); as a non-root child the pill's `.fixedSize` is honored.
+        ZStack(alignment: .topLeading) {
+            pillContent
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var pillContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
             if state.suggestions.isEmpty {
@@ -34,11 +50,10 @@ struct MeetingCoachView: View {
             RoundedRectangle(cornerRadius: MW.rLarge, style: .continuous)
                 .strokeBorder(MW.border, lineWidth: 0.5)
         )
-        .shadow(color: .black.opacity(0.35), radius: 28, y: 14)
-        // Generous outer padding (was 12) so the 28pt-radius shadow has room
-        // to render on every side of the card before the host window edge.
-        .padding(.horizontal, 36)
-        .padding(.vertical, 40)
+        // No `.shadow`/`.padding` envelope here: the shadow is drawn by a
+        // separate pass-through window (CardShadowView) behind this card, so
+        // the card window stays exactly card-sized and only the card is
+        // interactive.
     }
 
     private var header: some View {

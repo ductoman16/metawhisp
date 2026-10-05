@@ -12,6 +12,15 @@ import SwiftData
 /// spec://BACKLOG#C1.2
 @MainActor
 final class StructuredGenerator: ObservableObject {
+    /// ITER-041 — per-conversation extraction schema is the most complex
+    /// in the codebase (title+project+category+decisions+nextSteps+
+    /// participants+keyQuotes). 8B-instant failed parse in production
+    /// (2026-05-28 17:13 — 2 consecutive parse failures right after the
+    /// mini migration). Moved to medium tier; still ~7× cheaper than the
+    /// heavy default since this is the highest-volume background caller.
+    static let llmTier: LLMTier = .medium
+    static let llmServiceId: String = "StructuredGenerator"
+
     @Published var isRunning = false
     @Published var lastError: String?
 
@@ -73,14 +82,16 @@ final class StructuredGenerator: ObservableObject {
     /// recent 200 rows and filtering in Swift is reliable and cheap.
     /// `static` + `internal` so retroactive tests can call it directly.
     static func fetchHistoryItems(conversationId: UUID, in ctx: ModelContext) -> [HistoryItem] {
-        var desc = FetchDescriptor<HistoryItem>(
-            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        // AUD-016 — fetch ALL rows ascending then filter, with NO cap. The former
+        // newest-200 GLOBAL cap truncated long conversations and, when unrelated
+        // recent rows filled the slice, could drop the target conversation's head
+        // (or all of it). We still filter in Swift rather than predicate on the
+        // Optional<UUID> — see the commit-race note above.
+        let desc = FetchDescriptor<HistoryItem>(
+            sortBy: [SortDescriptor(\.createdAt, order: .forward)]
         )
-        desc.fetchLimit = 200
         let candidates = (try? ctx.fetch(desc)) ?? []
-        return candidates
-            .filter { $0.conversationId == conversationId }
-            .sorted { $0.createdAt < $1.createdAt }
+        return candidates.filter { $0.conversationId == conversationId }
     }
 
     /// Backfill — retries generation for conversations stuck on placeholder fields.
@@ -96,21 +107,45 @@ final class StructuredGenerator: ObservableObject {
         // Match conversations where StructuredGenerator clearly hadn't run successfully:
         // - title is the "Quick note" placeholder, OR
         // - overview is the "(empty)" placeholder (LLM call failed but title written).
+        // ITER-035-followup (2026-05-12) — also require structuredBackfillAttempted != true.
+        // Before this guard, the backfill kept retrying the same short-transcript
+        // conversations every launch + every 30 min → user reported $16/day Groq
+        // spend from a runaway loop. Now each conversation gets at MOST one
+        // backfill attempt regardless of outcome.
+        //
+        // NB: in-memory filter for `structuredBackfillAttempted` rather than
+        // SwiftData predicate — `#Predicate` can't type-check optional-Bool
+        // boolean compounds reliably, gave a timeout. Fetch broader set,
+        // then `.filter` in Swift.
         var desc = FetchDescriptor<Conversation>(
             predicate: #Predicate {
                 !$0.discarded
                 && ($0.title == "Quick note" || $0.overview == "(empty)")
             }
         )
-        desc.fetchLimit = 100
-        let placeholders = (try? ctx.fetch(desc)) ?? []
+        desc.fetchLimit = 500  // wider fetch — in-memory filter narrows below
+        let allCandidates = (try? ctx.fetch(desc)) ?? []
+        let placeholders = Array(
+            allCandidates
+                .filter { $0.structuredBackfillAttempted != true }
+                .prefix(100)
+        )
         guard !placeholders.isEmpty else { return }
         NSLog("[StructuredGenerator] Backfilling %d placeholder conversations", placeholders.count)
         for conv in placeholders {
+            // Mark attempted BEFORE LLM call so even on failure / cancel we don't
+            // retry next pass. Successful generate() runs through with the flag
+            // already set — harmless, it's checked only on selection.
+            conv.structuredBackfillAttempted = true
             // Only retry if there's actually a real transcript available.
             let items = Self.fetchHistoryItems(conversationId: conv.id, in: ctx)
             let transcript = items.map { $0.displayText }.joined(separator: "\n")
-            guard transcript.count >= minTranscriptChars else { continue }
+            guard transcript.count >= minTranscriptChars else {
+                // Short transcript — flag stays set, persist + skip LLM call.
+                NSLog("[StructuredGenerator] backfill: conv %@ skipped — transcript %d chars < %d, marked attempted", conv.id.uuidString.prefix(8) as CVarArg, transcript.count, minTranscriptChars)
+                try? ctx.save()
+                continue
+            }
             // Reset title/overview so generate() re-runs through the LLM path.
             conv.title = nil
             conv.overview = nil
@@ -118,8 +153,10 @@ final class StructuredGenerator: ObservableObject {
             conv.emoji = nil
             try? ctx.save()
             // Pass the transcript we already have — avoids generate() doing
-            // a second DB fetch for the same data.
-            await generate(conversationId: conv.id, knownTranscript: transcript)
+            // a second DB fetch for the same data. `preferCloud: true` keeps
+            // accumulated backfill OFF the local model — large prompts × N
+            // conversations would otherwise freeze a freshly-activated Phi-4.
+            await generate(conversationId: conv.id, knownTranscript: transcript, preferCloud: true)
         }
     }
 
@@ -128,16 +165,19 @@ final class StructuredGenerator: ObservableObject {
     /// finish AFTER launch), and without periodic re-check they stay broken
     /// forever. 30-min cadence is rare enough to not load the proxy, frequent
     /// enough that a returning user sees titles update within minutes.
+    ///
+    /// ITER-035-followup (2026-05-12) — periodic loop disabled. Even with the
+    /// `structuredBackfillAttempted` sticky flag added today, this loop fires
+    /// the LLM 48 times/day (every 30 min) for any user who closes meetings
+    /// between launches. Combined with the prior infinite-retry bug, drove
+    /// $16/day Groq spend. Launch backfill alone catches legitimate
+    /// transcribe-then-close-fast conversations on next app start, which
+    /// covers the original case (user closes laptop after meeting). Cost
+    /// now bounded by total conversation count, not by wall-clock time.
     func startPeriodicBackfill() {
         periodicBackfillTask?.cancel()
-        periodicBackfillTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(self?.periodicBackfillInterval ?? 1800))
-                guard let self, !Task.isCancelled else { return }
-                await self.backfillPlaceholders()
-            }
-        }
-        NSLog("[StructuredGenerator] ✅ Periodic backfill armed (every %.0fs)", periodicBackfillInterval)
+        NSLog("[StructuredGenerator] periodic backfill disabled (cost-control 2026-05-12); launch backfill remains")
+        return
     }
 
     /// Cancel the periodic backfill (used on teardown / settings toggle off).
@@ -156,21 +196,17 @@ final class StructuredGenerator: ObservableObject {
         let ctx = ModelContext(container)
         var desc = FetchDescriptor<Conversation>(predicate: #Predicate { $0.id == conversationId })
         desc.fetchLimit = 1
-        guard let conv = try? ctx.fetch(desc).first else { return }
-        // Reset structured fields so generate() takes the full LLM path.
-        conv.title = nil
-        conv.overview = nil
-        conv.category = nil
-        conv.emoji = nil
-        conv.primaryProject = nil
-        conv.topicsJSON = nil
-        conv.decisionsJSON = nil
-        conv.actionItemsJSON = nil
-        conv.participantsJSON = nil
-        conv.keyQuotesJSON = nil
-        conv.nextStepsJSON = nil
-        try? ctx.save()
-        await generate(conversationId: conversationId)
+        guard (try? ctx.fetch(desc).first) != nil else { return }
+        // Nothing is cleared here. The eleven structured fields used to be set
+        // to nil and SAVED before the generator ran, and the generator has
+        // five ways to return without writing: no LLM access, a transcript
+        // under the floor, a run already in flight, a parse failure, a network
+        // error. Each of them left the conversation permanently blank (audit,
+        // 2026-09-06, P1). The full path is now asked for outright, and what
+        // was there stands until a result replaces it.
+        NSLog("[StructuredGenerator] regenerate requested for conv %@ — existing fields kept until a result replaces them",
+              conversationId.uuidString.prefix(8) as CVarArg)
+        await generate(conversationId: conversationId, isRegeneration: true)
     }
 
     /// Generate title/overview/category/emoji for a conversation by id.
@@ -181,8 +217,23 @@ final class StructuredGenerator: ObservableObject {
     /// cross-ModelContext race that produced "Quick note (empty)" placeholders
     /// when the new context didn't see the just-committed HistoryItem row.
     /// Backfill / manual paths leave it nil and fall back to the DB fetch.
-    func generate(conversationId: UUID, knownTranscript: String? = nil) async {
+    /// Run structuring for one conversation.
+    ///
+    /// - Parameter preferCloud: when `true`, bypasses the local-LLM path
+    ///   even if `LocalLLMService.isReady`. Used by the launch backfill —
+    ///   processing 10-50 accumulated conversations through a freshly
+    ///   activated local model right after «Make active» froze user's
+    ///   Mac 2026-05-13 (3k-token prefill × N conversations). Backfill
+    ///   stays on cloud; only fresh user-initiated dictations route local.
+    /// `isRegeneration` is the user pressing "regenerate": run the full path
+    /// even though the conversation already has a title. It used to be
+    /// simulated by deleting the eleven structured fields first, which lost
+    /// them for good whenever the run then produced nothing (audit, P1).
+    func generate(conversationId: UUID, knownTranscript: String? = nil, preferCloud: Bool = false,
+                  isRegeneration: Bool = false) async {
+        let t0 = Date()
         guard !isRunning else { return }
+        NSLog("[StructuredGenerator] conv %@ dropped — another generation already in flight", conversationId.uuidString.prefix(8) as CVarArg)
         guard hasLLMAccess else {
             NSLog("[StructuredGenerator] No LLM access — skipping")
             return
@@ -202,7 +253,9 @@ final class StructuredGenerator: ObservableObject {
         // has since landed. This recovers from the previous race condition where
         // StructuredGenerator fired before the HistoryItem was persisted.
         let isPlaceholder = (conv.title == "Quick note")
-        if conv.title != nil && conv.overview != nil && !isPlaceholder {
+        if !StructuredFieldSet.forcesFullRegeneration(isRegeneration: isRegeneration, hasTitle: conv.title != nil),
+           conv.title != nil && conv.overview != nil && !isPlaceholder {
+        NSLog("[StructuredGenerator] conv %@ already structured — skipping", conversationId.uuidString.prefix(8) as CVarArg)
             return
         }
 
@@ -273,10 +326,19 @@ final class StructuredGenerator: ObservableObject {
 
         let startedAt = conv.startedAt
         let userPrompt = buildPrompt(transcript: transcript, startedAt: startedAt)
+        NSLog("[StructuredGenerator] ▶︎ conv %@ — transcript %d chars, prompt %d chars, engine=%@, preferCloud=%d", conversationId.uuidString.prefix(8) as CVarArg, transcript.count, userPrompt.count, (!preferCloud && LocalLLMService.shared.isReady) ? "local" : ((LicenseService.shared.isPro && LicenseService.shared.licenseKey != nil) ? "pro" : "byok"), preferCloud ? 1 : 0)
 
         do {
             let response: String
-            if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
+            // ITER-039 — local LLM takes priority for FRESH dictations
+            // user just produced. Backfill paths (preferCloud=true) bypass
+            // local because pumping 10-50 accumulated conversations through
+            // a freshly-activated Phi-4 has frozen user's Mac in testing —
+            // each conversation can be 2-5k tokens, KV cache compounds, GPU
+            // queue saturates.
+            if !preferCloud, LocalLLMService.shared.isReady {
+                response = try await callLocalLLM(system: Self.systemPrompt, user: userPrompt)
+            } else if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
                 response = try await callProProxy(system: Self.systemPrompt, user: userPrompt, licenseKey: licenseKey)
             } else {
                 let apiKey = settings.activeAPIKey
@@ -294,6 +356,7 @@ final class StructuredGenerator: ObservableObject {
             }
 
             guard let parsed = parseResponse(response) else {
+            NSLog("[StructuredGenerator] ⚠️ parse failed conv %@ — response %d chars after %.1fs, has-brace=%d", conversationId.uuidString.prefix(8) as CVarArg, response.count, Date().timeIntervalSince(t0), response.contains("{") ? 1 : 0)
                 NSLog("[StructuredGenerator] ⚠️ Parse failed for conv %@", conversationId.uuidString.prefix(8) as CVarArg)
                 return
             }
@@ -322,9 +385,13 @@ final class StructuredGenerator: ObservableObject {
                 let cleaned = topics
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                     .filter { !$0.isEmpty }
-                if !cleaned.isEmpty {
-                    conv.topicsJSON = (try? String(data: JSONEncoder().encode(cleaned), encoding: .utf8))
-                }
+                // Written whether or not the new result has topics, like the
+                // five arrays below: a regeneration that keeps the old topics
+                // next to a new title describes a conversation that never
+                // happened (audit follow-up, 2026-09-08).
+                conv.topicsJSON = cleaned.isEmpty
+                    ? nil
+                    : (try? String(data: JSONEncoder().encode(cleaned), encoding: .utf8))
             }
             // ITER-021 — structured meeting summary sections.
             // Encode as JSON `[String]` for SwiftData (flat schema). Empty arrays
@@ -336,12 +403,7 @@ final class StructuredGenerator: ObservableObject {
             conv.nextStepsJSON    = Self.encodeStringArray(parsed.nextSteps)
             conv.updatedAt = Date()
             try? ctx.save()
-            NSLog("[StructuredGenerator] ✅ [%@] (%@) project=%@ topics=%d: %@",
-                  conv.emoji ?? "?",
-                  parsed.category,
-                  conv.primaryProject ?? "—",
-                  parsed.topics?.count ?? 0,
-                  parsed.title)
+                  NSLog("[StructuredGenerator] ✅ conv %@ — %.1fs, response %d chars, title %d chars, overview %d chars, decisions=%d actions=%d participants=%d quotes=%d next=%d topics=%d project=%d", conversationId.uuidString.prefix(8) as CVarArg, Date().timeIntervalSince(t0), response.count, parsed.title.count, parsed.overview.count, parsed.decisions?.count ?? 0, parsed.actionItems?.count ?? 0, parsed.participants?.count ?? 0, parsed.keyQuotes?.count ?? 0, parsed.nextSteps?.count ?? 0, parsed.topics?.count ?? 0, conv.primaryProject == nil ? 0 : 1)
 
             // Embed the now-finalized conversation so MetaChat can semantically retrieve
             // it later. Fire-and-forget; nil embedding falls back to recency ordering.
@@ -367,6 +429,7 @@ final class StructuredGenerator: ObservableObject {
             // there. Nothing to do here on the post-LLM path anymore.
         } catch {
             lastError = error.localizedDescription
+            NSLog("[StructuredGenerator] ❌ conv %@ failed after %.1fs — %@", conversationId.uuidString.prefix(8) as CVarArg, Date().timeIntervalSince(t0), error.localizedDescription)
             NSLog("[StructuredGenerator] ❌ Failed: %@", error.localizedDescription)
         }
     }
@@ -375,6 +438,58 @@ final class StructuredGenerator: ObservableObject {
 
     static let systemPrompt = """
     You are an expert content analyzer. Your task is to analyze the provided voice transcript and provide structure and clarity.
+
+    ── CORE ANTI-HALLUCINATION DIRECTIVE (read first, applies to ALL fields) ──
+
+    The transcript is the ONLY source of truth. Do NOT invent facts. Do NOT
+    fill in plausible-sounding technical details (e.g. «geolocation push
+    notifications», «chat functionality», «OAuth flow») unless those exact
+    concepts are LITERALLY stated in the transcript. If the transcript is
+    short, fragmented, or unclear, prefer GENERIC honesty («Quick check-in»,
+    «Brief catch-up») over confident invention.
+
+    ── MAIN-TOPIC vs PASSING-MENTION RULE ──
+
+    A word mentioned ONCE or TWICE in a service phrase («у меня по X завал
+    был», «потому что X не успел», «между делом по X занимался») is NOT the
+    meeting's main topic. It's CONTEXT, not the subject.
+
+    Generic patterns (use these abstract placeholders to learn the pattern;
+    do NOT echo the literal placeholder names into your output):
+    -  «I worked on <SIDE-PROJECT-X>, so I couldn't finish <MAIN-WORK-Y>»
+       → main topic is <MAIN-WORK-Y> (the build/release/feature delay), NOT
+       <SIDE-PROJECT-X>.
+    -  «Met <PERSON-X> yesterday, they told me about <TOPIC-Z>» → main
+       topic is <TOPIC-Z>, NOT <PERSON-X>.
+    -  Brand / project / app names mentioned in apology or excuse position
+       («busy with X», «behind on X», «X took longer than expected») are
+       background context. The MAIN topic is whatever the speaker is
+       actually trying to communicate: a status, decision, blocker, or ask.
+
+    CRITICAL: do NOT use any project or brand name AS the title unless that
+    name dominates the transcript word count AND the substantive content
+    revolves around it. When in doubt, prefer a verb-based title that
+    describes what the speaker was DOING or DECIDING.
+
+    To qualify as main topic, the subject must:
+    - Appear ≥30% of the transcript word-count, OR
+    - Be the explicit answer to «what was this conversation about»
+      (decisions, actions, key questions all centred on it).
+    If neither — that word is CONTEXT, ignore for title/overview/project/topics.
+
+    ── INSUFFICIENT-EVIDENCE FALLBACK ──
+
+    When transcript is < 30 seconds OR no clear main topic emerges OR the
+    main topic is just status-reporting («didn't get around to X», «still
+    working on Y»):
+    - title: «Quick check-in» / «Status update» / «Brief notes» (Title Case)
+    - overview: literal 1-sentence factual summary of what was actually said,
+      no embellishment. Example: «Status update — release delayed, more work
+      on side project tomorrow.»
+    - decisions / action_items / participants / key_quotes / next_steps:
+      empty `[]` arrays. EMPTY is better than fabricated.
+
+    ── ──
 
     For the TITLE: Write a clear, compelling headline (≤10 words) that captures the central topic and outcome. Use Title Case, avoid filler words, include a key noun + verb where possible (e.g., "Team Finalizes Q2 Budget" or "Debugging Memory Extraction Pipeline").
 
@@ -391,8 +506,11 @@ final class StructuredGenerator: ObservableObject {
     ❌ "Invoice" / "Sync" / "Meeting" / "Standup"
     ❌ "Marketing Sync" (still too generic — pick a specific topic discussed)
     ❌ "Q2 Plans" (which Q2? plans for what? include a project or person)
+    ❌ Title that amplifies a passing-mention word (see PASSING-MENTION RULE above).
+       Re-read the transcript: if the subject occupies < 30% of the talk,
+       choose a different subject OR the insufficient-evidence fallback.
 
-    For the OVERVIEW: Direct, factual 1-2 sentence summary. Lead with concrete content — what was built, decided, discussed, planned. Use specific project names, people, concrete actions.
+    For the OVERVIEW: Direct, factual 1-2 sentence summary. Lead with concrete content — what was built, decided, discussed, planned. Use specific project names, people, concrete actions. NEVER invent specifics — only use facts literally stated in the transcript.
 
     HARD-FORBIDDEN preambles (do NOT start the overview with these — they add zero info):
     - "The conversation is about ..."
@@ -648,30 +766,190 @@ final class StructuredGenerator: ObservableObject {
         return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Action plan (2026-05-29 feature)
+
+    /// On-demand "meeting write-up + action plan" for the conversation detail
+    /// page. Free-form markdown (Summary + Action-plan checklist) the user can
+    /// read or copy — replaces the manual "paste transcript into ChatGPT" loop.
+    ///
+    /// Runs on the HEAVY tier (user-facing quality, unlike the mini-tier
+    /// structured extraction). Local LLM takes priority when loaded.
+    func generateActionPlan(transcript: String, title: String?) async throws -> String {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 40 else {
+            throw ProcessingError.apiError("Transcript too short for a plan")
+        }
+        let (system, user) = ConversationTextAssembler.actionPlanPrompt(transcript: trimmed, title: title)
+
+        // Local LLM first (free + private) when active. ITER-051 F1.2 —
+        // chunked map-reduce so an hour-long transcript's plan covers the
+        // whole meeting, not the first ~2 minutes (old 2000-char cap).
+        if LocalLLMService.shared.isReady {
+            return try await LocalLLMService.shared.completeChunked(system: system, user: user)
+        }
+        guard LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey else {
+            throw ProcessingError.apiError("Pro required to generate an action plan")
+        }
+        // The proxy takes one prompt at a time, and an 87-minute meeting is
+        // longer than it accepts — the same reason the local path folds. Same
+        // fold, so the plan covers the whole meeting on either engine
+        // (2026-09-04; before this the Pro path sent 47 000 chars and got
+        // HTTP 400 back).
+        var skipped = 0
+        var ofParts = 0
+        let plan = try await ChunkedCompletion.run(
+            system: system, user: user,
+            chunkChars: ChunkedCompletion.graphemeBudget(for: user, unitLimit: LLMRequestBody.safePromptChars),
+            // Skips accumulate across fold rounds while each round has its
+            // own part count — keeping the largest is what makes "N of M"
+            // true (independent review: two skips in a round of three then
+            // one in a round of two read as "3 of 2").
+            onChunkSkipped: { _, of, _ in skipped += 1; ofParts = max(ofParts, of) }
+        ) { sys, usr, _ in
+            try await self.callProAdvice(system: sys, user: usr, licenseKey: licenseKey,
+                                         tier: .heavy, serviceId: "ActionPlan",
+                                         timeout: 60, label: "Action-plan")
+        }.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !plan.isEmpty else { throw ProcessingError.apiError("Empty plan from LLM") }
+        NSLog("[StructuredGenerator] Action-plan pro ✅ plan %d chars, %d of %d sections skipped", plan.count, skipped, ofParts)
+        // A plan that covers part of the meeting says so: dropping a section
+        // quietly is the same lie as dropping the microphone quietly.
+        guard skipped > 0 else { return plan }
+        return plan + "\n\n_" + String(skipped) + " of " + String(ofParts)
+            + " sections of this meeting could not be processed — the plan may be missing items from them._"
+    }
+
     // MARK: - Pro proxy
 
     private func callProProxy(system: String, user: String, licenseKey: String) async throws -> String {
+        // One JSON out (title/overview/…), so the fold does not apply here —
+        // the same head+tail sandwich the local path uses, against the
+        // proxy's own limit. Without it an hour-long meeting got HTTP 400 and
+        // no title at all (2026-09-04).
+        try await callProAdvice(system: system,
+                                user: Self.headAndTail(user, limit: ChunkedCompletion.graphemeBudget(
+                                    for: user, unitLimit: LLMRequestBody.safePromptChars)),
+                                licenseKey: licenseKey,
+                                tier: Self.llmTier, serviceId: Self.llmServiceId,
+                                timeout: 30, label: "Structured")
+    }
+
+    /// Keep the beginning and the END of a transcript when it does not fit:
+    /// the end of a meeting carries the decisions and the action items, and a
+    /// head-only cut used to drop them.
+    nonisolated static func headAndTail(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let marker = "\n[…transcript middle omitted…]\n"
+        let room = max(0, limit - marker.count)
+        let head = room * 2 / 3
+        return String(text.prefix(head)) + marker + String(text.suffix(room - head))
+    }
+
+    /// One call to `POST /api/pro/advice`. A failure carries the proxy's own
+    /// words: "HTTP 400" alone hid `Prompt too long (47178 chars, max 32000)`
+    /// for two days and left the founder guessing (2026-09-04).
+    private func callProAdvice(system: String, user: String, licenseKey: String,
+                               tier: LLMTier, serviceId: String,
+                               timeout: TimeInterval, label: String) async throws -> String {
+        // The wire limit counts UTF-16 units. Everything above aims below it;
+        // if a prompt still arrives over the line, say so plainly instead of
+        // spending a call to be told "Prompt too long".
+        guard user.utf16.count <= LLMRequestBody.maxPromptChars,
+              system.utf16.count <= LLMRequestBody.maxPromptChars else {
+            throw ProcessingError.apiError(
+                label + " prompt too long for the proxy (" + String(user.utf16.count)
+                    + " units, max " + String(LLMRequestBody.maxPromptChars) + ")")
+        }
         let url = URL(string: "https://api.metawhisp.com/api/pro/advice")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(licenseKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
+        request.timeoutInterval = timeout
 
-        let body: [String: Any] = ["system": system, "user": user]
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user, tier: tier, serviceId: serviceId
+        )
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw ProcessingError.apiError("Structured proxy HTTP \(http.statusCode)")
+            throw ProcessingError.apiError(
+                "\(label) proxy HTTP \(http.statusCode)\(Self.proxyReason(data))")
         }
         struct ProResponse: Decodable { let text: String }
         let result = try JSONDecoder().decode(ProResponse.self, from: data)
         return result.text
     }
 
-    private var hasLLMAccess: Bool {
-        !settings.activeAPIKey.isEmpty || LicenseService.shared.isPro
+    /// The proxy's own words for a refusal, for the message shown to the USER.
+    /// It may quote the body: that text goes to the person whose request it
+    /// was, on their own screen. The LOG gets `LLMRequestBody.proxyReason`
+    /// instead, which never writes a body to disk (audit, 2026-09-06).
+    nonisolated static func proxyReason(_ data: Data) -> String {
+        struct ProxyError: Decodable { let error: String }
+        if let decoded = try? JSONDecoder().decode(ProxyError.self, from: data), !decoded.error.isEmpty {
+            return " — " + decoded.error.prefix(200)
+        }
+        let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? "" : " — " + raw.prefix(200)
+    }
+
+    // Internal (was private) — ITER-050 B1.1: ProjectAggregator must check
+    // access BEFORE wiping conversation fields it can't regenerate.
+    var hasLLMAccess: Bool {
+        // ITER-039 — `LocalLLMService.isReady` is the third clause. Free
+        // users with a downloaded + activated MLX model now get
+        // StructuredGenerator (structured-text cleanup, the most-used LLM
+        // call in the app) working without any API key or Pro subscription.
+        !settings.activeAPIKey.isEmpty
+            || LicenseService.shared.isPro
+            || LocalLLMService.shared.isReady
+    }
+
+    /// Route system + user prompt through the local Phi-4 (or whichever
+    /// MLX model is loaded).
+    ///
+    /// **Prompt size hard cap (2026-05-13 freeze incident).** The transcript
+    /// can hit 5k+ chars in real use; combined with the structured-output
+    /// system prompt that's ~3k+ tokens. Sending the whole thing to local
+    /// Phi-4 froze the user's Mac for 30+ seconds (prefill on 32-layer GQA
+    /// model with 3k context = massive KV-cache materialization + main-
+    /// thread block). We cap at ~2k chars (~600-700 tokens) for the user
+    /// transcript and let cloud handle the rare larger ones via Pro.
+    ///
+    /// **Output cap.** 384 tokens is enough for our structured JSON
+    /// response (title + overview + actionItems + …). Anything bigger
+    /// suggests the model is hallucinating off-track — fail fast.
+    private func callLocalLLM(system: String, user: String) async throws -> String {
+        // ITER-051 F1.2 — head+tail sandwich instead of a head-only 2000-char
+        // cut: the response is one JSON (title/overview), so map-reduce
+        // chunking doesn't apply here, but the END of a meeting (decisions,
+        // action items) must inform the overview. 4000+2000 fits Phi-4's
+        // context comfortably alongside the system prompt.
+        let cappedUser: String
+        if user.count > 6000 {
+            cappedUser = String(user.prefix(4000))
+                + "\n[…transcript middle omitted for local model…]\n"
+                + String(user.suffix(2000))
+        } else {
+            cappedUser = user
+        }
+        let combined = system + "\n\n" + cappedUser
+        var collected = ""
+        for await chunk in LocalLLMService.shared.generate(
+            prompt: combined,
+            maxTokens: 384,
+            temperature: 0.3
+        ) {
+            collected += chunk
+        }
+        if collected.isEmpty {
+            throw NSError(domain: "LocalLLM", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "Local model returned no tokens — check Settings → AI Models that Phi-4 is downloaded and active."
+            ])
+        }
+        return collected
     }
 
     /// Ensure the LLM-supplied icon is an SF Symbol string, not a Unicode emoji.

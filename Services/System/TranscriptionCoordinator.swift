@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Foundation
+import Combine
 import os
 
 /// Single-point lifecycle coordinator for transcription pipeline.
@@ -21,7 +22,50 @@ final class TranscriptionCoordinator: ObservableObject {
     @Published var translateNext = false
 
     private let recorder: any AudioSource
-    var whisperEngine: WhisperKitEngine?
+    /// The on-device WhisperKit model id currently loaded and ready (nil = none).
+    /// FREE-1/FREE-7: onboarding gates on "the SELECTED model is loaded", not just
+    /// "downloaded" or "some model loaded" — downloading Tiny then Large must load
+    /// Large, not silently keep Tiny.
+    @Published var loadedWhisperModelId: String? = nil
+    /// FREE-2: set true once a BYOK cloud key has validated against the provider,
+    /// so the onboarding gate reacts (an @AppStorage key write doesn't publish).
+    /// Onboarding-transient: onboarding has no provider switcher (so it can't go
+    /// stale there) and this flag is not consulted after onboarding completes.
+    @Published var cloudKeyValidated: Bool = false
+    var whisperEngine: WhisperKitEngine? {
+        didSet { observeModelState() }
+    }
+    private var modelStateObservation: AnyCancellable?
+    private var blockedReadinessError: String?
+
+    var canStartRecording: Bool { activeEngine?.isModelLoaded == true }
+
+    var idleStatusLabel: String {
+        if canStartRecording { return "Ready" }
+        if settings.transcriptionEngine == "cloud" { return "Cloud not ready" }
+        return (whisperEngine?.modelState.value ?? .unloaded).label
+    }
+
+    private var engineReadinessError: String {
+        if settings.transcriptionEngine == "cloud" { return "API key not set for cloud transcription" }
+        return whisperEngine?.modelState.value.recordingError
+            ?? "No model loaded. Select or download a model in Settings."
+    }
+
+    private func observeModelState() {
+        modelStateObservation = whisperEngine?.modelState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                if self.settings.transcriptionEngine != "cloud",
+                   let blocked = self.blockedReadinessError, self.lastError == blocked {
+                    self.lastError = state.recordingError
+                    self.blockedReadinessError = state.recordingError
+                }
+                self.objectWillChange.send()
+            }
+        objectWillChange.send()
+    }
     private let cloudEngine = CloudWhisperEngine()
     private let textInserter: TextInsertionService
     private let soundService: SoundService
@@ -54,6 +98,11 @@ final class TranscriptionCoordinator: ObservableObject {
     /// spec://BACKLOG#Phase6
     weak var chatService: ChatService?
 
+    /// ITER-035 v2 — after a dictation HistoryItem is saved + assigned to a
+    /// Conversation, fire-and-forget a markdown export to the user's Obsidian
+    /// vault. No-op when sync isn't enabled.
+    weak var obsidianExporter: ObsidianExporter?
+
     /// True while user is holding Right ⌘ (long-press). Set by `startVoiceQuestion()` /
     /// cleared by `stopVoiceQuestion()` handler after the transcript is sent.
     var voiceQuestionMode: Bool = false
@@ -82,11 +131,13 @@ final class TranscriptionCoordinator: ObservableObject {
         self.textInserter = textInserter
         self.soundService = soundService
         self.settings = settings
+        observeModelState()
     }
 
     /// Toggle with translation — called by Right ⌥ shortcut.
     func toggleWithTranslation() {
         if stage == .idle { translateNext = true }
+        NSLog("[Coordinator] Translate requested (stage=%@, armed=%@)", "\(stage)", translateNext ? "YES" : "NO")
         toggle()
     }
 
@@ -158,6 +209,15 @@ final class TranscriptionCoordinator: ObservableObject {
     }
 
     private func startRecording() {
+        guard canStartRecording else {
+            translateNext = false
+            lastError = engineReadinessError
+            blockedReadinessError = lastError
+            abortVoiceQuestionIfActive(reason: engineReadinessError)
+            soundService.playError()
+            NSLog("[Coordinator] Recording blocked: %@", engineReadinessError)
+            return
+        }
         // Check microphone permission before starting
         guard recorder.hasPermission else {
             translateNext = false
@@ -220,6 +280,19 @@ final class TranscriptionCoordinator: ObservableObject {
         // Built-in MacBook mic: silence ~0.0002, quiet speech ~0.0005-0.002, normal ~0.003+
         // Threshold lowered to avoid dropping real speech recorded quietly
         let rms = Self.calculateRMS(samples)
+        // Digital silence is NOT a quiet room. RMS is zero only when every
+        // sample is zero, i.e. no signal arrived at all. Telling that user to
+        // "speak closer to the mic" is the advice that cost a day on
+        // 2026-08-12, when macOS fed the process eight recordings of nothing
+        // and the app never once said the microphone had gone dead.
+        if rms == 0, !samples.isEmpty {
+            NSLog("[Coordinator] ❌ recording was DIGITAL SILENCE (%d samples, RMS=0) — the mic delivered no audio",
+                  samples.count)
+            lastError = AudioRecordingService.deadMicMessage
+            abortVoiceQuestionIfActive(reason: AudioRecordingService.deadMicMessage)
+            stage = .idle
+            return
+        }
         if rms < 0.0003 {
             NSLog("[Coordinator] Audio too quiet (RMS=%.5f), skipping transcription", rms)
             abortVoiceQuestionIfActive(reason: "Audio too quiet — speak closer to the mic.")
@@ -248,26 +321,34 @@ final class TranscriptionCoordinator: ObservableObject {
 
     private func transcribe(samples: [Float], shouldTranslate: Bool, rms: Float) async {
         guard let currentEngine = activeEngine, currentEngine.isModelLoaded else {
-            lastError = settings.transcriptionEngine == "cloud" ? "API key not set for cloud transcription" : "No model loaded. Go to Settings to download one."
+            lastError = engineReadinessError
+            if let recoveryURL = Self.saveSamplesAsWav(samples) {
+                lastError = "\(engineReadinessError) Audio saved to \(recoveryURL.path)"
+            }
             abortVoiceQuestionIfActive(reason: "Transcription engine not ready.")
             stage = .idle
             soundService.playError()
             NSLog("[Coordinator] ❌ Engine not ready")
+            NSLog("[Coordinator] engine=%@, %d samples (%.1fs) could not be transcribed — %@", settings.transcriptionEngine, samples.count, Double(samples.count) / 16000.0, lastError ?? "?")
             return
         }
 
         NSLog("[Coordinator] Transcribing %d samples via %@...", samples.count, currentEngine.name)
 
         do {
-            let lang = settings.transcriptionLanguage == "auto" ? nil : settings.transcriptionLanguage
-            var promptWords = correctionDictionary.map { Array(Set($0.corrections.values)) } ?? []
-            // Always include our brand in prompt to bias Whisper toward it
-            promptWords.append("MetaWhisp")
+            let lang = TranscriptionLanguageResolver.resolveLanguage(settings.transcriptionLanguage)
+            // Prompt = curated brand glossary only, EN-gated (see
+            // enginePromptWords). The correction dictionary is deliberately NOT
+            // in the prompt: its values are applied post-hoc by
+            // CorrectionDictionary.apply below; feeding them to the decoder made
+            // Whisper echo them back verbatim on silence (2026-08-06).
+            let promptWords = TranscriptionLanguageResolver.enginePromptWords(language: lang)
             let result = try await currentEngine.transcribe(audioSamples: samples, language: lang, promptWords: promptWords)
 
-            let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            var trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else {
                 NSLog("[Coordinator] Empty result")
+                NSLog("[Coordinator] empty transcript after %.2fs engine time, RMS=%.5f", result.processingTime, rms)
                 // Surface to user — silent return left them wondering why
                 // pressing ⌘ produced nothing. Most common cause is Cloud
                 // Whisper / on-device engine returning a blank string when
@@ -281,7 +362,7 @@ final class TranscriptionCoordinator: ObservableObject {
             // Filter Whisper hallucinations.
             // Phase 1: Always-filter toxic tokens (YouTube artifacts) regardless of RMS.
             if Self.isAlwaysHallucination(trimmed) {
-                NSLog("[Coordinator] ⚠️ Filtered hallucination (always): '%@'", String(trimmed.prefix(80)))
+                NSLog("[Coordinator] ⚠️ Filtered hallucination (always): %d chars", trimmed.count)
                 // CRITICAL: do NOT auto-paste, but DO save text to clipboard +
                 // expose via lastResult so user can recover. Filter is heuristic;
                 // false positives have lost real dictations (3 times today,
@@ -294,10 +375,26 @@ final class TranscriptionCoordinator: ObservableObject {
                 stage = .idle
                 return
             }
+            // ITER-035-followup #2 (2026-05-12) — long-form dictation MAY still
+            // contain a hallucination artifact spliced into a momentary silence
+            // mid-speech (Whisper inserts «DimaTorzok» / «Subtitles by» between
+            // real phrases). `isAlwaysHallucination` returned false for these
+            // (text was long enough to be real speech), but we still need to
+            // strip the toxic substring before sending to TextProcessor.
+            let lowerCheck = trimmed.lowercased()
+            let stillHasToxic = Self.toxicHallucinationTokens.contains { lowerCheck.contains($0) }
+            if stillHasToxic {
+                let cleaned = Self.stripHallucinationTokens(trimmed)
+                if cleaned != trimmed {
+                    NSLog("[Coordinator] 🧹 Stripped hallucination tokens (was %d chars, now %d)",
+                          trimmed.count, cleaned.count)
+                    trimmed = cleaned
+                }
+            }
             // Phase 2: Pattern-match only on near-silence audio (RMS < 0.003).
             // Built-in MacBook mic: silence ~0.0005, quiet speech ~0.002, normal speech ~0.005+
             if rms < 0.003, Self.isHallucination(trimmed) {
-                NSLog("[Coordinator] ⚠️ Filtered hallucination (RMS=%.4f): '%@'", rms, String(trimmed.prefix(80)))
+                NSLog("[Coordinator] ⚠️ Filtered hallucination (RMS=%.4f): %d chars", rms, trimmed.count)
                 // Same recovery path — text on clipboard so user has the
                 // option even on quiet-audio false positives.
                 Self.saveSuspectToClipboard(trimmed)
@@ -308,58 +405,106 @@ final class TranscriptionCoordinator: ObservableObject {
                 return
             }
 
-            lastResult = result
-            NSLog("[Coordinator] ✅ lang=%@, %.2fs: %@", result.language ?? "?", result.processingTime, String(result.text.prefix(100)))
+            // TR-5: metric-based hallucination guard. The pattern filters above
+            // catch known artifacts; this catches SEMANTIC hallucinations they miss,
+            // using Whisper's own per-segment confidence metrics (aggregated over the
+            // clip). Precision-first thresholds, and — critically — it routes to the
+            // SAME clipboard recovery, never the silent-discard path, so a false
+            // positive costs the user a ⌘V, not their dictation.
+            if let reason = TranscriptionConfidenceGate.rejectionReason(
+                TranscriptionConfidenceGate.aggregateMetrics(result.segments),
+                text: trimmed
+            ) {
+                NSLog("[Coordinator] 🎚️ Low-confidence metrics (%@) — saved to clipboard, not pasted", reason)
+                Self.saveSuspectToClipboard(trimmed)
+                lastResult = result
+                lastError = "Low transcription confidence — text saved to clipboard, ⌘V to paste anyway."
+                abortVoiceQuestionIfActive(reason: "Low transcription confidence.")
+                stage = .idle
+                return
+            }
 
-            // Post-process (translate / clean / polish) if needed
-            var finalText = result.text
-            var processedText: String?
+            lastResult = result
+            NSLog("[Coordinator] ✅ lang=%@, %.2fs, %d chars", result.language ?? "?", result.processingTime, result.text.count)
+
+            // AUD-011 — establish ONE normalized transcript value, used for
+            // post-processing, history, Obsidian export, downstream AI and paste.
+            // Start from the sanitized `trimmed` (hallucination tokens already
+            // stripped), NOT the raw result.text which would re-introduce them.
+            var finalText = trimmed
 
             let needsProcess = (textProcessor?.needsProcessing ?? false) || shouldTranslate
             if let processor = textProcessor, needsProcess {
                 stage = .postProcessing
                 do {
-                    let (processed, wasProcessed) = try await processor.process(result.text, translate: shouldTranslate)
+                    let (processed, wasProcessed) = try await processor.process(finalText, translate: shouldTranslate)
                     if wasProcessed {
                         finalText = processed
-                        processedText = processed
-                        NSLog("[Coordinator] ✅ Post-processed: %@", String(processed.prefix(100)))
+                        NSLog("[Coordinator] ✅ Post-processed: %d chars", processed.count)
                     }
                 } catch {
                     NSLog("[Coordinator] ⚠️ Post-processing failed: %@", error.localizedDescription)
+                    NSLog("[Coordinator] continuing with UNPROCESSED text (%d chars, translate=%@) — no translation applied", finalText.count, shouldTranslate ? "YES" : "NO")
                     lastError = error.localizedDescription
                 }
             }
 
-            // Save to history (with processed text if available).
+            // 2026-05-28: brand-name auto-correct (BrandGlossary) BEFORE the user
+            // dictionary apply so an explicit user override still wins. Only
+            // unambiguous Cyrillic mangles (Бриво→Brevo, etc.) — see BrandGlossary.
+            let glossaryCorrected = BrandGlossary.applyCorrections(finalText)
+            if glossaryCorrected != finalText {
+                NSLog("[Coordinator] 📚 BrandGlossary corrected (%d chars)", glossaryCorrected.count)
+                finalText = glossaryCorrected
+            }
+
+            // Apply learned corrections (after all processing, before paste).
+            if let dict = correctionDictionary {
+                let corrected = dict.apply(finalText)
+                if corrected != finalText {
+                    NSLog("[Coordinator] 📝 Applied corrections (%d chars)", corrected.count)
+                    finalText = corrected
+                }
+            }
+
+            // AUD-011 — save history with the SAME normalized value used for paste,
+            // so Library, Obsidian export and downstream AI extraction all match it.
+            // processedText carries the normalized string whenever it differs from the
+            // raw transcript (displayText falls back to the raw text otherwise).
             if let hs = historyService {
                 let item = hs.save(result)
-                item?.processedText = processedText
+                NSLog("[Coordinator] history %@ (translatedTo=%@, %d chars)", item == nil ? "NOT saved" : "saved", shouldTranslate ? settings.translateTo : "-", finalText.count)
+                NSLog("[Coordinator] History save: %@", item == nil ? "SKIPPED (store degraded or save failed)" : "OK")
+                item?.processedText = (finalText == result.text) ? nil : finalText
                 item?.translatedTo = shouldTranslate ? settings.translateTo : nil
                 item?.modelName = settings.selectedModel
                 item?.source = audioSourceLabel
                 // Assign to Conversation (C1.1) — sets conversationId on the item.
                 if let item {
                     conversationGrouper?.assign(historyItem: item)
-                }
-            }
-
-            // Apply learned corrections (before paste, after all processing)
-            if let dict = correctionDictionary {
-                let corrected = dict.apply(finalText)
-                if corrected != finalText {
-                    NSLog("[Coordinator] 📝 Applied corrections: %@", String(corrected.prefix(80)))
-                    finalText = corrected
+                    // ITER-035 v2 — export this dictation as a markdown file in the
+                    // user's Obsidian vault. Fire-and-forget; ObsidianExporter gates.
+                    if let exporter = obsidianExporter {
+                        let itemID = item.id
+                        Task { @MainActor in
+                            await exporter.exportHistoryItem(itemID)
+                        }
+                    }
                 }
             }
 
             // Voice question mode (Phase 6) — route to MetaChat instead of clipboard paste.
             if voiceQuestionMode {
                 voiceQuestionMode = false
-                NSLog("[Coordinator] 🎤 Voice question transcript → MetaChat: %@", String(finalText.prefix(80)))
+                NSLog("[Coordinator] 🎤 Voice question transcript → MetaChat (%d chars)", finalText.count)
                 VoiceQuestionState.shared.thinking(transcript: finalText)
                 if let chat = chatService {
-                    Task { await chat.send(finalText, source: .voice) }
+                    // F1.9 — keep the handle so Esc (dismiss) can cancel the
+                    // in-flight generation instead of letting it run blind.
+                    VoiceQuestionState.shared.activeSendTask = Task {
+                        await chat.send(finalText, source: .voice)
+                        NSLog("[Coordinator] 🎤 voice question send returned (chatError=%@)", chat.lastError ?? "none")
+                    }
                 } else {
                     NSLog("[Coordinator] ⚠️ chatService nil — voice question dropped")
                     VoiceQuestionState.shared.failed("Chat not available")
@@ -388,6 +533,8 @@ final class TranscriptionCoordinator: ObservableObject {
             // spec://BACKLOG#B1
 
             soundService.playSuccess()
+            NSLog("[Coordinator] ✅ Dictation done: translate=%@, %d chars, autoPaste=%@", shouldTranslate ? "YES" : "NO", finalText.count, settings.autoSubmit ? "ON" : "OFF")
+            NSLog("[Coordinator] ✅ Done: %d chars, autoPaste=%@", finalText.count, settings.autoSubmit ? "on" : "off")
             stage = .idle
 
         } catch {
@@ -429,10 +576,10 @@ final class TranscriptionCoordinator: ObservableObject {
     /// `~/Library/Application Support/MetaWhisp/Recovery/`.
     /// Used when transcription fails — gives the user something they can
     /// re-submit instead of losing the dictation entirely.
-    static func saveSamplesAsWav(_ samples: [Float]) -> URL? {
-        guard !samples.isEmpty else { return nil }
-
-        // Resolve / create the recovery folder.
+    /// `~/Library/Application Support/MetaWhisp/Recovery/`, created on demand.
+    /// Audio and, since 2026-09-08, a transcript the library refused both land
+    /// here — one folder the user can be pointed at.
+    static func recoveryDirectory() -> URL? {
         let fm = FileManager.default
         guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil
@@ -443,16 +590,23 @@ final class TranscriptionCoordinator: ObservableObject {
         do {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         } catch {
-            NSLog("[Coordinator] saveSamplesAsWav: mkdir failed — %@", error.localizedDescription)
+            NSLog("[Coordinator] recovery folder: mkdir failed — %@", error.localizedDescription)
             return nil
         }
+        return dir
+    }
+
+    static func saveSamplesAsWav(_ samples: [Float], named fileName: String? = nil) -> URL? {
+        guard !samples.isEmpty else { return nil }
+
+        guard let dir = Self.recoveryDirectory() else { return nil }
 
         let stamp: String = {
             let fmt = DateFormatter()
             fmt.dateFormat = "yyyy-MM-dd-HH-mm-ss"
             return fmt.string(from: Date())
         }()
-        let url = dir.appendingPathComponent("recording-\(stamp).wav")
+        let url = dir.appendingPathComponent(fileName ?? "recording-\(stamp).wav")
 
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -497,14 +651,113 @@ final class TranscriptionCoordinator: ObservableObject {
     /// Tokens that are ALWAYS hallucinations — filter regardless of audio energy.
     /// These are YouTube artifacts that Whisper never produces from real speech.
     /// Exposed internally so meeting recording can reuse the same filter.
+    /// Tokens that NEVER appear in real human speech — they're Whisper's
+    /// «I don't know what to emit on this silent fragment» fillers. Single
+    /// source of truth for both detection (this method) and surgical removal
+    /// (`stripHallucinationTokens`).
+    static let toxicHallucinationTokens = [
+        "♪", "♫", "торзок", "torzok", "dimatorzok", "dima torzok",
+        "amara.org", "переводчик:", "translator:",
+    ]
+
+    /// Surgical removal of hallucination artifacts from a transcript that's
+    /// OTHERWISE real speech. Catches both bare tokens («DimaTorzok») and the
+    /// usual attribution sentences («Subtitles by DimaTorzok»). Cleans up
+    /// double-spaces and dangling punctuation after removal. Caller checks
+    /// for toxic-token presence first; this just does the cleanup.
+    static func stripHallucinationTokens(_ text: String) -> String {
+        var result = text
+
+        // Order matters — longer / more specific patterns first so we don't
+        // leave «Subtitles by» behind after removing «DimaTorzok».
+        //
+        // 2026-05-28 expansion: meeting transcripts in production were
+        // leaking «Субтитры сделал DimaTorzok», «Субтитры создавал
+        // DimaTorzok», «Продолжение следует…», «Спасибо за просмотр»,
+        // «Подписывайтесь». 14× DimaTorzok in last 10 long meetings. The
+        // old regex only covered «by/от» attribution; Whisper actually
+        // emits the verb forms «сделал/создавал/делал/подогнал/писал/
+        // предоставил/корректировал/написал». Added verb-attribution
+        // branch + standalone YouTube boilerplate patterns. Regression-
+        // pinned by `HallucinationStripTests`.
+        let patterns: [String] = [
+            // 1. Full attribution with name — Whisper YouTube artifact.
+            //    Covers both English «by/от» and Russian verb forms.
+            #"(?i)\s*\b(subtitles?|субтитры|перевод(ил)?|translated)\s+(by\s+|от\s+|сделал\s+|создавал\s+|делал\s+|подогнал\s+|писал\s+|предоставил\s+|корректировал\s+|написал\s+)?(dima\s*torzok|dimatorzok|amara\.org)\b\.?"#,
+
+            // 2. Bare verb-attribution (no name after, or name was already
+            //    stripped by pattern 3 below). «Субтитры сделал» on its own
+            //    is never real meeting speech.
+            #"(?i)\s*\b(subtitles?|субтитры|перевод(ил)?)\s+(by|от|сделал|создавал|делал|подогнал|писал|предоставил|корректировал|написал)\b\.?"#,
+
+            // 3. Standalone «DimaTorzok» / variants
+            #"(?i)\bdima\s*torzok\b"#,
+            #"(?i)\bdimatorzok\b"#,
+            #"(?i)\bторзок\b"#,
+
+            // 4. Translator attribution
+            #"(?i)переводчик:\s*\S+"#,
+            #"(?i)translator:\s*\S+"#,
+
+            // 5. «Продолжение следует» / «To be continued» — YouTube outro
+            //    that Whisper inserts on silence at chunk boundaries.
+            //    Trailing ellipsis (3 dots OR single … char) optional.
+            #"(?i)\bпродолжение\s+следует\b\.{0,3}…?"#,
+            #"(?i)\bto\s+be\s+continued\b\.{0,3}…?"#,
+
+            // 6. YouTube subscribe boilerplate. Specific multi-word framings
+            //    only — bare «subscribe» can be a legit business word.
+            #"(?i)\bподписывайтесь(\s+на\s+канал)?\b\.?"#,
+            #"(?i)\bplease\s+like\s+and\s+subscribe\b\.?"#,
+            #"(?i)\blike\s+and\s+subscribe\b\.?"#,
+            #"(?i)\bplease\s+subscribe\b\.?"#,
+
+            // 7. YouTube thanks-for-watching boilerplate
+            #"(?i)\bспасибо\s+за\s+просмотр\b\.?"#,
+            #"(?i)\bthanks?\s+for\s+watching\b\.?"#,
+
+            // 8. Music notation runs
+            "♪+",
+            "♫+",
+
+            // 9. amara.org standalone
+            #"(?i)\bamara\.org\b"#,
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
+        }
+
+        // Collapse multi-space + clean dangling punctuation pairs.
+        if let r = try? NSRegularExpression(pattern: #"\s{2,}"#) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = r.stringByReplacingMatches(in: result, range: range, withTemplate: " ")
+        }
+        // Fix « , » → « ,» and « . » → «. » left by mid-sentence removal.
+        result = result.replacingOccurrences(of: " ,", with: ",")
+        result = result.replacingOccurrences(of: " .", with: ".")
+        result = result.replacingOccurrences(of: " !", with: "!")
+        result = result.replacingOccurrences(of: " ?", with: "?")
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func isAlwaysHallucination(_ text: String) -> Bool {
         let lower = text.lowercased()
-        let toxicTokens = [
-            "♪", "♫", "торзок", "torzok", "dimatorzok", "dima torzok",
-            "amara.org", "переводчик:", "translator:",
-        ]
-        for token in toxicTokens {
-            if lower.contains(token) { return true }
+        let containsToxic = Self.toxicHallucinationTokens.contains { lower.contains($0) }
+        if containsToxic {
+            // ITER-035-followup #2 (2026-05-12) — split the decision.
+            // SHORT text + toxic token = pure hallucination (Whisper emitted
+            // «Subtitles by DimaTorzok» on silent audio and stopped). DROP.
+            // LONG text + toxic token = real speech with the artifact spliced
+            // mid-stream. We DON'T drop the whole thing — caller is expected
+            // to call `stripHallucinationTokens(_:)` to surgically remove the
+            // artifact substring and pass the cleaned remainder through to
+            // TextProcessor. Returning `false` here means «not all-hallucination»,
+            // not «no cleanup needed».
+            return text.count < 200
         }
         // Text is ONLY "субтитры" + attribution (no real speech content)
         if lower.hasPrefix("субтитры") && text.count < 60 { return true }
@@ -532,7 +785,7 @@ final class TranscriptionCoordinator: ObservableObject {
     /// 3. Any single word repeats 5+ times CONSECUTIVELY
     /// Real speech rarely triggers any of these — they're characteristic of
     /// Whisper getting stuck in a generation loop on uncertain audio.
-    static func containsExcessivePhraseRepetition(_ text: String) -> Bool {
+    nonisolated static func containsExcessivePhraseRepetition(_ text: String) -> Bool {
         let words = text.lowercased()
             .components(separatedBy: .whitespacesAndNewlines)
             .map { $0.trimmingCharacters(in: .punctuationCharacters) }

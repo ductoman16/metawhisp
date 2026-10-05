@@ -18,6 +18,73 @@ enum InsightPrompts {
     /// for v1; in v2 (ITER-027.6) we'll switch to native function calling
     /// so the model can also issue `execute_sql` to investigate OCR
     /// across the last hour.
+    /// ITER-027.6 — system prompt for the INVESTIGATION loop (tool calling).
+    /// Same quality bars as `systemPrompt`, but the model must dig through
+    /// screen HISTORY with tools before it may advise — the fix for the
+    /// screen-echo failure mode («Rerun Failed Agents» while the user looks
+    /// at the failed-agents list): echo is now an explicit no_advice rule,
+    /// and real insights are expected to cite what the investigation found.
+    static let investigationSystemPrompt: String = """
+        You analyze a user's screen activity to find ONE specific, high-value insight the user would NOT figure out on their own. The goal is to IMPRESS the user — make them think "wow, I'm glad I have this."
+
+        WORKFLOW (tools are MANDATORY — never answer in plain text):
+        1. Review the ACTIVITY SUMMARY and CURRENT SCREEN in the user message.
+        2. Investigate with search_screen_history: what was the user doing earlier — errors they hit, commands they ran, drafts they wrote, things they started and abandoned. Valuable insights live in HISTORY, not in the current frame.
+        3. Confirm your hypothesis with get_screen_text BEFORE advising — never advise from a snippet alone.
+        4. Then call provide_advice — or no_advice, which is the correct outcome for MOST runs.
+
+        CORE QUESTION: does interrupting the user right now add concrete value?
+        Silence is the default and the most common correct answer. A notification earns its
+        interruption only by doing one of two things: answering a question the user is
+        writing or about to ask, or changing what they do next.
+
+        A fact is an event or an obligation: a commitment someone made, a request, a
+        deadline, a blocker, a failure, a decision, or a status that changed.
+        (Decision procedure ported from the reference implementation's measured director prompt.)
+
+        Check the reasons for silence first, in this order:
+        - No fact supports a specific, timely action: no_advice.
+        - The point reports the outcome of something the user themselves just did: no_advice.
+          They were there.
+        - The point's only next step is to keep doing what the user is visibly already
+          doing: no_advice. A real next step names something they are not already doing,
+          something they owe someone, or a loose end this screen now unblocks.
+        - The point duplicates PREVIOUSLY PROVIDED INSIGHTS, even reworded: no_advice.
+        - The point is a commitment between other parties that does not involve the user:
+          no_advice.
+
+        These SPEAK — being visible on screen does not silence an obligation:
+        - A commitment the user personally made or accepted, or a request aimed at them —
+          especially with a deadline. The value is capturing it before it scrolls away:
+          "Anna is waiting for the deck by 16:00 — you said you'd send it."
+        - A failure or blocker that bites later if ignored: payment declined, build broken,
+          auth or quota expired. Say the consequence, which the screen does not.
+        - A mistake about to happen: wrong year, wrong recipient, wrong amount.
+        - A forgotten loose end from history connected to this screen.
+        - A visible credential in a shareable context — say one is visible and where,
+          NEVER its value.
+
+        Then say what it is about:
+        - Name the specific thing in the headline. The user reads it away from the screen
+          that produced it. Take the identifier from the screen: the person who asked, the
+          file and branch, the document title, the amount, the deadline.
+        - "PR blocked", "respond to the email", "document needs review" identify nothing.
+        - Write identifiers exactly as the screen spells them. Never invent one.
+        - The body must add the consequence or the next step, which the screen does not say.
+
+        GOOD EXAMPLES (this is the quality bar — note how each needs HISTORY or careful reading, not the current frame):
+        - "You stashed changes 2 hours ago — remember to git stash pop"
+        - "You've scheduled this for 2026 — double-check the year"
+        - "Sensitive credentials visible in terminal — mask before sharing"
+        - "The build error you hit at 14:20 is the missing metallib — swift test needs it too"
+        - "Replying to group thread, not DM — check the recipient"
+
+        BAD EXAMPLES (never produce these):
+        - "Rerun the failed agents" (user is LOOKING at the failed-agents list — pure echo)
+        - "Set your first goal to get started" (pointing at UI the user can see)
+        - "Press Cmd+Enter to send the message" (basic shortcut everyone knows)
+        """
+
     static let systemPrompt: String = """
         You analyze a user's current screen + recent activity to find ONE specific, high-value insight the user would NOT figure out on their own. The goal is to IMPRESS the user — make them think "wow, I'm glad I have this."
 
@@ -33,7 +100,7 @@ enum InsightPrompts {
           "reasoning": "<brief explanation why this matters now>",
           "category": "productivity" | "communication" | "learning" | "other",
           "source_app": "<app where the context was observed>",
-          "confidence": <0.60-1.00 number, NOT a string>,
+          "confidence": <0.60-1.00 number, NOT a string. Calibrate: 0.90+ = preventing a clear mistake; 0.75-0.89 = highly relevant non-obvious tip; 0.60-0.74 = useful but the user might already know>,
           "context_summary": "<brief summary of what user is looking at>",
           "current_activity": "<high-level description of user's activity>"
         }
@@ -122,13 +189,25 @@ enum InsightPrompts {
         windowTitle: String?,
         ocr: String,
         activitySummary: String,
-        previousInsights: [String]
+        previousInsights: [String],
+        context: InsightContextPack = InsightContextPack()
     ) -> String {
         var lines: [String] = []
         lines.append("CURRENT APP: \(appName).")
         if let t = windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
            !t.isEmpty {
             lines.append("Window: \"\(t)\".")
+        }
+
+        // The user's own open work goes in BEFORE the screen. The model had
+        // tools to go looking for this and never used them once in thirty-six
+        // shipped comments; the reference implementation does not ask its model
+        // to look either — it puts the facts in the prompt. Data only: the
+        // workflow that says what to do with them lives in the system prompt.
+        let contextBlock = context.bounded().promptBlock()
+        if !contextBlock.isEmpty {
+            lines.append("")
+            lines.append(contextBlock)
         }
 
         let truncatedOCR = String(ocr.prefix(maxOCRChars))

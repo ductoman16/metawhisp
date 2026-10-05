@@ -133,4 +133,151 @@ final class CalendarEndStopDecisionTests: XCTestCase {
         )
         XCTAssertEqual(decision, .stopNow)
     }
+
+    // MARK: - ITER-034.1 — sliding-window guards (regression 2026-05-11)
+
+    /// REGRESSION 2026-05-11: user report «созвон закончился в 5 минут позже
+    /// календарного окна» — caller used `meetingRecorder.audioLevel`
+    /// (instantaneous), which dropped below threshold in normal 200-500ms
+    /// pauses between sentences. Decision fired `.stopNow` mid-discussion.
+    /// Fix: caller now passes `recentAudioActive` (true iff audio crossed
+    /// the silence threshold within the last 30s — sliding window, NOT
+    /// instantaneous). When true we must NOT `.stopNow` even if the current
+    /// RMS sample is quiet.
+    func test_recentAudioActive_blocksStopNow_evenIfCurrentRMSQuiet() {
+        let decision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(70),
+            eventEnd: now,
+            audioRMSLastNSec: 0.001,               // current sample IS quiet
+            notifyAttemptsSoFar: 0,
+            recentAudioActive: true                // …but someone talked recently
+        )
+        // Must not be stopNow — meeting still in progress, just a pause.
+        if case .stopNow = decision {
+            XCTFail("stopped mid-pause despite recent audio activity: \(decision)")
+        }
+    }
+
+    /// REGRESSION 2026-05-12: user got «RECORDING STOPPED · Meeting
+    /// overrunning» card ~5 min into a recording (event was short OR
+    /// recording started after event end). Recording was actually CONTINUING,
+    /// not stopped — the card title was misleading. Fix: when BOTH signals
+    /// say meeting is clearly ongoing (audio active AND meeting app visible),
+    /// return `.silentExtend` instead of `.notifyAndExtend` — no card pushed.
+    func test_bothPositiveSignals_silentExtendNotNotify() {
+        let decision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(70),
+            eventEnd: now,
+            audioRMSLastNSec: 0.05,
+            notifyAttemptsSoFar: 0,
+            recentAudioActive: true,
+            meetingAppVisible: true
+        )
+        if case .silentExtend = decision {
+            // OK
+        } else {
+            XCTFail("expected silentExtend when both signals active, got \(decision)")
+        }
+    }
+
+    /// Only ONE positive signal (audio but no visible meeting app, or vice versa)
+    /// → still notifyAndExtend (caller pushes a card so user knows).
+    func test_onePositiveSignal_notifyAndExtend() {
+        let auditDecision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(70),
+            eventEnd: now,
+            audioRMSLastNSec: 0.05,
+            notifyAttemptsSoFar: 0,
+            recentAudioActive: true,
+            meetingAppVisible: false
+        )
+        if case .notifyAndExtend = auditDecision { } else {
+            XCTFail("audio-only signal should still notify, got \(auditDecision)")
+        }
+
+        let visibleDecision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(70),
+            eventEnd: now,
+            audioRMSLastNSec: 0.001,
+            notifyAttemptsSoFar: 0,
+            recentAudioActive: false,
+            meetingAppVisible: true
+        )
+        if case .notifyAndExtend = visibleDecision { } else {
+            XCTFail("app-visible-only signal should still notify, got \(visibleDecision)")
+        }
+    }
+
+    /// Same regression — alternate channel: if a meeting app (Zoom / Meet /
+    /// Teams / etc) is visible on screen in the recent capture window, the
+    /// meeting is ongoing regardless of audio. Blocks stopNow.
+    func test_meetingAppVisible_blocksStopNow() {
+        let decision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(70),
+            eventEnd: now,
+            audioRMSLastNSec: 0.001,
+            notifyAttemptsSoFar: 0,
+            recentAudioActive: false,
+            meetingAppVisible: true                // Zoom in foreground
+        )
+        if case .stopNow = decision {
+            XCTFail("stopped while meeting app visible: \(decision)")
+        }
+    }
+
+    /// Both new signals false + quiet RMS → still stops as before. Guards
+    /// the backward-compat path so the new params don't break the existing
+    /// "no one's around" auto-stop.
+    func test_stopNow_stillFires_whenAllSignalsClear() {
+        let decision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(70),
+            eventEnd: now,
+            audioRMSLastNSec: 0.001,
+            notifyAttemptsSoFar: 0,
+            recentAudioActive: false,
+            meetingAppVisible: false
+        )
+        XCTAssertEqual(decision, .stopNow)
+    }
+
+    /// After the notify budget is exhausted, the decision splits on
+    /// `recentAudioActive`:
+    ///   - audio active → `silentExtend` (don't kill a still-going call;
+    ///     user keeps getting cards every 5 min and can stop manually)
+    ///   - audio quiet  → `hardStop` (anti-zombie safety valve)
+    ///
+    /// Originally `hardStop` ALWAYS won past the budget. That regressed
+    /// real Google-Meet-in-Chrome calls: `meetingAppVisible` returns false
+    /// for browser-tab meetings, so a loud 46-min call got hard-stopped at
+    /// notify #3 even though the user was still talking. The current
+    /// contract preserves the anti-zombie cap (audio-quiet branch) while
+    /// keeping live calls alive (audio-active branch).
+
+    func test_silentExtend_whenBudgetExhaustedButAudioActive() {
+        let decision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(2000),
+            eventEnd: now,
+            audioRMSLastNSec: 0.05,
+            notifyAttemptsSoFar: 3,
+            recentAudioActive: true,
+            meetingAppVisible: true
+        )
+        if case .silentExtend = decision {
+            // pass
+        } else {
+            XCTFail("Expected .silentExtend when audio active past budget, got \(decision)")
+        }
+    }
+
+    func test_hardStop_whenBudgetExhaustedAndAudioQuiet() {
+        let decision = CalendarEndStopDecision.evaluate(
+            now: now.addingTimeInterval(2000),
+            eventEnd: now,
+            audioRMSLastNSec: 0.05,
+            notifyAttemptsSoFar: 3,
+            recentAudioActive: false,
+            meetingAppVisible: true
+        )
+        XCTAssertEqual(decision, .hardStop)
+    }
 }

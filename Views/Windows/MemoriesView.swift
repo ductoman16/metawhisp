@@ -13,6 +13,8 @@ struct MemoriesView: View {
     private var memories: [UserMemory]
 
     @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject private var license = LicenseService.shared
+    @ObservedObject private var localLLM = LocalLLMService.shared
     @Environment(\.modelContext) private var modelContext
 
     @State private var selectedFilter: Filter = .all
@@ -22,12 +24,19 @@ struct MemoriesView: View {
 
     enum Filter: String, CaseIterable {
         case all = "All"
+        case review = "Needs review"
         case system = "System"
         case interesting = "Interesting"
     }
 
+    /// ITER-047 Element B — generic gate (local LLM counts) for the reminder bar.
+    private var hasLLMAccess: Bool {
+        LLMAccess.has(apiKey: settings.activeAPIKey, isPro: license.isPro, localReady: localLLM.isReady)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if !hasLLMAccess { LLMAccessBar() }
             header
             Rectangle().fill(MW.border).frame(height: MW.hairline)
 
@@ -41,7 +50,27 @@ struct MemoriesView: View {
                     ScrollView {
                         LazyVStack(spacing: 6) {
                             ForEach(filteredMemories) { memory in
-                                MemoryRowView(memory: memory, onEdit: { editingMemory = memory }, onDelete: { delete(memory) })
+                                VStack(alignment: .leading, spacing: 6) {
+                                    MemoryRowView(memory: memory,
+                                                  onEdit: { editingMemory = memory },
+                                                  onDelete: { delete(memory) })
+                                    if memory.needsReview {
+                                        HStack(spacing: 8) {
+                                            Text("Read off your screen — not used until you confirm")
+                                                .font(MW.monoSm)
+                                                .foregroundStyle(MW.textMuted)
+                                            Spacer()
+                                            Button("Confirm") { confirm(memory) }
+                                                .buttonStyle(.borderless)
+                                                .font(MW.monoSm)
+                                            Button("Discard") { delete(memory) }
+                                                .buttonStyle(.borderless)
+                                                .font(MW.monoSm)
+                                                .foregroundStyle(MW.textMuted)
+                                        }
+                                        .padding(.horizontal, 4)
+                                    }
+                                }
                             }
                         }
                         .padding(16)
@@ -121,6 +150,7 @@ struct MemoriesView: View {
             try? await Task.sleep(for: .milliseconds(500))
             let newCount = memories.count
             let delta = newCount - beforeCount
+            NSLog("[MemoriesView] EXTRACT NOW finished — %d memories before, %d after (banner: %@)", beforeCount, newCount, delta > 0 ? "added" : "none")
             extractionResult = delta > 0
                 ? "Added \(delta) new \(delta == 1 ? "memory" : "memories")"
                 : "No new memories this cycle (nothing valuable to extract)"
@@ -153,9 +183,25 @@ struct MemoriesView: View {
 
     private var filteredMemories: [UserMemory] {
         switch selectedFilter {
-        case .all: return memories
-        case .system: return memories.filter { $0.category == "system" }
-        case .interesting: return memories.filter { $0.category == "interesting" }
+        // ITER-071.6 — proposals read off the screen are held out of the main
+        // list: they are not facts about the user until the user says so.
+        case .all: return memories.filter { !$0.needsReview }
+        case .review: return memories.filter { $0.needsReview }
+        case .system: return memories.filter { $0.category == "system" && !$0.needsReview }
+        case .interesting:
+            return memories.filter { $0.category == "interesting" && !$0.needsReview }
+        }
+    }
+
+    /// Accept a screen-proposed fact: from here on the assistant may use it.
+    private func confirm(_ memory: UserMemory) {
+        do {
+            try MutationService.shared.commit(.memorySaved(memory.id), in: modelContext) {
+                memory.needsReview = false
+                memory.updatedAt = Date()
+            }
+        } catch {
+            NSLog("[Memories] confirm failed: %@", error.localizedDescription)
         }
     }
 
@@ -198,9 +244,16 @@ struct MemoriesView: View {
     }
 
     private func delete(_ memory: UserMemory) {
-        memory.isDismissed = true
-        memory.updatedAt = Date()
-        try? modelContext.save()
+        // SB-3 / AUD-030 — soft dismiss AND remove the vault file (only on a
+        // successful save). Previously the Obsidian .md lingered forever.
+        do {
+            try MutationService.shared.commit(.memoryDismissed(memory.id), in: modelContext) {
+                memory.isDismissed = true
+                memory.updatedAt = Date()
+            }
+        } catch {
+            NSLog("[MemoriesView] dismiss save failed: %@", error.localizedDescription)
+        }
     }
 }
 
@@ -301,9 +354,16 @@ private struct MemoryEditSheet: View {
                 Button("Cancel", action: onDismiss)
                     .font(MW.mono)
                 Button("Save") {
-                    memory.content = editedContent
-                    memory.updatedAt = Date()
-                    try? modelContext.save()
+                    // SB-3 — re-export the edited memory to the vault + refresh MCP
+                    // on a successful save.
+                    do {
+                        try MutationService.shared.commit(.memorySaved(memory.id), in: modelContext) {
+                            memory.content = editedContent
+                            memory.updatedAt = Date()
+                        }
+                    } catch {
+                        NSLog("[MemoriesView] edit save failed: %@", error.localizedDescription)
+                    }
                     onDismiss()
                 }
                 .font(MW.mono)

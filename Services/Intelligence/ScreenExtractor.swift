@@ -9,6 +9,14 @@ import SwiftData
 /// spec://BACKLOG#Phase2.R1 + R2
 @MainActor
 final class ScreenExtractor: ObservableObject {
+    /// ITER-041 — schema is the most complex in the codebase (3 arrays:
+    /// observations + memories + tasks, with per-element nested fields).
+    /// 8B-instant produced malformed JSON in production (PID 24170 ran with
+    /// mini before today's fix: «Parse failed» repeated). Moved to medium
+    /// tier; still ~4× cheaper than the historical heavy default.
+    static let llmTier: LLMTier = .medium
+    static let llmServiceId: String = "ScreenExtractor"
+
     @Published var isRunning = false
     @Published var lastRun: Date?
     @Published var lastError: String?
@@ -22,6 +30,9 @@ final class ScreenExtractor: ObservableObject {
     private let visitGapSeconds: TimeInterval = 60 * 5  // 5 min
     /// Max visits per batch call (trims prompt size).
     private let maxVisitsPerBatch = 20
+    /// The page size, visible to tests so the paging contract is pinned
+    /// against the real number rather than a copy of it.
+    nonisolated static let maxVisitsPerBatchForTests = 20
     /// Preview chars from OCR per visit in the prompt.
     private let ocrPreviewChars = 300
 
@@ -51,6 +62,15 @@ final class ScreenExtractor: ObservableObject {
         await extractBatch()
     }
 
+    /// ITER-053.1 — purge fence. «Delete screen history» bumps the epoch; an
+    /// in-flight batch that started BEFORE the bump discards its results
+    /// instead of re-inserting rows distilled from just-deleted OCR (Codex
+    /// review: the LLM await window let deleted history reappear).
+    private var purgeEpoch = 0
+    func invalidatePendingWork() {
+        purgeEpoch += 1
+    }
+
     // MARK: - Batch logic
 
     private func extractBatch() async {
@@ -65,34 +85,82 @@ final class ScreenExtractor: ObservableObject {
         isRunning = true
         defer {
             isRunning = false
-            lastRun = Date()
         }
+        // ITER-053.1 purge fence — snapshot the epoch before any await.
+        let epoch = purgeEpoch
+        // Review fix — lastRun advances ONLY after a successful pass (or a
+        // legitimately empty window); a parse failure used to permanently
+        // skip the whole visits batch because defer stamped it processed.
 
         let ctx = ModelContext(container)
         let since = lastRun ?? Date().addingTimeInterval(-3600)
 
         // Fetch ScreenContexts since last run, oldest first.
+        // Strictly newer than the checkpoint: an inclusive boundary re-read
+        // and re-processed the row the last pass ended on, every pass (Codex).
         var descriptor = FetchDescriptor<ScreenContext>(
-            predicate: #Predicate { $0.timestamp >= since },
+            predicate: #Predicate { $0.timestamp > since },
             sortBy: [SortDescriptor(\.timestamp, order: .forward)]
         )
         descriptor.fetchLimit = 500
         let contexts = (try? ctx.fetch(descriptor)) ?? []
         guard !contexts.isEmpty else {
+            lastRun = Date()   // empty window — legitimately done
             NSLog("[ScreenExtractor] No new screen contexts since %@", since.description)
             return
         }
 
-        // Group into visits.
-        let visits = collapseIntoVisits(contexts)
-        guard !visits.isEmpty else { return }
-        let trimmed = Array(visits.suffix(maxVisitsPerBatch))
+        // ITER-071.2 — visits come from the canonical table the live agent
+        // writes, not from app/time reconstruction. Batch and realtime now
+        // describe ONE reality. (Rows not covered by any canonical visit —
+        // pre-cutover history still inside the window — take the legacy
+        // collapse explicitly, so nothing is dropped silently.)
+        let visitRecords: [ContextVisitRecord]
+        do {
+            visitRecords = try ctx.fetch(FetchDescriptor<ContextVisitRecord>(
+                predicate: #Predicate { $0.lastObservedAt >= since },
+                sortBy: [SortDescriptor(\.startedAt, order: .forward)]))
+        } catch {
+            // A failed read is not "there are no visits": treating it that way
+            // declared every live row pre-cutover, ran legacy grouping on it,
+            // and advanced the checkpoint past the hour (Codex). Leave the
+            // window unprocessed and try again next pass.
+            NSLog("[ScreenExtractor] visit read failed (%@) — leaving the window unprocessed",
+                  error.localizedDescription)
+            return
+        }
+        let visits = canonicalVisits(for: contexts, records: visitRecords)
+        guard !visits.isEmpty else { lastRun = Date(); return }
+        // ITER-071.3 — an ordered page, oldest first. Taking the NEWEST twenty
+        // and then checkpointing at the oldest of those meant everything older
+        // sat before the new floor and was never fetched again: the visits the
+        // log called "deferred" were being lost, not deferred (Codex).
+        //
+        // The checkpoint is the last moment this pass actually consumed, so a
+        // deferred visit is simply the next page — nothing skipped, nothing
+        // read twice.
+        let trimmed = Array(visits.prefix(maxVisitsPerBatch))
+        let droppedCount = visits.count - trimmed.count
+        let checkpointFloor: Date? = droppedCount > 0 ? trimmed.last?.endedAt : nil
+        if droppedCount > 0 {
+            NSLog("[ScreenExtractor] %d visits queued for the next pass (batch cap %d)",
+                  droppedCount, maxVisitsPerBatch)
+        }
 
         let prompt = buildPrompt(visits: trimmed)
+        NSLog("[ScreenExtractor] batch start: %d contexts, %d visit records → %d visits, prompt %d chars, route=%@", contexts.count, visitRecords.count, trimmed.count, prompt.count, LocalLLMService.shared.isReady ? "local" : (LicenseService.shared.isPro ? "pro" : "byok"))
 
         do {
             let response: String
-            if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
+            // ITER-051 F1.3 — local model first (free + private), same priority
+            // order as MemoryExtractor. Falls to cloud paths when not loaded.
+            if LocalLLMService.shared.isReady {
+                // ITER-057.5 — 384 tokens truncated the JSON (up to 20 observations
+                // + memories + tasks), producing the hourly "Parse error" loop.
+                response = try await LocalLLMService.shared.completeBlocking(
+                    system: Self.systemPrompt, user: prompt,
+                    maxUserChars: 6000, maxTokens: 1024)
+            } else if LicenseService.shared.isPro, let licenseKey = LicenseService.shared.licenseKey {
                 NSLog("[ScreenExtractor] Analyzing %d visits via Pro proxy", trimmed.count)
                 response = try await callProProxy(system: Self.systemPrompt, user: prompt, licenseKey: licenseKey)
             } else {
@@ -109,6 +177,15 @@ final class ScreenExtractor: ObservableObject {
 
             guard let parsed = parseResponse(response) else {
                 NSLog("[ScreenExtractor] ⚠️ Parse failed")
+                NSLog("[ScreenExtractor] response was %d chars for %d visits", response.count, trimmed.count)
+                return
+            }
+
+            // ITER-053.1 purge fence — the user deleted screen history while
+            // we were awaiting the LLM. Discard this batch: its visits were
+            // built from rows that no longer exist.
+            guard epoch == purgeEpoch else {
+                NSLog("[ScreenExtractor] Batch discarded — screen history was purged mid-run")
                 return
             }
 
@@ -117,7 +194,8 @@ final class ScreenExtractor: ObservableObject {
             // startedAt + minVisitSeconds to prevent 0-duration rows (single-sample visits
             // previously had start == end, which broke dashboard "top apps by time").
             var obsCount = 0
-            for (i, obsJson) in parsed.observations.enumerated() where i < trimmed.count {
+            var newObservations: [ScreenObservation] = []
+            for (i, obsJson) in (parsed.observations ?? []).enumerated() where i < trimmed.count {
                 let v = trimmed[i]
                 let durationFloor = AppSettings.shared.screenContextInterval
                 let safeEnd = max(v.endedAt, v.startedAt.addingTimeInterval(durationFloor))
@@ -135,22 +213,40 @@ final class ScreenExtractor: ObservableObject {
                     endedAt: safeEnd
                 )
                 ctx.insert(obs)
+                newObservations.append(obs)
                 obsCount += 1
+            }
+            // ITER-053.4 slice 2 — fire-and-forget embeddings so
+            // searchScreenHistory ranks these semantically (graceful nil-fail).
+            if !newObservations.isEmpty {
+                AppDelegate.shared?.embeddingService.embedScreenObservationsInBackground(newObservations, in: ctx)
             }
 
             // 2. Persist memories — linked back to the visit's ScreenContext.
             let existingMems = fetchRecentMemoryContents(in: ctx, limit: 100)
             var newMemories: [UserMemory] = []
-            for memJson in (parsed.memories ?? []) where memJson.visitIndex < trimmed.count {
+            // Facts accepted in THIS response count as existing too: the
+            // comparison used a snapshot taken before the loop, so one answer
+            // containing the same sentence twice inserted it twice.
+            var acceptedThisPass: [String] = []
+            for memJson in (parsed.memories ?? []) where Self.isValidVisitIndex(memJson.visitIndex, count: trimmed.count) {
                 let v = trimmed[memJson.visitIndex]
                 let wordCount = memJson.content.split(separator: " ").count
                 guard wordCount <= 15 else { continue }
                 guard ["system", "interesting"].contains(memJson.category) else { continue }
                 // Dedup against existing memories (exact content match — LLM's own semantic dedup is in prompt).
                 let trimmedContent = memJson.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                if existingMems.contains(where: { $0.caseInsensitiveCompare(trimmedContent) == .orderedSame }) {
-                    continue
-                }
+                // Exact text, anywhere in the store — not just the recent
+                // window. The live store holds three identical copies of
+                // "User conducts SEO analysis for example.com" because a
+                // bounded recent list had scrolled past the earlier ones.
+                if Self.memoryExists(exactly: trimmedContent, in: ctx) { continue }
+                // Same fact, different sentence. Reuses the director's own
+                // near-duplicate rule — stemmed content words, so Russian
+                // inflection and reordering do not create a second copy.
+                if (existingMems + acceptedThisPass).contains(where: {
+                    ScreenAgentDirector.isNearDuplicate($0, trimmedContent)
+                }) { continue }
                 let confidence = memJson.confidence ?? 0.7
                 guard confidence >= 0.6 else { continue }
                 let mem = UserMemory(
@@ -163,8 +259,13 @@ final class ScreenExtractor: ObservableObject {
                     conversationId: nil,
                     screenContextId: v.lastContextId
                 )
+                // ITER-071.6 — a fact read off the screen is a PROPOSAL. It is
+                // kept, so nothing is lost, but the assistant does not treat it
+                // as something it knows about the user until the user says so.
+                mem.needsReview = true
                 ctx.insert(mem)
                 newMemories.append(mem)
+                acceptedThisPass.append(trimmedContent)
             }
             let memCount = newMemories.count
 
@@ -175,11 +276,12 @@ final class ScreenExtractor: ObservableObject {
             var newTasks: [TaskItem] = []
             let dueParser = ISO8601DateFormatter()
             dueParser.formatOptions = [.withInternetDateTime]
-            for taskJson in (parsed.tasks ?? []) where taskJson.visitIndex < trimmed.count {
+            for taskJson in (parsed.tasks ?? []) where Self.isValidVisitIndex(taskJson.visitIndex, count: trimmed.count) {
                 let v = trimmed[taskJson.visitIndex]
-                // Per-visit app blacklist — AI assistants + self + IDEs + messengers never produce tasks.
-                if TaskExtractionFilters.isTaskBlacklisted(appName: v.appName) {
-                    NSLog("[ScreenExtractor] Skipping task from blacklisted app %@: %@",
+                // ITER-057.5 — whitelist: only conversation surfaces (messengers /
+                // mail / work browser tabs) produce tasks. Same gate as the reactor.
+                if !TaskExtractionFilters.isTaskAllowed(appName: v.appName, windowTitle: v.windowTitle) {
+                    NSLog("[ScreenExtractor] Skipping task from non-whitelisted app %@: %@",
                           v.appName, String(taskJson.description.prefix(60)))
                     continue
                 }
@@ -194,6 +296,15 @@ final class ScreenExtractor: ObservableObject {
                     continue
                 }
                 let evidence = taskJson.evidence?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                // ITER-066 — the quote must occur in the preview the model was
+                // shown. The preview is exactly its input, so a quote that is
+                // not in it was not read off the screen, it was made up.
+                guard ScreenAgentEvidence.normalize(v.ocrPreview)
+                    .contains(ScreenAgentEvidence.normalize(evidence)) else {
+                    NSLog("[ScreenExtractor] Task evidence not in visit OCR, skipping: %@",
+                          String(trimmedDesc.prefix(60)))
+                    continue
+                }
                 guard evidence.count >= TaskExtractionFilters.minEvidenceChars else {
                     NSLog("[ScreenExtractor] Evidence too weak (%d chars), skipping: %@",
                           evidence.count, String(trimmedDesc.prefix(60)))
@@ -201,7 +312,7 @@ final class ScreenExtractor: ObservableObject {
                 }
                 // Generic-phrase reject list.
                 if TaskExtractionFilters.isGenericNoise(trimmedDesc) {
-                    NSLog("[ScreenExtractor] Generic noise, skipping: %@", trimmedDesc)
+                    NSLog("[ScreenExtractor] generic noise, skipping (%d chars)", trimmedDesc.count)
                     continue
                 }
                 // ITER-032 — strict title validator (replaces reference's tool-loop
@@ -215,12 +326,20 @@ final class ScreenExtractor: ObservableObject {
                 }
                 // Fuzzy dedup — 60% word overlap counts as a duplicate.
                 if TaskExtractionFilters.isNearDuplicate(trimmedDesc, against: existingTasks) {
-                    NSLog("[ScreenExtractor] Near-duplicate task, skipping: %@", String(trimmedDesc.prefix(60)))
+                    NSLog("[ScreenExtractor] near-duplicate task, skipping (%d chars)", trimmedDesc.count)
                     continue
                 }
                 // Also avoid dup against tasks we're inserting in THIS batch.
                 let batchDescs = newTasks.map { $0.taskDescription }
                 if TaskExtractionFilters.isNearDuplicate(trimmedDesc, against: batchDescs) { continue }
+                // The hourly analysis is the other producer that filled the
+                // staged bin nobody could read. Same rule as the realtime one:
+                // notice, do not create.
+                guard ScreenDerivedTaskPolicy.mayMutateWithoutConfirmation else {
+                    NSLog("[ScreenExtractor] observed a task in the hour's work — not creating one (%d chars)",
+                          trimmedDesc.count)
+                    continue
+                }
                 var due: Date? = nil
                 if let raw = taskJson.dueAt, !raw.isEmpty, raw != "null" {
                     due = dueParser.date(from: raw)
@@ -240,7 +359,18 @@ final class ScreenExtractor: ObservableObject {
                 newTasks.append(task)
             }
 
-            try? ctx.save()
+            do {
+                try ctx.save()
+            } catch {
+                // ITER-071 — this was `try?` followed by an unconditional
+                // checkpoint, so a failed write was recorded as an hour
+                // successfully processed and its observations were gone.
+                NSLog("[ScreenExtractor] ❌ save failed (%@) — leaving the window unprocessed",
+                      error.localizedDescription)
+                return
+            }
+            // Only past what was actually looked at.
+            lastRun = checkpointFloor ?? Date()
             NSLog("[ScreenExtractor] ✅ %d observations, %d memories, %d tasks from %d visits",
                   obsCount, memCount, newTasks.count, trimmed.count)
 
@@ -262,7 +392,7 @@ final class ScreenExtractor: ObservableObject {
     // MARK: - Visit collapsing
 
     /// A "visit" = consecutive ScreenContexts on the same app within gap threshold.
-    private struct Visit {
+    struct Visit {
         let appName: String
         let windowTitle: String?
         let startedAt: Date
@@ -271,12 +401,72 @@ final class ScreenExtractor: ObservableObject {
         let lastContextId: UUID?
     }
 
-    private func collapseIntoVisits(_ contexts: [ScreenContext]) -> [Visit] {
+    /// ITER-071.2 — build Visit structures from the canonical table the live
+    /// agent writes. The rule US-071-3 exists for: batch analysis consumes the
+    /// same immutable visit identity as realtime and never rebuilds visits
+    /// from app name plus five-minute gaps. Contexts not covered by any
+    /// canonical visit (pre-cutover rows still inside the window) take the
+    /// legacy collapse explicitly — processed, never silently dropped.
+    nonisolated func canonicalVisits(
+        for contexts: [ScreenContext],
+        records: [ContextVisitRecord]
+    ) -> [Visit] {
+        let byID = Dictionary(contexts.map { ($0.id, $0) },
+                              uniquingKeysWith: { first, _ in first })
+        var covered = Set<UUID>()
+        var visits: [Visit] = []
+        for record in records.sorted(by: { $0.startedAt < $1.startedAt }) {
+            let listed = Set(record.frameIDs)
+            let observedUntil = record.endedAt ?? record.lastObservedAt
+            // Listed frames, PLUS any row that falls inside this visit's own
+            // observed window for the same window identity: the frame list is
+            // a bounded 32, so a long visit's oldest frames drop off it — and
+            // without this they resurfaced as a second, legacy visit for the
+            // very same stretch, and the model was handed the same window
+            // twice (Codex).
+            let frames = contexts.filter { c in
+                if listed.contains(c.id) { return true }
+                guard c.appName == record.appName,
+                      c.timestamp >= record.startedAt, c.timestamp <= observedUntil
+                else { return false }
+                return WindowTitleNormalizer.normalize(c.windowTitle) == record.normalizedTitle
+            }.sorted { $0.timestamp < $1.timestamp }
+            guard let first = frames.first, let last = frames.last else { continue }
+            frames.forEach { covered.insert($0.id) }
+            var ocr = ""
+            for frame in frames where !frame.ocrText.isEmpty && ocr.count < ocrPreviewChars {
+                if !ocr.isEmpty { ocr += " " }
+                ocr += frame.ocrText.replacingOccurrences(of: "\n", with: " ")
+            }
+            visits.append(Visit(
+                appName: record.appName,
+                windowTitle: record.rawTitle,
+                // The slice describes what THIS page actually saw. Taking the
+                // record's own start and end would credit the visit with time
+                // no frame in this batch witnessed — a visit that began at
+                // 09:50 with one frame at 10:05 claimed fifteen minutes of
+                // work nobody observed, and the day report adds those up.
+                startedAt: first.timestamp,
+                endedAt: last.timestamp,
+                ocrPreview: String(ocr.prefix(ocrPreviewChars)),
+                lastContextId: last.id))
+        }
+        let uncovered = contexts.filter { !covered.contains($0.id) }
+        let legacy = collapseIntoVisits(uncovered)
+        return (visits + legacy).sorted { $0.startedAt < $1.startedAt }
+    }
+
+    /// Internal (not private) so `ScreenExtractorVisitGroupingTests` can pin
+    /// the boundary rule, matching the convention the other extractors use.
+    /// Post-071.2 this is the LEGACY fallback for pre-cutover rows only —
+    /// production grouping is `canonicalVisits`.
+    nonisolated func collapseIntoVisits(_ contexts: [ScreenContext]) -> [Visit] {
         var visits: [Visit] = []
         var currentApp: String? = nil
         var currentStart: Date? = nil
         var currentEnd: Date? = nil
         var currentWindowTitle: String? = nil
+        var currentNormalizedTitle: String? = nil
         var currentOcrBuilder = ""
         var currentLastId: UUID? = nil
         var lastTime: Date? = nil
@@ -297,16 +487,28 @@ final class ScreenExtractor: ObservableObject {
             currentStart = nil
             currentEnd = nil
             currentWindowTitle = nil
+            currentNormalizedTitle = nil
             currentOcrBuilder = ""
             currentLastId = nil
         }
 
         for c in contexts {
             let gap = lastTime.map { c.timestamp.timeIntervalSince($0) } ?? 0
-            let isNewVisit = c.appName != currentApp || gap > visitGapSeconds
+            // ITER-071 — a different WINDOW is a different visit, not just a
+            // different app. Grouping by app alone merged two browser tabs or
+            // two Slack channels into one stretch, and then attached the last
+            // window's title to OCR accumulated across all of them — so a fact
+            // from one conversation could be attributed to another. Cosmetic
+            // title churn is normalized away first, or a ticking clock in a
+            // title would shatter one visit into dozens.
+            let normalized = WindowTitleNormalizer.normalize(c.windowTitle)
+            let isNewVisit = c.appName != currentApp
+                || normalized != currentNormalizedTitle
+                || gap > visitGapSeconds
             if isNewVisit {
                 flush()
                 currentApp = c.appName
+                currentNormalizedTitle = normalized
                 currentStart = c.timestamp
             }
             currentEnd = c.timestamp
@@ -405,7 +607,11 @@ final class ScreenExtractor: ObservableObject {
             let start = df.string(from: v.startedAt)
             let end = df.string(from: v.endedAt)
             let title = v.windowTitle ?? ""
-            lines.append("Visit \(i + 1) — \(v.appName) · \(start)-\(end) · \(title)")
+            // Codex P1 — the parser and the prompt's own instructions are
+            // zero-based, but the labels said "Visit 1". A model following the
+            // labels dropped the only visit or validated against the wrong
+            // OCR; a model following the instructions contradicted the labels.
+            lines.append("Visit \(i) — \(v.appName) · \(start)-\(end) · \(title)")
             if !v.ocrPreview.isEmpty {
                 lines.append("  OCR: \(v.ocrPreview)")
             }
@@ -414,6 +620,18 @@ final class ScreenExtractor: ObservableObject {
         let joined = lines.joined(separator: "\n")
         if joined.count > 20000 { return String(joined.prefix(20000)) }
         return joined
+    }
+
+    // MARK: - Model index guard
+
+    /// The LLM supplies `visitIndex` for every memory/task it returns. It is a
+    /// raw `Int` off the wire, so it can be negative — and `trimmed[-1]` is a
+    /// fatal trap, not a caught error.
+    ///
+    /// Internal (not private) so `ScreenExtractorVisitIndexTests` pins the
+    /// contract, matching the `MemoryExtractor.parseResponse` convention.
+    nonisolated static func isValidVisitIndex(_ index: Int, count: Int) -> Bool {
+        index >= 0 && index < count
     }
 
     // MARK: - Response parse
@@ -442,7 +660,9 @@ final class ScreenExtractor: ObservableObject {
         let dueAt: String?
     }
     private struct BatchResult: Decodable {
-        let observations: [ObservationJSON]
+        // ITER-057.5 — optional: a truncated/partial response with only memories
+        // or tasks shouldn't fail the whole batch ("Parse error … Response head: {").
+        let observations: [ObservationJSON]?
         let memories: [MemoryJSON]?
         let tasks: [TaskJSON]?
     }
@@ -501,7 +721,10 @@ final class ScreenExtractor: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 60
 
-        let body: [String: Any] = ["system": system, "user": user]
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user,
+            tier: Self.llmTier, serviceId: Self.llmServiceId
+        )
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -514,23 +737,41 @@ final class ScreenExtractor: ObservableObject {
     }
 
     private var hasLLMAccess: Bool {
+        // ITER-051 F1.3 — the local model is a first-class access path, same
+        // as MemoryExtractor/TaskExtractor (the Memories screen already told
+        // local-only users these readers work).
         !settings.activeAPIKey.isEmpty || LicenseService.shared.isPro
+            || LocalLLMService.shared.isReady
     }
 
     // MARK: - Dedup helpers (cheap Swift-side check against last N entries)
 
+    /// Exact-text existence across the WHOLE store, dismissed rows included.
+    /// A bounded recent list is not a dedup index: three identical copies of
+    /// the same sentence are in the live store because the earlier ones had
+    /// scrolled out of the window by the time the fact came round again.
+    nonisolated static func memoryExists(exactly content: String, in ctx: ModelContext) -> Bool {
+        var desc = FetchDescriptor<UserMemory>(predicate: #Predicate { $0.content == content })
+        desc.fetchLimit = 1
+        return ((try? ctx.fetch(desc))?.isEmpty == false)
+    }
+
+    /// INCLUDES dismissed rows, matching what tasks already do below: a fact
+    /// the user threw away must not come back an hour later. Discarding a
+    /// screen proposal is a verdict, and re-proposing it is the product
+    /// arguing with the user once per hour, forever.
     private func fetchRecentMemoryContents(in ctx: ModelContext, limit: Int) -> [String] {
         var desc = FetchDescriptor<UserMemory>(
-            predicate: #Predicate { !$0.isDismissed },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
-        desc.fetchLimit = limit
+        desc.fetchLimit = limit * 2
         return ((try? ctx.fetch(desc)) ?? []).map { $0.content }
     }
 
+    /// ITER-057.5 — INCLUDES dismissed rows: a task the user rejected must not
+    /// resurrect from the next batch (dismissed = permanent negative example).
     private func fetchRecentTaskDescriptions(in ctx: ModelContext, limit: Int) -> [String] {
         var desc = FetchDescriptor<TaskItem>(
-            predicate: #Predicate { !$0.isDismissed },
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         desc.fetchLimit = limit

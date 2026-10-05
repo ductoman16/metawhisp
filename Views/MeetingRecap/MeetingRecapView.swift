@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Per-meeting recap popup card (2026-04-29).
@@ -17,8 +18,17 @@ struct MeetingRecapView: View {
     var onToggleTask: (UUID) -> Void
 
     var body: some View {
+        // ITER-050 B2.2 — the card window is sized exactly to the pill
+        // (two-window pattern, see MeetingRecapWindowController); the drop
+        // shadow is drawn by CardShadowView in the shadow child window.
         if let p = state.payload {
-            VStack(alignment: .leading, spacing: 0) {
+            recapPill(p)
+        }
+    }
+
+    @ViewBuilder
+    private func recapPill(_ p: MeetingRecapState.Payload) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
                 header(p)
                 divider
                 ScrollView {
@@ -85,30 +95,21 @@ struct MeetingRecapView: View {
                 RoundedRectangle(cornerRadius: MW.rLarge, style: .continuous)
                     .strokeBorder(MW.border, lineWidth: 0.5)
             )
-            .shadow(color: .black.opacity(0.4), radius: 32, y: 16)
-            .padding(40)
-        }
+            // Drop shadow lives in the shadow child window (CardShadowView) —
+            // ITER-050 B2.2 two-window pattern, same as MeetingCoach.
     }
 
     // MARK: - Header
 
     private func header(_ p: MeetingRecapState.Payload) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            // `Conversation.emoji` is set by StructuredGenerator and may hold
-            // EITHER a Unicode emoji ("📞") OR an SF Symbol name ("bubble.left").
-            // Detect SF symbol by the presence of a dot in the string +
-            // absence of any emoji-presentation scalar — render with
-            // Image(systemName:) so the user sees a glyph, not raw text.
-            if let emoji = p.emoji, !emoji.isEmpty {
-                if isSFSymbolName(emoji) {
-                    Image(systemName: emoji)
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(MW.textSecondary)
-                } else {
-                    Text(emoji)
-                        .font(.system(size: 22))
-                }
-            }
+            // Conversation.emoji (SF Symbol picked by LLM) is intentionally
+            // omitted from the recap header. User feedback 2026-05-12: «должно
+            // быть написано только название созвона» — the LLM-picked symbols
+            // (`hammer`, `bell`, `gear`, …) felt arbitrary and added visual
+            // noise without informational value. The field is still populated
+            // and shown in ConversationsView/DetailView lists where it helps
+            // scanning, just not in the recap popup.
             VStack(alignment: .leading, spacing: 3) {
                 Text(p.title.isEmpty ? "Meeting" : p.title)
                     .font(.system(size: 15, weight: .semibold))
@@ -259,13 +260,14 @@ struct MeetingRecapView: View {
         return "\(mins / 60)h \(mins % 60)m"
     }
 
-    /// True if `s` looks like an SF Symbol name (e.g. "bubble.left",
-    /// "phone.connection") rather than a Unicode emoji ("📞"). SF Symbol names
-    /// are ASCII + dot-separated. Real emojis use codepoints in private-use
-    /// emoji blocks. Cheap heuristic: ASCII + contains a dot = SF Symbol.
+    /// True if `s` is a valid SF Symbol name. Asks AppKit directly via
+    /// `NSImage(systemSymbolName:)` — Apple's own resolver, no false positives
+    /// or negatives. 2026-05-12 — replaced the previous "contains a dot"
+    /// heuristic that missed single-word SF Symbols (`hammer`, `bell`, `gear`,
+    /// `star`, `phone`, `bubble`, …) and rendered them as literal text in
+    /// the recap header. User report: «не понимаю почему hammer ещё написано».
     private func isSFSymbolName(_ s: String) -> Bool {
-        guard !s.isEmpty else { return false }
-        guard s.allSatisfy({ $0.isASCII }) else { return false }
-        return s.contains(".")
+        guard !s.isEmpty, s.allSatisfy({ $0.isASCII }) else { return false }
+        return NSImage(systemSymbolName: s, accessibilityDescription: nil) != nil
     }
 }

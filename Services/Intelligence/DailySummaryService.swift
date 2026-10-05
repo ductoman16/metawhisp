@@ -1,6 +1,5 @@
 import Foundation
 import SwiftData
-import UserNotifications
 
 /// Generates the once-a-day recap (`DailySummary`). Runs:
 /// - On a 5-minute in-process timer: when today's scheduled time has passed and no
@@ -8,23 +7,28 @@ import UserNotifications
 /// - On explicit "GENERATE NOW" from Dashboard.
 /// - On app launch (catch-up if the machine was asleep past the scheduled time).
 ///
-/// Notification delivery uses the system `UNUserNotificationCenter`. The generation
-/// itself is in-process because macOS doesn't wake non-daemon apps at a cron time;
-/// MetaWhisp is a menu-bar app so it's running whenever the user is logged in.
+/// Delivery is the app's own notification stack (`MWNotificationStack`), the same
+/// surface every other card uses. It used to post a macOS notification, and the
+/// authorization request for those was removed when the in-app stack arrived —
+/// so for the life of that banner nobody knew whether it was shown at all. The
+/// generation itself is in-process because macOS doesn't wake non-daemon apps
+/// at a cron time; MetaWhisp is a menu-bar app so it's running whenever the
+/// user is logged in.
 ///
 /// spec://iterations/ITER-009-daily-summary
 @MainActor
 final class DailySummaryService: ObservableObject {
+    /// ITER-041 — daily synthesis from already-processed Memories/Tasks
+    /// on medium tier. Synthesis-only, not re-analysis.
+    static let llmTier: LLMTier = .medium
+    static let llmServiceId: String = "DailySummaryService"
+
     @Published var isRunning = false
     @Published var lastError: String?
     @Published var lastGenerationAt: Date?
-
     private let settings = AppSettings.shared
     private var modelContainer: ModelContainer?
     private var timerTask: Task<Void, Never>?
-
-    /// Notification identifier — swapped out on each re-schedule so the old one cancels.
-    private let notificationId = "com.metawhisp.daily-summary"
 
     func configure(modelContainer: ModelContainer) {
         self.modelContainer = modelContainer
@@ -45,6 +49,7 @@ final class DailySummaryService: ObservableObject {
             }
         }
         NSLog("[DailySummary] ✅ Scheduler started")
+        NSLog("[DailySummary] Fires at %02d:%02d · today's recap exists=%@", settings.dailySummaryHour, settings.dailySummaryMinute, hasSummary(for: Calendar.current.startOfDay(for: Date())) ? "yes" : "no")
     }
 
     func stopScheduler() {
@@ -87,17 +92,28 @@ final class DailySummaryService: ObservableObject {
         // Future days have no data — silently skip (UI shows placeholder anyway).
         let today = Calendar.current.startOfDay(for: Date())
         guard dayStart <= today else { return nil }
-        // Delete existing row for the date so the new one takes its place cleanly.
-        if fetchSummary(for: dayStart) != nil, let container = modelContainer {
+        // SB-7: generate FIRST and replace the existing summary ONLY if generation
+        // actually produced one. The old code deleted the existing row up front, so
+        // a nil generation (LLM unavailable / parse fail) lost the day's summary with
+        // nothing to put back.
+        guard let fresh = await generate(for: dayStart, postNotification: false) else {
+            return nil   // generation failed → existing summary (if any) left intact
+        }
+        // Success → drop any OTHER (older) rows for the date so the fresh one stands alone.
+        if let container = modelContainer {
             let ctx = ModelContext(container)
             let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
-            let rows = (try? ctx.fetch(FetchDescriptor<DailySummary>(
-                predicate: #Predicate { $0.date >= dayStart && $0.date < nextDay }
+            let freshId = fresh.id
+            let stale = (try? ctx.fetch(FetchDescriptor<DailySummary>(
+                predicate: #Predicate { $0.date >= dayStart && $0.date < nextDay && $0.id != freshId }
             ))) ?? []
-            for row in rows { ctx.delete(row) }
-            try? ctx.save()
+            for row in stale { ctx.delete(row) }
+            if !stale.isEmpty { try? ctx.save() }
+            // The refresh has to follow the LAST write. generate() refreshed
+            // while both rows existed and could hand the menu bar the very row
+            // deleted just above (review, 2026-09-01).
         }
-        return await generate(for: dayStart, postNotification: false)
+        return fresh
     }
 
     /// ITER-022 G_dashboard — Public read for the carousel.
@@ -107,10 +123,26 @@ final class DailySummaryService: ObservableObject {
         return fetchSummary(for: dayStart)
     }
 
+    /// `isRead` existed on the model from the start and was written by nobody,
+    /// so "0 of 130 read" measured the flag rather than the reader. It is set
+    /// when the recap is actually shown — by the Dashboard card, whichever
+    /// way the user arrived at it — not when something is clicked on the way.
+    func markRead(id: UUID) {
+        guard let modelContainer else { return }
+        let ctx = ModelContext(modelContainer)
+        var d = FetchDescriptor<DailySummary>(predicate: #Predicate { $0.id == id })
+        d.fetchLimit = 1
+        guard let row = (try? ctx.fetch(d))?.first, !row.isRead else { return }
+        row.isRead = true
+        NSLog("[DailySummary] Recap read %.0f min after generation", Date().timeIntervalSince(row.createdAt) / 60)
+        try? ctx.save()
+    }
+
     // MARK: - Core generation
 
     @discardableResult
     private func generate(for dayStart: Date, postNotification: Bool) async -> DailySummary? {
+        let generateStartedAt = Date()
         guard !isRunning else { return nil }
         guard hasLLMAccess else {
             NSLog("[DailySummary] No LLM access — skipping")
@@ -137,6 +169,7 @@ final class DailySummaryService: ObservableObject {
         // on standing targets ("ahead on writing, behind on push-ups"). Pulled at
         // generation time; daily-reset runs inside `resetIfNewDay` per goal.
         let goalsForDay = fetchActiveGoals(ctx: ctx)
+        NSLog("[DailySummary] ▶ Generate trigger=%@ day=%@ conv=%d mem=%d tasksNew=%d tasksDone=%d apps=%d goals=%d", postNotification ? "timer" : "button", dayStart.description, conversations.count, memoriesAdded.count, tasksCreated.count, tasksCompleted.count, topApps.count, goalsForDay.count)
 
         let isEmptyDay = conversations.isEmpty && memoriesAdded.isEmpty
             && tasksCreated.isEmpty && tasksCompleted.isEmpty && topApps.isEmpty
@@ -220,10 +253,20 @@ final class DailySummaryService: ObservableObject {
         summary.unresolvedQuestionsJSON = unresolved.isEmpty ? nil : DailySummary.encodeStringArray(unresolved)
         summary.dayEmoji = dayEmoji.isEmpty ? nil : dayEmoji
         ctx.insert(summary)
-        try? ctx.save()
+        // SB-7 tail: a silently-failed save here used to return the in-memory
+        // summary anyway — generateForDate would then delete the OLD rows while
+        // the new one never persisted (the exact loss SB-7 fixes). Fail → nil →
+        // caller keeps the previous summary.
+        do {
+            try ctx.save()
+        } catch {
+            NSLog("[DailySummary] ❌ save failed — keeping previous summary: %@", error.localizedDescription)
+            return nil
+        }
 
         NSLog("[DailySummary] ✅ Generated: %@ · L=%d D=%d S=%d Q=%d emoji=%@",
               headline, learned.count, decided.count, shipped.count, unresolved.count, dayEmoji)
+              NSLog("[DailySummary] ✅ Generated day=%@ in %.1fs · L=%d D=%d S=%d Q=%d emoji=%@ energy=%d chars · excerpts=%d chars over %d conv · card=%@", dayStart.description, Date().timeIntervalSince(generateStartedAt), learned.count, decided.count, shipped.count, unresolved.count, dayEmoji.isEmpty ? "no" : "yes", energy.count, convExcerpts.values.reduce(0, { $0 + $1.count }), convExcerpts.count, postNotification ? "yes" : "no")
 
         if postNotification {
             postDeliveryNotification(title: headline, overview: energy)
@@ -467,7 +510,7 @@ final class DailySummaryService: ObservableObject {
         guard let data = extracted.data(using: .utf8) else { return [] }
         guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let arr = dict[key] as? [String] else {
-            NSLog("[DailySummary] %@ parse failed: %@", key, String(extracted.prefix(120)))
+            NSLog("[DailySummary] %@ parse failed — %d chars", key, extracted.count)
             return []
         }
         return arr.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -485,27 +528,31 @@ final class DailySummaryService: ObservableObject {
         return str.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - macOS notification (native UNUserNotificationCenter)
+    // MARK: - The card
 
+    /// The same in-app card every other announcement uses, with a tap that
+    /// opens the recap. The previous macOS notification had no click handler
+    /// for its whole life, and — since the authorization request was removed
+    /// when the in-app stack arrived — no proof it was ever shown.
+    ///
+    /// The card lives the stack's ordinary few seconds; the menu-bar row is
+    /// the durable surface and stays offered until the recap is read (see
+    /// `DayRecapStrip`). Opening it ends the card's life on screen, as with
+    /// every other card that opens something — left up, it sits over the
+    /// window it just opened.
     private func postDeliveryNotification(title: String, overview: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "Day recap ready"
-        content.subtitle = title
-        content.body = String(overview.prefix(180))
-        content.sound = .default
-        content.categoryIdentifier = "DAILY_SUMMARY"
-        content.userInfo = ["target": "dashboard"]
-
-        let request = UNNotificationRequest(
-            identifier: "\(notificationId)-\(Int(Date().timeIntervalSince1970))",
-            content: content,
-            trigger: nil // immediate delivery
-        )
-        UNUserNotificationCenter.current().add(request) { err in
-            if let err {
-                NSLog("[DailySummary] Notification post failed: %@", err.localizedDescription)
+        let noteID = UUID()
+        let note = MWNotification(
+            id: noteID,
+            kind: .dayRecap,
+            title: title,
+            body: String(overview.prefix(180)),
+            onTap: { @MainActor in
+                AppDelegate.shared?.openMainWindow(tab: .dashboard)
+                MWNotificationStack.shared.dismiss(id: noteID, reason: .opened)
             }
-        }
+        )
+        Task { @MainActor in MWNotificationStack.shared.push(note) }
     }
 
     // MARK: - Data fetch helpers
@@ -524,7 +571,7 @@ final class DailySummaryService: ObservableObject {
     private func fetchMemoriesAdded(ctx: ModelContext, from start: Date, to end: Date) -> [UserMemory] {
         var desc = FetchDescriptor<UserMemory>(
             predicate: #Predicate {
-                !$0.isDismissed && $0.createdAt >= start && $0.createdAt < end
+                !$0.isDismissed && !$0.needsReview && $0.createdAt >= start && $0.createdAt < end
             },
             sortBy: [SortDescriptor(\.createdAt, order: .forward)]
         )
@@ -891,11 +938,15 @@ final class DailySummaryService: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
 
-        let body: [String: Any] = ["system": system, "user": user]
+        let body = LLMRequestBody.proAdviceBody(
+            system: system, user: user,
+            tier: Self.llmTier, serviceId: Self.llmServiceId
+        )
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+        NSLog("[DailySummary] ❌ Proxy HTTP %d%@", http.statusCode, StructuredGenerator.proxyReason(data))
             throw NSError(domain: "DailySummary", code: http.statusCode,
                           userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])
         }

@@ -68,6 +68,22 @@ final class UserMemory {
     var subject: String?
     var characterization: String?
 
+    /// Project this memory belongs to. Drives ObsidianExporter folder
+    /// placement: `Memories/<project>/<date>--<slug>.md`. Nil → "General".
+    /// Added 2026-05-12 (ITER-035 Obsidian sync v2). SwiftData lightweight
+    /// migration: Optional field added without schema version bump, legacy
+    /// rows get nil = General bucket.
+    var project: String?
+
+    /// ITER-071.6 — a fact the hourly screen analysis PROPOSED, not one the
+    /// user stands behind. Stored so nothing is lost, excluded from what the
+    /// assistant treats as known about the user until confirmed.
+    ///
+    /// 858 screen-derived facts had accumulated with no confirmation step at
+    /// all: a misread became something the assistant believed about you,
+    /// permanently, unless you found it in a list and removed it.
+    var needsReview: Bool = false
+
     init(
         content: String,
         category: String,

@@ -1,0 +1,446 @@
+import SwiftData
+import XCTest
+@testable import MetaWhisp
+
+/// ITER-049 B + ITER-053.4 + ITER-057.2 — schema versioning proofs.
+///
+/// History: V1 anchored the original 14-model shape. ITER-053.4 added
+/// `ScreenObservation.embedding` (V2, froze the pre-embedding observation).
+/// ITER-057.2 added `TaskItem.relevanceScore` (V3, froze the pre-score task
+/// shape under the V2 namespace). These tests prove an existing user's store
+/// survives every stage with data intact.
+final class SchemaMigrationTests: XCTestCase {
+
+    private var dir: URL!
+    private var storeURL: URL!
+
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("schemamig-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        storeURL = dir.appendingPathComponent("MetaWhisp.store")
+    }
+
+    override func tearDownWithError() throws { try? FileManager.default.removeItem(at: dir) }
+
+    /// THE ship-gate: a store written under V1 (pre-embedding observation,
+    /// pre-score task) reopens under the LATEST schema + migration plan with
+    /// every row intact and the new columns nil — no wipe, no degraded fallback.
+    func testV1StoreMigratesToLatestWithDataIntact() throws {
+        var digestIds: [UUID] = []
+        // 1. Write a store the OLD way: V1 schema (frozen shapes).
+        do {
+            let v1Schema = Schema(versionedSchema: MetaWhispSchemaV1.self)
+            let cfg = ModelConfiguration(schema: v1Schema, url: storeURL)
+            let container = try ModelContainer(for: v1Schema, configurations: [cfg])
+            let ctx = ModelContext(container)
+            let d1 = PatternDigest(weekStartDate: Date(timeIntervalSince1970: 0), windowDays: 7, conversationsAnalyzed: 3)
+            let d2 = PatternDigest(weekStartDate: Date(timeIntervalSince1970: 700_000), windowDays: 7, conversationsAnalyzed: 5)
+            ctx.insert(d1); ctx.insert(d2)
+            let obs = MetaWhispSchemaV1.ScreenObservation(
+                screenContextId: nil, appName: "Safari", windowTitle: "Docs",
+                contextSummary: "Reading docs", currentActivity: "Research",
+                hasTask: false, startedAt: Date(timeIntervalSince1970: 100),
+                endedAt: Date(timeIntervalSince1970: 400))
+            ctx.insert(obs)
+            let task = MetaWhispSchemaV2.TaskItem(
+                taskDescription: "Send Alex the onboarding deck", status: "staged")
+            ctx.insert(task)
+            try ctx.save()
+            digestIds = [d1.id, d2.id].sorted { $0.uuidString < $1.uuidString }
+        }
+
+        // 2. Reopen the SAME file under the latest schema + the migration plan.
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg2 = ModelConfiguration(schema: latestSchema, url: storeURL)
+        let container2 = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg2])
+        let ctx2 = ModelContext(container2)
+
+        // 3. Rows intact; migrated rows carry nil in the added columns.
+        let digests = try ctx2.fetch(FetchDescriptor<PatternDigest>())
+        XCTAssertEqual(digests.count, 2, "V1 rows must survive the migration")
+        XCTAssertEqual(digests.map(\.id).sorted { $0.uuidString < $1.uuidString }, digestIds)
+
+        let observations = try ctx2.fetch(FetchDescriptor<ScreenObservation>())
+        XCTAssertEqual(observations.count, 1)
+        XCTAssertEqual(observations.first?.appName, "Safari")
+        XCTAssertNil(observations.first?.embedding, "new column starts nil after lightweight migration")
+
+        let tasks = try ctx2.fetch(FetchDescriptor<TaskItem>())
+        XCTAssertEqual(tasks.count, 1)
+        XCTAssertEqual(tasks.first?.taskDescription, "Send Alex the onboarding deck")
+        XCTAssertEqual(tasks.first?.status, "staged")
+        XCTAssertNil(tasks.first?.relevanceScore, "new column starts nil after lightweight migration")
+    }
+
+    /// ITER-057.2 — the incremental stage on its own: a V2-era store (embedding
+    /// present, no relevanceScore) opens under V3 with tasks intact.
+    func testV2StoreMigratesToV3WithTasksIntact() throws {
+        do {
+            let v2Schema = Schema(versionedSchema: MetaWhispSchemaV2.self)
+            let cfg = ModelConfiguration(schema: v2Schema, url: storeURL)
+            let container = try ModelContainer(for: v2Schema, configurations: [cfg])
+            let ctx = ModelContext(container)
+            let task = MetaWhispSchemaV2.TaskItem(
+                taskDescription: "Reply to Sam about the contract draft", status: "committed")
+            ctx.insert(task)
+            try ctx.save()
+        }
+
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: storeURL)
+        let container = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg])
+        let ctx = ModelContext(container)
+        let tasks = try ctx.fetch(FetchDescriptor<TaskItem>())
+        XCTAssertEqual(tasks.count, 1)
+        XCTAssertEqual(tasks.first?.taskDescription, "Reply to Sam about the contract draft")
+        XCTAssertNil(tasks.first?.relevanceScore)
+    }
+
+    func testFreshStoreCreatesUnderV3() throws {
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: storeURL)
+        XCTAssertNoThrow(try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg]))
+    }
+
+    /// The previous shipped version must open under the new one — the V5
+    /// incident (store locked out, session silently in-memory) is the reason
+    /// this test exists for every version bump, however additive it looks.
+    func testV5StoreMigratesToV6WithItemsIntactAndJournalsEmpty() throws {
+        do {
+            let v5Schema = Schema(versionedSchema: MetaWhispSchemaV5.self)
+            let cfg = ModelConfiguration(schema: v5Schema, url: storeURL)
+            let container = try ModelContainer(for: v5Schema, configurations: [cfg])
+            let ctx = ModelContext(container)
+            let item = MetaWhispSchemaV5.ScreenAgentItem(
+                runID: UUID(), headline: "Presentation due at 16:00",
+                body: "Sam is waiting on it.", sourceApp: "Mail",
+                sourceWindowTitle: "Inbox", capturedAt: Date())
+            ctx.insert(item)
+            try ctx.save()
+        }
+
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: storeURL)
+        let container = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg])
+        let ctx = ModelContext(container)
+
+        let items = try ctx.fetch(FetchDescriptor<ScreenAgentItem>())
+        XCTAssertEqual(items.count, 1, "V5 rows must survive the migration")
+        XCTAssertEqual(items.first?.headline, "Presentation due at 16:00")
+
+        // The new journals exist, start empty, and accept rows.
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentRun>()).count, 0)
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentDeliveryRecord>()).count, 0)
+        let run = ScreenAgentRun(
+            contextID: UUID(), trigger: "appActivation",
+            startedAt: Date(), deadlineAt: Date().addingTimeInterval(10))
+        ctx.insert(run)
+        let delivery = ScreenAgentDeliveryRecord(itemID: UUID(), runID: run.id, queuedAt: Date())
+        ctx.insert(delivery)
+        XCTAssertNoThrow(try ctx.save())
+    }
+
+    /// The frozen V1 observation shape must stay frozen: this pins its fields
+    /// so an accidental edit (which would corrupt the migration source) fails.
+    func testFrozenV1ObservationShapeIsStable() throws {
+        let v1Schema = Schema(versionedSchema: MetaWhispSchemaV1.self)
+        let entity = v1Schema.entities.first { $0.name == "ScreenObservation" }
+        XCTAssertNotNil(entity)
+        let props = Set(entity!.properties.map(\.name))
+        XCTAssertFalse(props.contains("embedding"), "V1 is the PRE-embedding shape — never add fields to the frozen copy")
+        for expected in ["id", "appName", "contextSummary", "currentActivity", "startedAt", "endedAt", "createdAt"] {
+            XCTAssertTrue(props.contains(expected), "frozen V1 lost field \(expected)")
+        }
+    }
+
+    /// The previous shipped version must open under the new one — every bump.
+    func testV6StoreMigratesToV7WithJournalIntactAndVisitsEmpty() throws {
+        do {
+            let v6Schema = Schema(versionedSchema: MetaWhispSchemaV6.self)
+            let cfg = ModelConfiguration(schema: v6Schema, url: storeURL)
+            let container = try ModelContainer(for: v6Schema, configurations: [cfg])
+            let ctx = ModelContext(container)
+            ctx.insert(ScreenAgentItem(
+                runID: UUID(), headline: "Presentation due at 16:00",
+                body: "Sam is waiting.", sourceApp: "Mail",
+                sourceWindowTitle: "Inbox", capturedAt: Date()))
+            let run = ScreenAgentRun(contextID: UUID(), trigger: "contextAccepted",
+                                     deadlineAt: Date())
+            ctx.insert(run)
+            ctx.insert(ScreenAgentDeliveryRecord(itemID: UUID(), runID: run.id))
+            try ctx.save()
+        }
+
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: storeURL)
+        let container = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg])
+        let ctx = ModelContext(container)
+
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentItem>()).count, 1)
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentRun>()).count, 1)
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentDeliveryRecord>()).count, 1)
+
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ContextVisitRecord>()).count, 0)
+        let visit = ContextVisitRecord(
+            id: UUID(), generation: 0, bundleID: "com.apple.mail", appName: "Mail",
+            rawTitle: "Inbox", normalizedTitle: "inbox", startedAt: Date())
+        ctx.insert(visit)
+        XCTAssertNoThrow(try ctx.save())
+    }
+
+    /// ITER-071.6 — the facts already in the store were never proposals: they
+    /// must stay active, or the assistant forgets everything it knew about the
+    /// user the moment this ships.
+    func testV7StoreMigratesToV8WithExistingMemoriesStillTrusted() throws {
+        do {
+            let v7Schema = Schema(versionedSchema: MetaWhispSchemaV7.self)
+            let cfg = ModelConfiguration(schema: v7Schema, url: storeURL)
+            let container = try ModelContainer(for: v7Schema, configurations: [cfg])
+            let ctx = ModelContext(container)
+            ctx.insert(MetaWhispFrozenMemory.UserMemory(
+                content: "User works as a Product SEO Engineer",
+                category: "system", sourceApp: "Slack", confidence: 0.8))
+            try ctx.save()
+        }
+
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: storeURL)
+        let container = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg])
+        let ctx = ModelContext(container)
+
+        let memories = try ctx.fetch(FetchDescriptor<UserMemory>())
+        XCTAssertEqual(memories.count, 1, "existing facts must survive")
+        XCTAssertEqual(memories.first?.needsReview, false,
+                       "a fact the user already lived with is not suddenly unconfirmed")
+    }
+
+    /// The version that is on people's machines right now has to open under the
+    /// one about to ship. This is the invariant the V5 incident was about — the
+    /// store had a shape the new build refused, and the app sat in a temporary
+    /// container with the user's history apparently gone.
+    func testV8StoreMigratesToV9WithTheJournalIntactAndNoMetricsInvented() throws {
+        let runID = UUID()
+        do {
+            let v8Schema = Schema(versionedSchema: MetaWhispSchemaV8.self)
+            let cfg = ModelConfiguration(schema: v8Schema, url: storeURL)
+            let container = try ModelContainer(for: v8Schema, configurations: [cfg])
+            let ctx = ModelContext(container)
+            let run = ScreenAgentRun(contextID: UUID(), trigger: "contextAccepted",
+                                     deadlineAt: Date().addingTimeInterval(10))
+            run.id = runID
+            ctx.insert(run)
+            try ctx.save()
+        }
+
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: storeURL)
+        let container = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg])
+        let ctx = ModelContext(container)
+
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentRun>()).count, 1,
+                       "the run journal must survive the upgrade")
+        XCTAssertTrue(try ctx.fetch(FetchDescriptor<ScreenAgentRunMetrics>()).isEmpty,
+                      "runs from before the counters existed have no measurements, "
+                      + "and a zero row would read as «it cost nothing»")
+    }
+
+    /// One row per run, enforced by the store rather than by everyone
+    /// remembering: a second row would double every total silently.
+    func testARunCannotBeMeasuredTwice() throws {
+        let schema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: schema, url: storeURL)
+        let container = try ModelContainer(for: schema, configurations: [cfg])
+        let ctx = ModelContext(container)
+        let runID = UUID()
+        ctx.insert(ScreenAgentRunMetrics(runID: runID, gateOutcome: "fired"))
+        try ctx.save()
+        ctx.insert(ScreenAgentRunMetrics(runID: runID, gateOutcome: "skipped"))
+        try? ctx.save()
+
+        let rows = try ctx.fetch(FetchDescriptor<ScreenAgentRunMetrics>())
+        XCTAssertEqual(rows.count, 1, "runID is unique — one run, one measurement")
+    }
+
+    /// The frozen pre-review memory shape, pinned as a full property set the
+    /// way V5 is: without it a future edit to the frozen copy silently changes
+    /// what V1-V7 claim the store looked like, and the migration proof then
+    /// migrates from a shape that never shipped (Codex).
+    func testFrozenMemoryShapeIsStable() throws {
+        let v7Schema = Schema(versionedSchema: MetaWhispSchemaV7.self)
+        let entity = v7Schema.entities.first { $0.name == "UserMemory" }
+        XCTAssertNotNil(entity, "the frozen copy must keep the entity name the store uses")
+        let props = Set(entity!.properties.map(\.name))
+        XCTAssertFalse(props.contains("needsReview"),
+                       "V7 is the PRE-review shape — never add fields to the frozen copy")
+        XCTAssertEqual(props, [
+            "id", "content", "category", "sourceApp", "windowTitle", "confidence",
+            "contextSummary", "isDismissed", "conversationId", "screenContextId",
+            "sourceFile", "createdAt", "updatedAt", "embedding", "headline",
+            "reasoning", "tagsCSV", "kind", "subject", "characterization", "project",
+        ])
+    }
+
+    /// The frozen V5 item shape: V4 plus feedback fields and the signature —
+    /// and nothing that lands after V5. Pins the migration SOURCE.
+    func testFrozenV5ItemShapeIsStable() throws {
+        let v5Schema = Schema(versionedSchema: MetaWhispSchemaV5.self)
+        let entity = v5Schema.entities.first { $0.name == "ScreenAgentItem" }
+        XCTAssertNotNil(entity)
+        // Full-set equality, not a sample: a partial pin let a frozen field
+        // vanish while the test stayed green (Codex).
+        let props = Set(entity!.properties.map(\.name))
+        XCTAssertEqual(props, [
+            "id", "runID", "createdAt", "headline", "body", "sourceApp",
+            "sourceWindowTitle", "capturedAt", "visitID", "visitGeneration",
+            "evidenceContextIDsJSON", "deliveryOutcome", "deliveredAt",
+            "suppressionReason", "interaction", "interactedAt",
+            "feedbackReason", "feedbackAt", "semanticSignature",
+        ])
+    }
+
+    /// Same for the frozen pre-relevanceScore TaskItem shape referenced by V1+V2.
+    func testFrozenV2TaskItemShapeIsStable() throws {
+        let v2Schema = Schema(versionedSchema: MetaWhispSchemaV2.self)
+        let entity = v2Schema.entities.first { $0.name == "TaskItem" }
+        XCTAssertNotNil(entity)
+        let props = Set(entity!.properties.map(\.name))
+        XCTAssertFalse(props.contains("relevanceScore"), "V2 is the PRE-score shape — never add fields to the frozen copy")
+        for expected in ["id", "taskDescription", "completed", "status", "embedding", "assignee", "createdAt"] {
+            XCTAssertTrue(props.contains(expected), "frozen V2 lost field \(expected)")
+        }
+    }
+
+    /// Proof against the REAL store. Skipped unless `MW_REAL_STORE_COPY` points at a
+    /// COPY of `~/Library/Application Support/MetaWhisp.store` (+ its WAL sidecars,
+    /// copied together). Run manually before shipping:
+    ///   MW_REAL_STORE_COPY=/tmp/mw-store-verify/MetaWhisp.store swift test \
+    ///     --filter SchemaMigrationTests/testRealStoreCopyOpensUnderLatest
+    func testRealStoreCopyOpensUnderLatest() throws {
+        guard let path = ProcessInfo.processInfo.environment["MW_REAL_STORE_COPY"],
+              FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("Set MW_REAL_STORE_COPY to a copy of the real store to run this proof")
+        }
+        let url = URL(fileURLWithPath: path)
+        let latestSchema = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let cfg = ModelConfiguration(schema: latestSchema, url: url)
+        let container = try ModelContainer(
+            for: latestSchema, migrationPlan: MetaWhispMigrationPlan.self, configurations: [cfg])
+        let ctx = ModelContext(container)
+        let memories = try ctx.fetch(FetchDescriptor<UserMemory>()).count
+        let tasks = try ctx.fetch(FetchDescriptor<TaskItem>()).count
+        let convos = try ctx.fetch(FetchDescriptor<Conversation>()).count
+        let history = try ctx.fetch(FetchDescriptor<HistoryItem>()).count
+        let observations = try ctx.fetch(FetchDescriptor<ScreenObservation>()).count
+        print("[RealStoreVerify] memories=\(memories) tasks=\(tasks) conversations=\(convos) history=\(history) observations=\(observations)")
+        XCTAssertGreaterThan(memories + tasks + convos + history, 0,
+                             "real store must open under the latest schema with its data intact (lightweight migration)")
+    }
+}
+
+extension SchemaMigrationTests {
+
+    /// ITER-067 — the store on a real user's disk is V3. It has their
+    /// dictations, meetings, tasks and memories in it, and this is the change
+    /// that asks it to become V4. A lightweight stage adding one entity should
+    /// be safe; "should be" is not a thing to find out from a bug report.
+    func test_v3StoreOpensAsV4WithEverythingIntact() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mw-v3-to-v4-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let storeURL = dir.appendingPathComponent("store.sqlite")
+
+        // A V3 store with the user's real kinds of data in it.
+        do {
+            let v3 = Schema(versionedSchema: MetaWhispSchemaV3.self)
+            let container = try ModelContainer(
+                for: v3, configurations: [ModelConfiguration(schema: v3, url: storeURL)])
+            let ctx = ModelContext(container)
+            ctx.insert(TaskItem(taskDescription: "Send the deck", status: "staged"))
+            ctx.insert(UserMemory(content: "Prefers async updates", category: "system",
+                                  sourceApp: "Slack", confidence: 0.9))
+            ctx.insert(ScreenContext(appName: "Slack", windowTitle: "#launch", ocrText: "hello"))
+            try ctx.save()
+        }
+
+        // Reopen it the way the shipped app will.
+        let latest = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let container = try ModelContainer(
+            for: latest, migrationPlan: MetaWhispMigrationPlan.self,
+            configurations: [ModelConfiguration(schema: latest, url: storeURL)])
+        let ctx = ModelContext(container)
+
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<TaskItem>()).count, 1,
+                       "a V3 store must keep its tasks")
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<UserMemory>()).count, 1,
+                       "a V3 store must keep its memories")
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenContext>()).count, 1,
+                       "a V3 store must keep its screen history")
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentItem>()).count, 0,
+                       "the new entity starts empty rather than inventing rows")
+
+        // And the new entity is usable straight away, not merely declared.
+        let item = ScreenAgentItem(
+            runID: UUID(), headline: "Anna is waiting for the deck",
+            body: "", sourceApp: "Slack", sourceWindowTitle: "#launch", capturedAt: Date())
+        ctx.insert(item)
+        try ctx.save()
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<ScreenAgentItem>()).count, 1)
+    }
+}
+
+extension SchemaMigrationTests {
+
+    /// The failure this exists to stop, learned the hard way on 2026-08-25.
+    ///
+    /// Three properties were added to a shipped model without a new schema
+    /// version. SwiftData refused to open the store, the app fell into a
+    /// temporary in-memory session, and for eleven minutes nothing the user did
+    /// was saved. It failed loudly and preserved the store, which is the system
+    /// working — but only after the damage window had already opened.
+    ///
+    /// The guard is not "did I remember the fields". It is: whatever the latest
+    /// schema currently declares, a store written by the previous shipped
+    /// version must still open under it.
+    func test_aV4StoreOpensUnderTheLatestSchema() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mw-v4-to-latest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let storeURL = dir.appendingPathComponent("store.sqlite")
+
+        do {
+            let v4 = Schema(versionedSchema: MetaWhispSchemaV4.self)
+            let container = try ModelContainer(
+                for: v4, configurations: [ModelConfiguration(schema: v4, url: storeURL)])
+            let ctx = ModelContext(container)
+            ctx.insert(MetaWhispSchemaV4.ScreenAgentItem(
+                runID: UUID(), headline: "Anna needs the deck by 16:00", body: "",
+                sourceApp: "Slack", sourceWindowTitle: "#launch", capturedAt: Date()))
+            ctx.insert(HistoryItem(text: "a dictation the user would hate to lose",
+                                   language: "en", audioDuration: 3, processingTime: 1))
+            try ctx.save()
+        }
+
+        let latest = Schema(versionedSchema: MetaWhispSchemaV9.self)
+        let container = try ModelContainer(
+            for: latest, migrationPlan: MetaWhispMigrationPlan.self,
+            configurations: [ModelConfiguration(schema: latest, url: storeURL)])
+        let ctx = ModelContext(container)
+
+        XCTAssertEqual(try ctx.fetch(FetchDescriptor<HistoryItem>()).count, 1,
+                       "a store one version behind must open, not send the app to the "
+                       + "in-memory fallback where the user's work stops being saved")
+        let items = try ctx.fetch(FetchDescriptor<ScreenAgentItem>())
+        XCTAssertEqual(items.count, 1)
+        XCTAssertNil(items.first?.feedbackReason, "the added field starts empty")
+    }
+}

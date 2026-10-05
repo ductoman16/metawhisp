@@ -28,6 +28,10 @@ import Foundation
 /// spec://iterations/ITER-019-realtime-meeting-advice
 @MainActor
 final class LiveMeetingAdvisor: ObservableObject {
+    // LiveMeetingAdvisor does not call the Pro proxy directly — partial
+    // transcriptions flow into MeetingCoachService.shared.process(...)
+    // which owns the LLM call + tier declaration. Phase D will add a
+    // pre-tick mini gate here to skip uneventful windows.
     @Published private(set) var isActive = false
     /// Last partial text we transcribed — useful for diagnostics + UI status pill.
     @Published private(set) var lastPartial: String = ""
@@ -185,6 +189,11 @@ final class LiveMeetingAdvisor: ObservableObject {
         // Snapshot current sample offsets to bound this chunk.
         let micCurrent = mr.mic.currentSampleCount
         let sysCurrent = mr.systemAudio.currentSampleCount
+        // A system channel that joined late carries leading silence for the
+        // part of the meeting it missed. That silence is history: reading it
+        // now would mix the meeting's first minute against the mic's latest
+        // one.
+        sysOffset = max(sysOffset, mr.systemAudio.placedLeadingSilence)
         let micChunk = mr.mic.peekSamples(from: micOffset)
         let sysChunk = mr.systemAudio.peekSamples(from: sysOffset)
         // Advance offsets ONLY after a successful read so a transcription failure
@@ -199,6 +208,7 @@ final class LiveMeetingAdvisor: ObservableObject {
         // RMS guard — silence/noise blocks below ~0.0005 are dropped (matches
         // the same-named filter in AppDelegate's full-meeting transcribe path).
         let rms = TranscriptionCoordinator.calculateRMS(mixed)
+        NSLog("[LiveAdvise] chunk — %d samples (%.1fs), rms=%.4f", mixed.count, Double(mixed.count) / 16000.0, rms)
         if rms < 0.0008 {
             // Advance offsets — quiet samples never need re-attempt.
             micOffset = micCurrent
@@ -211,17 +221,46 @@ final class LiveMeetingAdvisor: ObservableObject {
             let result = try await engine.transcribe(
                 audioSamples: mixed,
                 language: lang,
-                promptWords: ["MetaWhisp"]
+                // TR-3 (4th site, ITER-046): these live partials feed the Meeting
+                // Copilot AND the assembled recap transcript. The English-only
+                // glossary as an initial_prompt biased RU meetings toward <|en|>,
+                // so the copilot/recap saw EN-bled garbage. Gate like the other
+                // three sites; brand names are still fixed post-hoc by
+                // applyCorrections below.
+                promptWords: TranscriptionLanguageResolver.enginePromptWords(language: lang),
+                // ITER-054 — live-advice chunks are part of THIS meeting, which
+                // is billed once by wall-clock at finalize (applyMeetingStop).
+                // Metering them here (Codex review) double-booked opt-in
+                // live-advice meetings on top of the final log. Ride free.
+                countUsage: false
             )
-            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            NSLog("[LiveAdvise] transcribed %d chars", rawText.count)
 
             // Advance offsets on success — this audio is now "consumed".
             micOffset = micCurrent
             sysOffset = sysCurrent
 
             // Filter the well-known Whisper hallucinations (matches existing path).
-            if text.isEmpty || TranscriptionCoordinator.isAlwaysHallucination(text) { return }
-            if rms < 0.003, TranscriptionCoordinator.isHallucination(text) { return }
+            if rawText.isEmpty || TranscriptionCoordinator.isAlwaysHallucination(rawText) { return }
+            if rms < 0.003, TranscriptionCoordinator.isHallucination(rawText) { return }
+
+            // 2026-05-28: surgically strip mid-text hallucination artifacts
+            // BEFORE storing in `collectedPartials`. Without this, the final
+            // meeting transcript (assembled from these partials in
+            // `assembleMeetingTranscriptFromLive`) inherited DimaTorzok /
+            // «Субтитры сделал» / «Продолжение следует» mid-stream. Pinned
+            // by `HallucinationStripTests`. Then auto-correct unambiguous
+            // brand mangles (Brevo from Cyrillic transliteration).
+            let stripped = TranscriptionCoordinator.stripHallucinationTokens(rawText)
+            if stripped.isEmpty {
+                NSLog("[LiveAdvise] 🧹 partial emptied by strip (was %d chars)", rawText.count)
+                return
+            }
+            if stripped != rawText {
+                NSLog("[LiveAdvise] 🧹 stripped hallucination from partial (was %d → %d chars)", rawText.count, stripped.count)
+            }
+            let text = BrandGlossary.applyCorrections(stripped)
 
             lastPartial = text
             lastFireAt = Date()
@@ -229,10 +268,28 @@ final class LiveMeetingAdvisor: ObservableObject {
             // 2nd cloud transcription pass that `AppDelegate.stopMeetingRecording`
             // used to do over the same audio (was 50% of all cloud minutes per meeting).
             collectedPartials.append(text)
-            // Drive the floating Meeting Copilot overlay (ITER-019.2). The service
-            // owns its own concurrency guard so a still-running LLM call doesn't
-            // stack with the next 30s tick — it just skips that cycle.
-            Task { await MeetingCoachService.shared.process(partialText: text) }
+            // ITER-041 Phase D — gate the heavy MeetingCoach LLM tick.
+            // Skip the floating Copilot overlay when the cheap gate sees no
+            // coachable moment in this 30s partial. Without a Pro license
+            // the gate is bypassed (MeetingCoach already no-ops on non-Pro).
+            // Standard advice trigger below has its own Phase C gate.
+            if LicenseService.shared.isPro, let key = LicenseService.shared.licenseKey {
+                let gate = await GateClient.call(
+                    context: text,
+                    purpose: .meetingCoach,
+                    recentTopics: [],
+                    serviceId: MeetingCoachService.llmServiceId,
+                    licenseKey: key
+                )
+                if gate.shouldFire {
+                    Task { await MeetingCoachService.shared.process(partialText: text) }
+                } else {
+                    NSLog("[LiveAdvise] gate-skipped MeetingCoach score=%.2f — %@",
+                          gate.score, String(gate.reasoning.prefix(80)))
+                }
+            } else {
+                Task { await MeetingCoachService.shared.process(partialText: text) }
+            }
             // Standard advice path stays — it posts the macOS notification and
             // populates Insights. Meeting Copilot adds the live overlay on TOP of that.
             adviceService?.triggerOnTranscription(text: text, source: "meeting-live")

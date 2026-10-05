@@ -1,0 +1,432 @@
+import Foundation
+import SwiftData
+
+/// Versioned SwiftData schema + migration plan (ITER-049 B / AUD-007).
+///
+/// Until now the store was built from a bare `Schema([... 14 models ...])` with
+/// NO migration plan, so the first breaking `@Model` change would fail to open
+/// an existing user's store (and A1's degraded path would catch it). This anchors
+/// the CURRENT shape as `V1` and threads a `SchemaMigrationPlan` through the
+/// container so future changes get an explicit, tested migration stage instead of
+/// relying on implicit lightweight migration.
+///
+/// V1 is the baseline: it lists today's 14 models unchanged with version 1.0.0,
+/// which is what the existing on-disk store was written with, so introducing it
+/// is a no-op for current users (proven on a copy of the real store — see
+/// `SchemaMigrationTests`).
+///
+/// **Freezing rule (Codex):** when the FIRST real change lands, do NOT edit these
+/// model classes for the new version while V1 still references them — snapshot the
+/// V1 field shapes into a frozen `MetaWhispSchemaV1` namespace, make the live
+/// classes V2, and add a `.lightweight`/`.custom` stage from V1 to V2.
+enum MetaWhispSchemaV1: VersionedSchema {
+    static var versionIdentifier = Schema.Version(1, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [
+            HistoryItem.self, ScreenContext.self, AdviceItem.self,
+            MetaWhispFrozenMemory.UserMemory.self,
+            MetaWhispSchemaV2.TaskItem.self,            // frozen pre-relevanceScore shape (same in V1+V2)
+            ChatMessage.self, Conversation.self,
+            MetaWhispSchemaV1.ScreenObservation.self,   // frozen pre-embedding shape
+            IndexedFile.self, DailySummary.self, Goal.self, ProjectAlias.self,
+            AuditLog.self, PatternDigest.self,
+        ]
+    }
+
+    /// FROZEN V1 shape of ScreenObservation — the on-disk layout BEFORE
+    /// ITER-053.4 added `embedding`. Nested under the version enum with the
+    /// SAME type name so the entity name matches the store. Never edit this
+    /// copy. Unchanged models above are shared with V2 by reference — only the
+    /// changed model gets frozen (freezing rule in this file's header).
+    @Model
+    final class ScreenObservation {
+        var id: UUID
+        var screenContextId: UUID?
+        var appName: String
+        var windowTitle: String?
+        var contextSummary: String
+        var currentActivity: String
+        var hasTask: Bool
+        var taskTitle: String?
+        var sourceCategory: String?
+        var focusStatus: String?
+        var startedAt: Date
+        var endedAt: Date
+        var createdAt: Date
+
+        init(
+            screenContextId: UUID?, appName: String, windowTitle: String?,
+            contextSummary: String, currentActivity: String, hasTask: Bool,
+            taskTitle: String? = nil, sourceCategory: String? = nil,
+            focusStatus: String? = nil, startedAt: Date, endedAt: Date
+        ) {
+            self.id = UUID()
+            self.screenContextId = screenContextId
+            self.appName = appName
+            self.windowTitle = windowTitle
+            self.contextSummary = contextSummary
+            self.currentActivity = currentActivity
+            self.hasTask = hasTask
+            self.taskTitle = taskTitle
+            self.sourceCategory = sourceCategory
+            self.focusStatus = focusStatus
+            self.startedAt = startedAt
+            self.endedAt = endedAt
+            self.createdAt = Date()
+        }
+    }
+}
+
+/// ITER-053.4 slice 2 — V2 adds `ScreenObservation.embedding: Data?` (semantic
+/// screen-history search). Additive optional column → lightweight stage.
+enum MetaWhispSchemaV2: VersionedSchema {
+    static var versionIdentifier = Schema.Version(2, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [
+            HistoryItem.self, ScreenContext.self, AdviceItem.self,
+            MetaWhispFrozenMemory.UserMemory.self,
+            MetaWhispSchemaV2.TaskItem.self,   // frozen pre-relevanceScore shape
+            ChatMessage.self, Conversation.self, ScreenObservation.self,
+            IndexedFile.self, DailySummary.self, Goal.self, ProjectAlias.self,
+            AuditLog.self, PatternDigest.self,
+        ]
+    }
+
+    /// FROZEN V1/V2 shape of TaskItem — the on-disk layout BEFORE ITER-057.2
+    /// added `relevanceScore`. Nested with the SAME type name so the entity name
+    /// matches the store; referenced by BOTH V1 and V2 (the model didn't change
+    /// between them). Never edit this copy (freezing rule in this file's header).
+    @Model
+    final class TaskItem {
+        var id: UUID
+        var taskDescription: String
+        var completed: Bool
+        var dueAt: Date?
+        var sourceTranscriptId: UUID?
+        var conversationId: UUID?
+        var screenContextId: UUID?
+        var sourceApp: String?
+        var createdAt: Date
+        var updatedAt: Date
+        var completedAt: Date?
+        var isDismissed: Bool
+        var status: String?
+        var embedding: Data?
+        var assignee: String?
+
+        init(
+            taskDescription: String,
+            dueAt: Date? = nil,
+            sourceTranscriptId: UUID? = nil,
+            sourceApp: String? = nil,
+            conversationId: UUID? = nil,
+            screenContextId: UUID? = nil,
+            status: String = "committed",
+            assignee: String? = nil
+        ) {
+            self.id = UUID()
+            self.taskDescription = taskDescription
+            self.completed = false
+            self.dueAt = dueAt
+            self.sourceTranscriptId = sourceTranscriptId
+            self.sourceApp = sourceApp
+            self.conversationId = conversationId
+            self.screenContextId = screenContextId
+            self.createdAt = Date()
+            self.updatedAt = Date()
+            self.isDismissed = false
+            self.status = status
+            self.assignee = assignee
+        }
+    }
+}
+
+/// ITER-057.2 — V3 adds `TaskItem.relevanceScore: Int?` (LLM re-rank position
+/// for staged candidates). Additive optional column → lightweight stage.
+enum MetaWhispSchemaV3: VersionedSchema {
+    static var versionIdentifier = Schema.Version(3, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [
+            HistoryItem.self, ScreenContext.self, AdviceItem.self,
+            MetaWhispFrozenMemory.UserMemory.self,
+            TaskItem.self, ChatMessage.self, Conversation.self, ScreenObservation.self,
+            IndexedFile.self, DailySummary.self, Goal.self, ProjectAlias.self,
+            AuditLog.self, PatternDigest.self,
+        ]
+    }
+}
+
+/// ITER-067 — V4 adds `ScreenAgentItem`: the Screen Agent's comment as a
+/// durable row rather than a six-second banner that left no trace. Additive new
+/// entity, no change to any existing shape → lightweight stage.
+enum MetaWhispSchemaV4: VersionedSchema {
+    static var versionIdentifier = Schema.Version(4, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        MetaWhispSchemaV3.models + [MetaWhispSchemaV4.ScreenAgentItem.self]
+    }
+
+    /// FROZEN V4 shape of `ScreenAgentItem` — the on-disk layout BEFORE
+    /// ITER-070 added feedback and the semantic signature. Nested with the same
+    /// type name so the entity name matches the store. Never edit this copy.
+    ///
+    /// This exists because those three fields were once added to the live model
+    /// without a version bump. The store still had this shape, SwiftData
+    /// refused to open it, and the app spent eleven minutes in a temporary
+    /// in-memory session where nothing the user did was saved.
+    @Model
+    final class ScreenAgentItem {
+        @Attribute(.unique) var id: UUID
+        var runID: UUID
+        var createdAt: Date
+        var headline: String
+        var body: String
+        var sourceApp: String
+        var sourceWindowTitle: String
+        var capturedAt: Date
+        var visitID: UUID?
+        var visitGeneration: Int
+        var evidenceContextIDsJSON: String
+        var deliveryOutcome: String
+        var deliveredAt: Date?
+        var suppressionReason: String?
+        var interaction: String
+        var interactedAt: Date?
+
+        init(runID: UUID, headline: String, body: String, sourceApp: String,
+             sourceWindowTitle: String, capturedAt: Date) {
+            self.id = UUID()
+            self.runID = runID
+            self.createdAt = Date()
+            self.headline = headline
+            self.body = body
+            self.sourceApp = sourceApp
+            self.sourceWindowTitle = sourceWindowTitle
+            self.capturedAt = capturedAt
+            self.visitGeneration = 0
+            self.evidenceContextIDsJSON = "[]"
+            self.deliveryOutcome = "pending"
+            self.interaction = "none"
+        }
+    }
+}
+
+/// ITER-070 — V5. Adding `feedbackReason`, `feedbackAt` and
+/// `semanticSignature` to `ScreenAgentItem` was a schema change, and shipping
+/// it inside V4 was not: the store on disk still had the V4 shape, SwiftData
+/// refused to open it, and the app fell into a temporary in-memory session
+/// where nothing the user did was saved. It failed loudly and correctly — into
+/// the degraded path with the store preserved — but it failed.
+///
+/// The lesson is the version number, not the fields: any change to a shipped
+/// model's shape needs a new version and a stage, however small it looks.
+enum MetaWhispSchemaV5: VersionedSchema {
+    static var versionIdentifier = Schema.Version(5, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        MetaWhispSchemaV3.models + [MetaWhispSchemaV5.ScreenAgentItem.self]
+    }
+
+    /// FROZEN V5 shape of `ScreenAgentItem` — V4 plus the ITER-070 feedback
+    /// fields and the semantic signature. Nested with the same type name so
+    /// the entity name matches the store. Never edit this copy.
+    ///
+    /// V5 used to reference the LIVE model, so the migration proof migrated
+    /// from whatever the model looked like today — a future field change
+    /// would mutate the test's "V5" source too, and the test would pass while
+    /// a genuinely shipped V5 store failed (Codex).
+    @Model
+    final class ScreenAgentItem {
+        @Attribute(.unique) var id: UUID
+        var runID: UUID
+        var createdAt: Date
+        var headline: String
+        var body: String
+        var sourceApp: String
+        var sourceWindowTitle: String
+        var capturedAt: Date
+        var visitID: UUID?
+        var visitGeneration: Int
+        var evidenceContextIDsJSON: String
+        var deliveryOutcome: String
+        var deliveredAt: Date?
+        var suppressionReason: String?
+        var interaction: String
+        var interactedAt: Date?
+        var feedbackReason: String?
+        var feedbackAt: Date?
+        var semanticSignature: String = ""
+
+        init(runID: UUID, headline: String, body: String, sourceApp: String,
+             sourceWindowTitle: String, capturedAt: Date) {
+            self.id = UUID()
+            self.runID = runID
+            self.createdAt = Date()
+            self.headline = headline
+            self.body = body
+            self.sourceApp = sourceApp
+            self.sourceWindowTitle = sourceWindowTitle
+            self.capturedAt = capturedAt
+            self.visitGeneration = 0
+            self.evidenceContextIDsJSON = "[]"
+            self.deliveryOutcome = "pending"
+            self.interaction = "none"
+            self.semanticSignature = ""
+        }
+    }
+}
+
+/// Plan §4 — the run/delivery journal as entities of their own, linked to the
+/// legacy models by UUID only. V6 adds tables and touches no shipped shape,
+/// but the V5 lesson stands: it is a version and a stage regardless.
+enum MetaWhispSchemaV6: VersionedSchema {
+    static var versionIdentifier = Schema.Version(6, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        // From V3 + the LIVE item, not from V5 — V5 now pins its frozen copy,
+        // and inheriting it here would make production fetch a stranger class
+        // under the same entity name.
+        MetaWhispSchemaV3.models
+            + [ScreenAgentItem.self, ScreenAgentRun.self, ScreenAgentDeliveryRecord.self]
+    }
+}
+
+/// FROZEN pre-review shape of `UserMemory`, nested so the entity name matches
+/// the store. Referenced by V1…V7 because the model did not change across
+/// them; V8 adds `needsReview`. Never edit this copy.
+///
+/// The V5 lesson, applied before the fact this time: a field added to a live
+/// model that older versions still reference silently changes what those
+/// versions claim the store looked like, and the migration proof migrates
+/// from a shape that never shipped.
+enum MetaWhispFrozenMemory {
+    @Model
+    final class UserMemory {
+        var id: UUID
+        var content: String
+        var category: String
+        var sourceApp: String
+        var windowTitle: String?
+        var confidence: Double
+        var contextSummary: String?
+        var isDismissed: Bool
+        var conversationId: UUID?
+        var screenContextId: UUID?
+        var sourceFile: String?
+        var createdAt: Date
+        var updatedAt: Date
+        var embedding: Data?
+        var headline: String?
+        var reasoning: String?
+        var tagsCSV: String?
+        var kind: String?
+        var subject: String?
+        var characterization: String?
+        var project: String?
+
+        init(content: String, category: String, sourceApp: String, confidence: Double) {
+            self.id = UUID()
+            self.content = content
+            self.category = category
+            self.sourceApp = sourceApp
+            self.confidence = confidence
+            self.isDismissed = false
+            self.createdAt = Date()
+            self.updatedAt = Date()
+        }
+    }
+}
+
+/// Visit-wiring step 2 — the durable visit row. Additive entity, no live
+/// shape changes, so no new frozen copy is needed; built from V3 + live
+/// models like V6 (inheriting a version that pins a frozen copy would ship
+/// the frozen stranger class to production — the V6 lesson).
+enum MetaWhispSchemaV7: VersionedSchema {
+    static var versionIdentifier = Schema.Version(7, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        MetaWhispSchemaV3.models
+            + [ScreenAgentItem.self, ScreenAgentRun.self, ScreenAgentDeliveryRecord.self,
+               ContextVisitRecord.self]
+    }
+}
+
+/// ITER-071.6 — V8 adds `UserMemory.needsReview`: a fact the hourly screen
+/// analysis proposed is stored but not believed until the user confirms it.
+/// Additive optional-with-default column → lightweight stage.
+enum MetaWhispSchemaV8: VersionedSchema {
+    static var versionIdentifier = Schema.Version(8, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [
+            HistoryItem.self, ScreenContext.self, AdviceItem.self, UserMemory.self,
+            TaskItem.self, ChatMessage.self, Conversation.self, ScreenObservation.self,
+            IndexedFile.self, DailySummary.self, Goal.self, ProjectAlias.self,
+            AuditLog.self, PatternDigest.self,
+            ScreenAgentItem.self, ScreenAgentRun.self, ScreenAgentDeliveryRecord.self,
+            ContextVisitRecord.self,
+        ]
+    }
+}
+
+/// V9 adds `ScreenAgentRunMetrics`: what one analysis cost and did, as counts.
+/// A new entity, so the stage is lightweight and nothing already shipped
+/// changes shape — deliberately NOT more columns on `ScreenAgentRun`, which
+/// V6, V7 and V8 all pin.
+enum MetaWhispSchemaV9: VersionedSchema {
+    static var versionIdentifier = Schema.Version(9, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        MetaWhispSchemaV8.models + [ScreenAgentRunMetrics.self]
+    }
+}
+
+/// Migration plan for the live store: V1 → V2 (ScreenObservation.embedding) →
+/// V3 (TaskItem.relevanceScore). All lightweight (additive optional columns),
+/// verified by `SchemaMigrationTests`.
+enum MetaWhispMigrationPlan: SchemaMigrationPlan {
+    static var schemas: [any VersionedSchema.Type] {
+        [MetaWhispSchemaV1.self, MetaWhispSchemaV2.self, MetaWhispSchemaV3.self,
+         MetaWhispSchemaV4.self, MetaWhispSchemaV5.self, MetaWhispSchemaV6.self,
+         MetaWhispSchemaV7.self, MetaWhispSchemaV8.self, MetaWhispSchemaV9.self]
+    }
+    static var stages: [MigrationStage] {
+        [
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV1.self,
+                toVersion: MetaWhispSchemaV2.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV2.self,
+                toVersion: MetaWhispSchemaV3.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV3.self,
+                toVersion: MetaWhispSchemaV4.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV4.self,
+                toVersion: MetaWhispSchemaV5.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV5.self,
+                toVersion: MetaWhispSchemaV6.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV6.self,
+                toVersion: MetaWhispSchemaV7.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV7.self,
+                toVersion: MetaWhispSchemaV8.self
+            ),
+            MigrationStage.lightweight(
+                fromVersion: MetaWhispSchemaV8.self,
+                toVersion: MetaWhispSchemaV9.self
+            ),
+        ]
+    }
+}

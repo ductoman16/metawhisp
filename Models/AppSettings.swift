@@ -6,7 +6,19 @@ final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
     @AppStorage("selectedModel") var selectedModel: String = "large-v3-turbo"
-    @AppStorage("transcriptionLanguage") var transcriptionLanguage: String = "ru"
+    /// ITER-058.3 — onboarding quick-started on Base; Large V3 Turbo should
+    /// install in the background and hot-swap in. Cleared by the swap, an
+    /// explicit user model pick, or a low-disk skip.
+    @AppStorage("pendingBestModelUpgrade") var pendingBestModelUpgrade: Bool = false
+    /// ITER-058.3 — failed swap attempts; at 3 the upgrade gives up for good
+    /// (review: without a cap, a deterministic load failure looped
+    /// download-950MB → fail → delete → re-download forever).
+    @AppStorage("bestModelUpgradeAttempts") var bestModelUpgradeAttempts: Int = 0
+    /// Whisper identifies the language itself, so onboarding no longer asks —
+    /// see `OnboardingLanguageDefault`. Anyone who used the app before this
+    /// change is pinned to "ru" by the migration below, so only fresh installs
+    /// land on "auto".
+    @AppStorage("transcriptionLanguage") var transcriptionLanguage: String = OnboardingLanguageDefault.freshInstallDefault
 
     /// Audio input device override. Empty string = follow macOS default
     /// (whichever input device the system has selected). Otherwise persists
@@ -15,6 +27,12 @@ final class AppSettings: ObservableObject {
     /// If the picked device was unplugged, falls back to system default.
     @AppStorage("preferredInputDeviceUID") var preferredInputDeviceUID: String = ""
     @AppStorage("hotkeyMode") var hotkeyMode: String = "toggle" // toggle, pushToTalk
+    /// ITER-062 — requested ON by default; runtime activation still requires
+    /// macOS Accessibility permission and an active event tap.
+    @AppStorage("layoutFixEnabled_iter062") var layoutFixEnabled: Bool = true
+    @AppStorage("layoutFixAutoEnabled_iter062") var layoutFixAutoEnabled: Bool = true
+    @AppStorage("layoutFixDoubleShiftEnabled_iter062") var layoutFixDoubleShiftEnabled: Bool = true
+    @AppStorage("layoutFixSwitchInputSource_iter062") var layoutFixSwitchInputSource: Bool = true
     @AppStorage("soundEnabled") var soundEnabled: Bool = true
     @AppStorage("autoSubmit") var autoSubmit: Bool = true
     @AppStorage("processingMode") var processingMode: String = "raw"
@@ -23,7 +41,17 @@ final class AppSettings: ObservableObject {
     @AppStorage("llmProvider") var llmProvider: String = "openai" // openai, cerebras
     @AppStorage("transcriptionEngine") var transcriptionEngine: String = "ondevice" // ondevice, cloud
     @AppStorage("cloudTranscriptionProvider") var cloudTranscriptionProvider: String = "groq" // groq, openai
+    /// LIC-1 — feature flag (default OFF). When ON, a cached Pro state expires after
+    /// `LicenseEntitlement.defaultGraceTTL` (72h) without a fresh server verify, so a
+    /// stale/planted Keychain key can't unlock Pro indefinitely offline. Ships dormant
+    /// so legit offline Pro users aren't locked out at release; enable consciously.
+    @AppStorage("enforceProEntitlementTTL") var enforceProEntitlementTTL: Bool = false
     @AppStorage("hasCompletedOnboarding") var hasCompletedOnboarding: Bool = false
+
+    /// ITER-056 — GitHub star promo lifecycle stage (see `GitHubStarPromo`):
+    /// 0 = never clicked (visible, no ✕) · 1 = starred (visible with ✕) ·
+    /// 2 = dismissed forever.
+    @AppStorage("githubStarStage") var githubStarStage: Int = 0
 
     /// One-time migration flag (ITER-026): on first launch after the unified
     /// notification work, dismiss every TaskItem still flagged
@@ -39,6 +67,29 @@ final class AppSettings: ObservableObject {
     /// stale default in their UserDefaults and back-to-back calls keep
     /// merging into one recording.
     @AppStorage("didMigrateSilenceStop_iter026") var didMigrateSilenceStop: Bool = false
+
+    /// One-time auto-promotion (ITER-034.3, 2026-05-11): Pro subscribers
+    /// whose `processingMode` is still on the global default `"raw"` get
+    /// promoted to `"structured"` on the first launch after install of this
+    /// build. Reason: user report «у меня никогда метависп не структурирует
+    /// текст и не добавляет буллеты хотя должен» — Pro user expecting AI
+    /// cleanup-with-bullets, but the default was raw and they never knew to
+    /// flip it in Settings → Processing Mode. The flag-gating means we
+    /// promote ONCE; if the user later moves themselves back to raw, the
+    /// flag is already set and we don't overwrite. Mirrors the existing
+    /// `transcriptionEngine` auto-switch to `cloud` for Pro.
+    @AppStorage("didAutoPromoteProcessingMode_iter034") var didAutoPromoteProcessingMode: Bool = false
+
+    /// ITER-039 — local LLM for Free tier. When `localLLMEnabled` is true AND
+    /// `localLLMActiveModelID` resolves to a downloaded model (or
+    /// «apple-foundation-models» on macOS 26+), the existing
+    /// `hasLLMAccess`-gated services route through `LocalLLMService` instead
+    /// of silently no-op'ing for Free users without a BYOK key.
+    @AppStorage("localLLMEnabled_iter039") var localLLMEnabled: Bool = false
+    /// Stable ModelSpec.id — one of «phi-4-mini» / «gemma-4-e2b» / «qwen3-4b»
+    /// / «qwen3-7b» / «apple-foundation-models». Empty = no active model.
+    /// Switched by the user via Settings → AI Models cards.
+    @AppStorage("localLLMActiveModelID_iter039") var localLLMActiveModelID: String = ""
     @AppStorage("weekStartsOn") var weekStartsOn: Int = 2 // 1=Sunday, 2=Monday
     @AppStorage("appTheme") var appTheme: String = "dark" // dark, light, auto
 
@@ -93,9 +144,34 @@ final class AppSettings: ObservableObject {
     // with 2-3 relevant memories / past decisions / pending tasks while user is
     // composing a reply in another app. Not a notification — NSWindow-based chip.
     @AppStorage("proactiveEnabled") var proactiveEnabled: Bool = false
+
+    /// ITER-067 — "be quiet for now", without turning the feature off and
+    /// losing the Inbox with it. Suppressed comments are still recorded and
+    /// still readable afterwards; they simply do not interrupt.
+    @AppStorage("screenAgentPaused") var screenAgentPaused: Bool = false
+
+    /// ITER-070 — how often the Screen Agent may interrupt, as one choice
+    /// instead of several unrelated intervals scattered through Settings.
+    @AppStorage("screenAgentPacing") var screenAgentPacing: String = ScreenAgentPacing.balanced.rawValue
+
+    /// ITER-069 — permission to send ONE downscaled image of an allowed,
+    /// focused window to the cloud vision model. Deliberately separate from
+    /// every other consent: agreeing to cloud text is not agreeing to
+    /// screenshots, and this stays off until the user says otherwise.
+    @AppStorage("screenAgentVisualConsent") var screenAgentVisualConsent: Bool = false
+
+    /// When the Inbox was last opened, as a Unix timestamp. The unread badge
+    /// counts delivered comments queued after this mark, so looking clears it
+    /// without rewriting a single journal row — the journal is history and
+    /// stays what it was.
+    @AppStorage("screenAgentInboxLastOpenedAt")
+    var screenAgentInboxLastOpenedAt: Double = 0
     /// Minimum gap between chip surfaces. Lower = more useful but more intrusive.
     /// Default 5 min balances usefulness against annoyance.
-    @AppStorage("proactiveCooldownMinutes") var proactiveCooldownMinutes: Double = 5
+    // 2026-08-08 — 5 → 10 min: reference-parity cadence (its analysis interval
+    // is 600s). Half the interruptions; the valuable classes (creds on screen,
+    // wrong date/recipient) are not time-critical at 5-min granularity.
+    @AppStorage("proactiveCooldownMinutes") var proactiveCooldownMinutes: Double = 10
     /// Apps where proactive chip is DISABLED (comma-separated bundle-ids or display names).
     /// Sensitive apps like 1Password, Keychain, Terminal are banned by default.
     @AppStorage("proactiveBlacklist") var proactiveBlacklist: String = "1Password,Keychain Access,Terminal,iTerm,Activity Monitor,System Settings"
@@ -105,6 +181,12 @@ final class AppSettings: ObservableObject {
     @AppStorage("screenContextInterval") var screenContextInterval: Double = 30
     @AppStorage("screenContextMode") var screenContextMode: String = "blacklist" // blacklist, whitelist
     @AppStorage("screenContextAppList") var screenContextAppList: String = "" // comma-separated
+    /// ITER-053.1 — retention for RAW OCR rows (ScreenContext), days. 0 = keep
+    /// forever. Raw OCR is the privacy-hot artifact → short default.
+    @AppStorage("screenRetentionDays") var screenRetentionDays: Int = 30
+    /// ITER-053.1 — retention for distilled ScreenObservation rows (the Rewind
+    /// timeline), days. 0 = keep forever. Distilled → longer default.
+    @AppStorage("observationRetentionDays") var observationRetentionDays: Int = 180
 
     // AI Advice
     @AppStorage("adviceEnabled") var adviceEnabled: Bool = false
@@ -128,14 +210,30 @@ final class AppSettings: ObservableObject {
 
     // Tasks
     @AppStorage("tasksEnabled") var tasksEnabled: Bool = true
+    /// ITER-057.1 — notify when the promotion loop moves a staged candidate to
+    /// active. Default OFF, exactly like the reference (extraction stays quiet;
+    /// the user opts in to being pinged).
+    @AppStorage("taskPromotionNotificationsEnabled") var taskPromotionNotificationsEnabled: Bool = false
+    /// ITER-057.1 (Codex) — the ITER-007 «one-time» screen-task→staged
+    /// migration had NO flag and re-ran EVERY launch, demoting even tasks the
+    /// user promoted themselves (and it would fight the promotion loop). Now
+    /// genuinely one-shot.
+    @AppStorage("didMigrateScreenTasksToStaged_iter007") var didMigrateScreenTasksToStaged: Bool = false
+    /// ITER-057.5 — one-time cleanup: dismiss the junk tasks system permission
+    /// dialogs (SecurityAgent / UserNotificationCenter / loginwindow) produced
+    /// before the task whitelist existed.
+    @AppStorage("didDismissSystemDialogTasks_iter057_5") var didDismissSystemDialogTasks: Bool = false
 
     // Screen extraction — hourly batch analysis of ScreenContext → ScreenObservation (spec://BACKLOG#Phase2.R1)
     @AppStorage("screenExtractionEnabled") var screenExtractionEnabled: Bool = true
     @AppStorage("screenExtractionInterval") var screenExtractionInterval: Double = 3600  // seconds (1 hour)
 
     // Realtime screen reaction — per-window LLM check for actionable tasks (spec://iterations/ITER-006).
-    // Off by default: Pro-only, adds LLM cost. User opts in for real-time task surfacing.
-    @AppStorage("realtimeScreenReactionEnabled") var realtimeScreenReactionEnabled: Bool = false
+    // ITER-057.5 — ON by default (reference parity: extraction is on; this is the
+    // commitment detector, the flagship's core). Cost is bounded by the task
+    // whitelist + 60s per-app cooldown + 30 calls/hour cap + mini gate; users who
+    // explicitly turned it off keep their stored false.
+    @AppStorage("realtimeScreenReactionEnabled") var realtimeScreenReactionEnabled: Bool = true
 
     // File Indexing — scan user-picked folders + extract memories from text files (spec://BACKLOG#Phase3.E1)
     @AppStorage("fileIndexingEnabled") var fileIndexingEnabled: Bool = false
@@ -180,6 +278,12 @@ final class AppSettings: ObservableObject {
     /// ISO-8601 timestamp of the last successful sync (oldest memory NOT yet
     /// appended must have createdAt > this). Empty on first run.
     @AppStorage("obsidianLastSyncedAt") var obsidianLastSyncedAt: String = ""
+
+    /// AUD-029 — opt-in for the MCP snapshot writer (default OFF). When OFF,
+    /// MetaWhisp writes NO snapshot of memories/tasks/conversations to disk and
+    /// purges any existing file; when ON it exposes a local-only snapshot for
+    /// the standalone `metawhisp-mcp` tool. Honoured by MCPSnapshotService.
+    @AppStorage("mcpEnabled") var mcpEnabled: Bool = false
 
     /// ITER-032 — show one-conversation projects in the Projects view.
     /// Default off so the grid stays clean (LLM hallucinations + typo
@@ -305,10 +409,46 @@ final class AppSettings: ObservableObject {
         didSet { KeychainHelper.save(key: "com.metawhisp.groqKey", value: groqKey) }
     }
 
+    /// ITER-054 — BYOK Deepgram (optional, any tier). When set, MEETINGS are
+    /// transcribed via the user's own Deepgram account in one diarized pass
+    /// (real speaker labels, 1× cost, никакого нашего воркера). Dictations
+    /// are unaffected.
+    /// BYOK Gemini, for meetings only. Native speaker labels on the user's own
+    /// account — the same bargain the Deepgram key offers, with a different
+    /// provider and a thirty-minute-per-request diarization cap the transcriber
+    /// slices around.
+    @Published var geminiKey: String {
+        didSet { KeychainHelper.save(key: "com.metawhisp.geminiKey", value: geminiKey) }
+    }
+
+    @Published var deepgramKey: String {
+        didSet { KeychainHelper.save(key: "com.metawhisp.deepgramKey", value: deepgramKey) }
+    }
+
     private init() {
         self.openaiKey = KeychainHelper.load(key: "com.metawhisp.openaiKey") ?? ""
         self.cerebrasKey = KeychainHelper.load(key: "com.metawhisp.cerebrasKey") ?? ""
         self.groqKey = KeychainHelper.load(key: "com.metawhisp.groqKey") ?? ""
+        self.deepgramKey = KeychainHelper.load(key: "com.metawhisp.deepgramKey") ?? ""
+        self.geminiKey = KeychainHelper.load(key: "com.metawhisp.geminiKey") ?? ""
+        Self.pinTranscriptionLanguageForExistingUsers()
+    }
+
+    /// Runs once, before anything reads `transcriptionLanguage`.
+    ///
+    /// The code default moved from "ru" to "auto" when onboarding stopped asking
+    /// about language. `@AppStorage` writes a key only when something assigns
+    /// it, so a long-time user who never opened that setting has nothing stored
+    /// and would have been switched to auto without touching a thing. Write
+    /// their effective value down first; fresh installs fall through untouched.
+    private static func pinTranscriptionLanguageForExistingUsers() {
+        let defaults = UserDefaults.standard
+        guard let pinned = OnboardingLanguageDefault.valueToPersist(
+            storedLanguage: defaults.string(forKey: "transcriptionLanguage"),
+            hasCompletedOnboarding: defaults.bool(forKey: "hasCompletedOnboarding")
+        ) else { return }
+        defaults.set(pinned, forKey: "transcriptionLanguage")
+        NSLog("[Settings] Existing install pinned to transcriptionLanguage=%@ before the auto default", pinned)
     }
 
     /// The active API key for the selected provider.
@@ -329,43 +469,137 @@ final class AppSettings: ObservableObject {
 
 // MARK: - Keychain Helper
 
-/// Stores secrets in an encrypted plist in Application Support.
-/// Avoids Keychain password prompts caused by code signature changes during development.
+/// AUD-024 — stores secrets (license key, session token, BYOK API keys) in the
+/// macOS Keychain via the Security framework.
+///
+/// Previously this wrote a PLAINTEXT JSON file at
+/// `~/Library/Application Support/MetaWhisp/.secrets` (readable by any process
+/// running as the same user) — the old doc comment claimed "encrypted plist",
+/// which was false. On first read we migrate every value from that legacy file
+/// into the Keychain, verify each one, and delete the file only when ALL are
+/// confirmed. SEC-1: there is NO plaintext read fallback — the legacy file is
+/// only ever read by the migration; if a value fails to verify in the Keychain
+/// the file is kept and migration retries on the next read/launch (worst case
+/// the user re-enters one key — never a silent plaintext read path).
+///
+/// Note: Keychain ACLs are bound to the code signature, so builds must keep a
+/// stable signing identity (release Developer ID + `hot-swap.sh` provide this).
 enum KeychainHelper {
-    private static var storage: [String: String] = {
-        load() ?? [:]
-    }()
+    private static let service = "com.metawhisp.secrets"
 
-    private static var storeURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("MetaWhisp", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(".secrets")
-    }
+    /// ITER-053.1 (2026-07-16) — unit tests must NEVER touch the real
+    /// keychain. A keychain item whose ACL doesn't trust the xctest binary
+    /// makes `SecItemCopyMatching` block on a hidden permission prompt and the
+    /// whole suite hangs forever (hit when a CLI-created item joined the
+    /// service). Tests see an empty keychain (deterministic) and can't pollute
+    /// the user's real one either.
+    private static let isUnitTest = NSClassFromString("XCTestCase") != nil
 
     static func save(key: String, value: String) {
-        if value.isEmpty {
-            storage.removeValue(forKey: key)
-        } else {
-            storage[key] = value
-        }
-        persist()
+        guard !isUnitTest else { return }
+        if value.isEmpty { keychainDelete(key); return }
+        keychainWrite(key: key, value: value)
     }
 
     static func load(key: String) -> String? {
-        storage[key]
+        guard !isUnitTest else { return nil }
+        // SEC-1: migrate-on-first-read (idempotent, no-op once the legacy file
+        // is gone) guarantees the Keychain is populated before ANY read — even
+        // ones that fire before applicationDidFinishLaunching (AppSettings.init
+        // reads keys). The permanent plaintext read fallback is REMOVED: the
+        // legacy `.secrets` file is now only ever read by the migration itself,
+        // so a planted file can no longer feed values into the app.
+        migrateLegacySecretsIfNeeded()
+        return keychainRead(key)
     }
 
-    private static func persist() {
-        if let data = try? JSONEncoder().encode(storage) {
-            try? data.write(to: storeURL, options: [.atomic, .completeFileProtection])
-            // Set file permissions to owner-only (600)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
-        }
+    // MARK: - Keychain primitives
+
+    @discardableResult
+    private static func keychainWrite(key: String, value: String) -> Bool {
+        guard let data = value.data(using: .utf8) else { return false }
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+        ]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
-    private static func load() -> [String: String]? {
-        guard let data = try? Data(contentsOf: storeURL) else { return nil }
+    private static func keychainRead(_ key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func keychainDelete(_ key: String) {
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+        ] as CFDictionary)
+    }
+
+    // MARK: - Legacy plaintext file (.secrets) — migration source ONLY (SEC-1)
+
+    private static var legacyURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport
+            .appendingPathComponent("MetaWhisp", isDirectory: true)
+            .appendingPathComponent(".secrets")
+    }
+
+    private static func legacyDict() -> [String: String]? {
+        guard let data = try? Data(contentsOf: legacyURL) else { return nil }
         return try? JSONDecoder().decode([String: String].self, from: data)
+    }
+
+    // MARK: - One-time migration
+
+    private static var migrated = false
+    private static let migrationLock = NSLock()
+
+    /// Imports the legacy plaintext `.secrets` file into the Keychain (called on
+    /// the first `load`, signed app → Keychain ACLs valid), verifies each value,
+    /// and deletes the file only when every secret is confirmed.
+    ///
+    /// SEC-1: the `migrated` flag is set ONLY on full success (or when there's
+    /// nothing to migrate). On a partial failure it stays false, so EVERY later
+    /// `load()` this launch RETRIES — a key that failed to write isn't missing
+    /// for the rest of the run (there is no plaintext fallback anymore). Locked
+    /// so concurrent launch-time reads don't race on the file delete.
+    static func migrateLegacySecretsIfNeeded() {
+        migrationLock.lock()
+        defer { migrationLock.unlock() }
+        guard !migrated else { return }
+        guard let dict = legacyDict(), !dict.isEmpty else { migrated = true; return }
+        var allConfirmed = true
+        for (k, v) in dict {
+            // Write AND verify (read back) before trusting the Keychain copy.
+            if !(keychainWrite(key: k, value: v) && keychainRead(k) == v) {
+                allConfirmed = false
+            }
+        }
+        // Delete the plaintext file ONLY when every secret is confirmed; mark
+        // migrated only then, so a partial failure is retried on the next read.
+        if allConfirmed {
+            try? FileManager.default.removeItem(at: legacyURL)
+            migrated = true
+            NSLog("[Keychain] ✅ migrated %d secrets to Keychain; legacy .secrets removed", dict.count)
+        } else {
+            NSLog("[Keychain] ⚠️ secret migration incomplete — will retry on next read")
+        }
     }
 }

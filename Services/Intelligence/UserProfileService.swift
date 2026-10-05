@@ -52,6 +52,9 @@ final class UserProfileService {
     static func buildSections(from memories: [UserMemory]) -> [Section] {
         let visible = memories.filter { mem in
             guard !mem.isDismissed else { return false }
+            // ITER-071.6 — a screen-proposed fact is not part of who the user
+            // is until they confirm it.
+            guard !mem.needsReview else { return false }
             // Drop person-kind memories — they describe other humans, not the user.
             if let k = mem.kind, k == "person" { return false }
             return true
@@ -91,6 +94,7 @@ final class UserProfileService {
         )
         desc.fetchLimit = 1000
         let all = (try? ctx.fetch(desc)) ?? []
+        NSLog("[UserProfileService] About Me — %d memories fetched (limit %d)", all.count, desc.fetchLimit ?? 0)
         return buildSections(from: all)
     }
 }
