@@ -79,7 +79,7 @@ struct MenuBarView: View {
     private var statusDot: some View {
         switch coordinator.stage {
         case .idle:
-            PulsingDot(color: MW.idle, size: 7, period: 1.6)
+            PulsingDot(color: coordinator.canStartRecording ? MW.idle : MW.textMuted, size: 7, period: 1.6)
         case .recording:
             PulsingDot(color: MW.live, size: 7, period: 1.0)
         case .processing:
@@ -404,7 +404,7 @@ struct MenuBarView: View {
                 )
             }
             .buttonStyle(HoverButtonStyle())
-            .disabled(coordinator.stage == .processing || coordinator.stage == .postProcessing)
+            .disabled(coordinator.stage == .idle ? !coordinator.canStartRecording : coordinator.stage != .recording)
 
             Rectangle().fill(MW.border).frame(width: 0.5)
 
@@ -420,7 +420,7 @@ struct MenuBarView: View {
                 )
             }
             .buttonStyle(HoverButtonStyle())
-            .disabled(coordinator.stage == .processing || coordinator.stage == .postProcessing)
+            .disabled(coordinator.stage == .idle ? !coordinator.canStartRecording : coordinator.stage != .recording)
         }
         .frame(height: 44)
         .overlay(Rectangle().fill(MW.border).frame(height: MW.hairline), alignment: .bottom)
@@ -491,7 +491,7 @@ struct MenuBarView: View {
 
     private var statusLabel: String {
         switch coordinator.stage {
-        case .idle: "Ready"
+        case .idle: coordinator.idleStatusLabel
         case .recording: "Recording"
         case .processing: "Transcribing"
         case .postProcessing: coordinator.translateNext ? "Translating" : "Processing"

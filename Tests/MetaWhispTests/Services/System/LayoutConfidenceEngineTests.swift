@@ -2,8 +2,8 @@ import XCTest
 @testable import MetaWhisp
 
 final class LayoutConfidenceEngineTests: XCTestCase {
-    private let mapper = KeyboardLayoutMapper.russianEnglish
-    private let confidence = LayoutConfidenceEngine()
+    private let mapper = KeyboardLayoutMapper.installedForTests
+    private let confidence = LayoutConfidenceEngine(mapper: .installedForTests)
 
     func test_convertEnglishTypingToRussianPreservesLetterCaseAndPunctuation() {
         XCTAssertEqual(

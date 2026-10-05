@@ -6,11 +6,11 @@ final class LayoutWordBufferTests: XCTestCase {
         var buffer = LayoutWordBuffer()
 
         for character in "ghbdtn" {
-            XCTAssertNil(buffer.record(String(character), source: .englishUS))
+            XCTAssertNil(buffer.record(String(character), source: .englishUS, mapper: .installedForTests))
         }
 
         XCTAssertEqual(
-            buffer.record(" ", source: .englishUS),
+            buffer.record(" ", source: .englishUS, mapper: .installedForTests),
             LayoutBufferedToken(
                 token: "ghbdtn",
                 convertedToken: "привет",
@@ -22,30 +22,30 @@ final class LayoutWordBufferTests: XCTestCase {
 
     func test_sourceChangeAndEditingCharactersDiscardThePendingWord() {
         var buffer = LayoutWordBuffer()
-        _ = buffer.record("g", source: .englishUS)
-        _ = buffer.record("h", source: .englishUS)
+        _ = buffer.record("g", source: .englishUS, mapper: .installedForTests)
+        _ = buffer.record("h", source: .englishUS, mapper: .installedForTests)
 
-        XCTAssertNil(buffer.record("б", source: .russian))
-        XCTAssertNil(buffer.record(" ", source: .russian))
+        XCTAssertNil(buffer.record("б", source: .russian, mapper: .installedForTests))
+        XCTAssertNil(buffer.record(" ", source: .russian, mapper: .installedForTests))
 
-        _ = buffer.record("g", source: .englishUS)
-        XCTAssertNil(buffer.record("1", source: .englishUS))
-        XCTAssertNil(buffer.record(" ", source: .englishUS))
+        _ = buffer.record("g", source: .englishUS, mapper: .installedForTests)
+        XCTAssertNil(buffer.record("1", source: .englishUS, mapper: .installedForTests))
+        XCTAssertNil(buffer.record(" ", source: .englishUS, mapper: .installedForTests))
     }
 
     func test_capsLongWordsAndAcceptsPunctuationAsTheTrailingText() {
         var buffer = LayoutWordBuffer(maxTokenLength: 3)
-        _ = buffer.record("g", source: .englishUS)
-        _ = buffer.record("h", source: .englishUS)
-        _ = buffer.record("b", source: .englishUS)
-        XCTAssertNil(buffer.record("d", source: .englishUS))
-        XCTAssertNil(buffer.record(" ", source: .englishUS))
+        _ = buffer.record("g", source: .englishUS, mapper: .installedForTests)
+        _ = buffer.record("h", source: .englishUS, mapper: .installedForTests)
+        _ = buffer.record("b", source: .englishUS, mapper: .installedForTests)
+        XCTAssertNil(buffer.record("d", source: .englishUS, mapper: .installedForTests))
+        XCTAssertNil(buffer.record(" ", source: .englishUS, mapper: .installedForTests))
 
         for character in "gh" {
-            XCTAssertNil(buffer.record(String(character), source: .englishUS))
+            XCTAssertNil(buffer.record(String(character), source: .englishUS, mapper: .installedForTests))
         }
         XCTAssertEqual(
-            buffer.record("!", source: .englishUS),
+            buffer.record("!", source: .englishUS, mapper: .installedForTests),
             LayoutBufferedToken(
                 token: "gh",
                 convertedToken: "пр",
@@ -59,11 +59,11 @@ final class LayoutWordBufferTests: XCTestCase {
         var buffer = LayoutWordBuffer()
 
         for character in "cjj,otybt" {
-            XCTAssertNil(buffer.record(String(character), source: .englishUS))
+            XCTAssertNil(buffer.record(String(character), source: .englishUS, mapper: .installedForTests))
         }
 
         XCTAssertEqual(
-            buffer.record(" ", source: .englishUS),
+            buffer.record(" ", source: .englishUS, mapper: .installedForTests),
             LayoutBufferedToken(
                 token: "cjj,otybt",
                 convertedToken: "сообщение",
@@ -77,11 +77,11 @@ final class LayoutWordBufferTests: XCTestCase {
         var buffer = LayoutWordBuffer()
 
         for character in "ghbdtn," {
-            XCTAssertNil(buffer.record(String(character), source: .englishUS))
+            XCTAssertNil(buffer.record(String(character), source: .englishUS, mapper: .installedForTests))
         }
 
         XCTAssertEqual(
-            buffer.record(" ", source: .englishUS),
+            buffer.record(" ", source: .englishUS, mapper: .installedForTests),
             LayoutBufferedToken(
                 token: "ghbdtn,",
                 convertedToken: "приветб",
@@ -92,7 +92,7 @@ final class LayoutWordBufferTests: XCTestCase {
     }
 
     func test_recordsRealPhysicalKeycodesForAppleRussianLetterKeys() throws {
-        let mapper = KeyboardLayoutMapper.russianEnglish
+        let mapper = KeyboardLayoutMapper.installedForTests
         guard mapper.isAvailable else {
             throw XCTSkip("The host does not have both US and Russian keyboard layouts enabled.")
         }

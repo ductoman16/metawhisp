@@ -112,7 +112,7 @@ struct DashboardView: View {
                 .overlay(RoundedRectangle(cornerRadius: MW.rSmall, style: .continuous).stroke(MW.border, lineWidth: 0.5))
             }
             .buttonStyle(.plain)
-            .disabled(coordinator.stage == .processing || coordinator.stage == .postProcessing)
+            .disabled(coordinator.stage == .idle ? !coordinator.canStartRecording : coordinator.stage != .recording)
         }
         .padding(.horizontal, MW.sp16).padding(.vertical, MW.sp12)
         .mwCard(radius: MW.rSmall, elevation: .flat)
@@ -123,7 +123,7 @@ struct DashboardView: View {
         case .recording: "Recording"
         case .processing: "Transcribing"
         case .postProcessing: coordinator.translateNext ? "Translating" : "Processing"
-        case .idle: "Ready"
+        case .idle: coordinator.idleStatusLabel
         }
     }
 }
