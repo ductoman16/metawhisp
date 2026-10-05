@@ -1,5 +1,35 @@
 # Local transcription latency fix
 
+## October 5 follow-up experiments
+
+Baseline: `88f3655` on `fix/local-transcription-latency` in
+`/Users/ryan/Source/metawhisp`. The user speaks English only, accepts the 200ms
+paste settling delay for reliability, authorizes timestamp/concurrency
+experiments, and reserves incremental transcription for a last resort.
+
+User story: as an English dictator on the M2 Pro, I want less waiting without
+missing words or degrading meeting timing. Keep only measured improvements;
+retain retry and confidence safeguards. Test short phrases, numbers, a final
+sentence surrounded by silence, multi-window audio, and competing inference.
+
+- [x] Save `com.metawhisp.app` transcriptionLanguage as `en`; verify with defaults.
+  Live UI confirmation unavailable: computer-use app lookup timed out. Running
+  app may require a restart to observe the externally written preference.
+- [x] Keep paste delay and defer incremental transcription.
+- [x] Run opt-in, release-mode `WhisperKitTuningTests` on synthetic local speech.
+  Three tests passed; 38 measurements in 252.56 seconds, excluding build.
+- [x] Compare transcripts and timings; keep or reject each candidate explicitly.
+  See `TUNING-2026-10-05.md`. English preference retained; timestamp and worker
+  changes rejected for now. Contention measured, but meeting advice is disabled.
+- [x] Run the regression gate and record results: PASS, 1,486 tests, zero
+  failures, all 69 critical suites, layout corpus within floor. Log:
+  `/tmp/metawhisp-tuning-regression-oct5.log`. Persisted language rechecked: `en`.
+
+The experiment harness never opens the microphone, changes settings, or writes
+clipboard/history. Timestamp settings alternate within each clip to reduce order
+bias. Worker order reverses on the second pass. Raw synthetic-only results go to
+`/tmp/metawhisp-tuning-oct5.log`.
+
 ## October 1 packaged-app readiness correction
 
 User story: as a dictator launching the fork, I need a truthful preparation
